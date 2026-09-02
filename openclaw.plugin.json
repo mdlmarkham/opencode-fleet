@@ -1,0 +1,42 @@
+{
+  "id": "opencode-fleet",
+  "name": "OpenCode Fleet",
+  "description": "Orchestrate OpenCode across multiple remote OpenClaw nodes (dev2, dev3, ...). Dispatch coding tasks, check fleet status, abort runaway sessions, and pull diffs over the authenticated node channel.",
+  "version": "0.1.0",
+  "kind": "plugin",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "defaultTransport": {
+        "type": "string",
+        "enum": ["http", "acp"],
+        "default": "http"
+      },
+      "nodePrefixes": {
+        "type": "array",
+        "items": { "type": "string" },
+        "default": ["dev"]
+      },
+      "defaultTimeoutMs": {
+        "type": "number",
+        "default": 300000
+      }
+    }
+  },
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "tools": [
+      "fleet_dispatch",
+      "fleet_status",
+      "fleet_abort",
+      "fleet_diff",
+      "fleet_models",
+      "fleet_provision",
+      "fleet_sync",
+      "fleet_cleanup"
+    ]
+  }
+}
