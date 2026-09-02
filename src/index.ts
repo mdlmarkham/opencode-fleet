@@ -373,7 +373,7 @@ export default definePluginEntry({
       name: "fleet_iterate",
       label: "Fleet Iterate",
       description:
-        "Dispatch a task and auto-iterate: if the worker's result indicates failure (build errors, test failures, or a hand-raise), re-dispatch with the errors appended until success or maxIterations. This is the Ralph-loop pattern for workers — turns a worker into a colleague that fixes its own mistakes.",
+        "Dispatch a task and auto-iterate: if the worker's result indicates failure (build errors, test failures, or a hand-raise), re-dispatch with the errors appended until success, maxIterations, or NO-PROGRESS escalation. Tracks whether each iteration's output differs from the last — if the worker repeats the same errors (no progress), it escalates instead of burning tokens in a blind retry loop.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -389,6 +389,10 @@ export default definePluginEntry({
             type: "string",
             description: "Optional string that indicates success (e.g. 'build succeeded'). If absent, treats any non-error result as success.",
           },
+          noProgressEscalate: {
+            type: "boolean",
+            description: "Escalate (stop + report) when consecutive iterations produce identical output (no progress). Default true.",
+          },
         },
         required: ["node", "cwd", "prompt"],
       },
@@ -402,14 +406,17 @@ export default definePluginEntry({
           transport?: "http" | "acp";
           timeoutMs?: number;
           successMarker?: string;
+          noProgressEscalate?: boolean;
         };
         const list = await api.runtime.nodes.list();
         const node = (list.nodes ?? []).find((n) => n.displayName === p.node || n.nodeId === p.node);
         if (!node) return jsonResult(`Node "${p.node}" not found.`);
 
         const maxIter = p.maxIterations ?? 5;
-        const iterations: Array<{ iter: number; summary?: string; handRaised?: boolean; question?: string; error?: string }> = [];
+        const escalateOnNoProgress = p.noProgressEscalate ?? true;
+        const iterations: Array<{ iter: number; summary?: string; handRaised?: boolean; question?: string; error?: string; progress?: boolean }> = [];
         let currentPrompt = p.prompt;
+        let prevFingerprint = "";
 
         for (let i = 1; i <= maxIter; i++) {
           const inv = await api.runtime.nodes.invoke({
@@ -431,12 +438,18 @@ export default definePluginEntry({
               ? (JSON.parse(payload) as { ok?: boolean; summary?: string; handRaised?: boolean; question?: string; error?: string })
               : ((payload as { ok?: boolean; summary?: string; handRaised?: boolean; question?: string; error?: string } | undefined) ?? {});
 
+          // Fingerprint the output to detect progress (or lack thereof).
+          const fingerprint = (parsed.summary ?? "").slice(0, 500) + "|" + (parsed.error ?? "").slice(0, 500);
+          const progress = i === 1 ? true : fingerprint !== prevFingerprint;
+          prevFingerprint = fingerprint;
+
           iterations.push({
             iter: i,
             summary: parsed.summary,
             handRaised: parsed.handRaised,
             question: parsed.question,
             error: parsed.error,
+            progress,
           });
 
           // Hand-raise: stop and let the caller answer.
@@ -449,6 +462,19 @@ export default definePluginEntry({
           const success = p.successMarker ? (parsed.summary ?? "").includes(p.successMarker) : !looksFailed;
           if (success) {
             return jsonResult({ iterations, done: true, success: true, finalSummary: parsed.summary });
+          }
+
+          // NO-PROGRESS escalation: same output as last iteration → stop, don't burn tokens.
+          if (escalateOnNoProgress && i > 1 && !progress) {
+            return jsonResult({
+              iterations,
+              done: false,
+              success: false,
+              escalated: true,
+              reason: "no progress across iterations (identical output)",
+              recommendation:
+                "Escalate: switch to a heavier model, change the approach, or hand off to a human. Do not keep retrying the same prompt.",
+            });
           }
 
           // Re-dispatch with the failure context appended.
