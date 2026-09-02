@@ -26,6 +26,22 @@ Do **NOT** use the fleet for:
 - Work that must stay on the manager (secrets, credentials, private state)
 - Anything inside `~/.openclaw` or active OpenClaw state dirs
 
+## Fleet vs. local coding-agent skill
+
+There are two ways to delegate coding work. Pick deliberately:
+
+| | `opencode-fleet` (this skill) | `coding-agent` skill |
+|---|---|---|
+| Where the worker runs | Remote nodes (dev2/dev3) | Local gateway host |
+| Repo access | Credential-free via git bundle | Local checkout/worktree |
+| Best for | Multi-node, parallel, real-infra testing | Single local worker, PR review |
+| Model routing | Aperture catalog, per-task | Local provider config |
+
+Use **fleet** when the work benefits from remote/parallel execution or a clean
+provisioned checkout. Use **coding-agent** for a single local background worker.
+Do not use the legacy `opencode-management` / `opencode-parallel` skills — they
+are archived and superseded by this plugin.
+
 ## The workflow
 
 Follow this order. The manager (main) does provisioning and syncing (it has the credentials); worker agents dispatch.
