@@ -494,6 +494,125 @@ export default definePluginEntry({
     });
 
     api.registerTool({
+      name: "fleet_watch",
+      label: "Fleet Watch",
+      description:
+        "Dispatch a task and watch it live: streams progress updates to the agent as the worker runs (via onUpdate), polls the node's activity, and returns the final result when the task completes. This is the monitoring view — use it when you want to see a task in progress rather than fire-and-forget.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          node: { type: "string", description: "Node display name or id." },
+          cwd: { type: "string", description: "Working directory on the node." },
+          prompt: { type: "string", description: "The task / goal for OpenCode." },
+          model: { type: "string", description: "Optional model override." },
+          transport: { type: "string", enum: ["http", "acp"], description: "Transport." },
+          timeoutMs: { type: "number", description: "Per-run timeout, ms." },
+          pollMs: { type: "number", description: "Activity poll interval, ms (default 15000)." },
+        },
+        required: ["node", "cwd", "prompt"],
+      },
+      execute: async (toolCallId, params, signal, onUpdate) => {
+        const p = params as {
+          node: string;
+          cwd: string;
+          prompt: string;
+          model?: string;
+          transport?: "http" | "acp";
+          timeoutMs?: number;
+          pollMs?: number;
+        };
+        const list = await api.runtime.nodes.list();
+        const node = (list.nodes ?? []).find((n) => n.displayName === p.node || n.nodeId === p.node);
+        if (!node) return jsonResult(`Node "${p.node}" not found.`);
+
+        const timeoutMs = p.timeoutMs ?? 300_000;
+        const pollMs = p.pollMs ?? 15_000;
+        const startedAt = Date.now();
+
+        // Kick off the dispatch (fire-and-forget from the tool's perspective;
+        // we monitor via activity polling).
+        const dispatchPromise = api.runtime.nodes.invoke({
+          nodeId: node.nodeId,
+          command: "opencode.run",
+          params: {
+            prompt: p.prompt,
+            cwd: p.cwd,
+            transport: p.transport ?? "http",
+            model: p.model,
+            timeoutMs,
+          },
+          timeoutMs,
+          signal,
+        });
+
+        // Poll activity and stream progress until the dispatch settles.
+        let settled = false;
+        let lastActivity = "";
+        const pollLoop = (async () => {
+          while (!settled && Date.now() - startedAt < timeoutMs) {
+            await new Promise((r) => setTimeout(r, pollMs));
+            if (settled) break;
+            try {
+              const inv = await api.runtime.nodes.invoke({
+                nodeId: node.nodeId,
+                command: "opencode.run",
+                params: { prompt: "__ACTIVITY__", cwd: "/", transport: "http" },
+                timeoutMs: 15000,
+                signal,
+              });
+              const payload = (inv as { payload?: unknown }).payload;
+              const parsed =
+                typeof payload === "string"
+                  ? (JSON.parse(payload) as { activity?: Array<{ pid?: number; elapsed?: string; cpu?: string; command?: string }> })
+                  : ((payload as { activity?: Array<{ pid?: number; elapsed?: string; cpu?: string; command?: string }> } | undefined) ?? {});
+              const procs = parsed.activity ?? [];
+              const summary = procs.length
+                ? `${procs.length} opencode process(es) running (${procs.map((x) => x.elapsed ?? "?").join(", ")} elapsed)`
+                : "no opencode process running";
+              if (summary !== lastActivity) {
+                lastActivity = summary;
+                onUpdate?.({
+                  content: [{ type: "text", text: summary }],
+                  details: { progress: summary },
+                  progress: { text: summary, visibility: "channel", privacy: "public" },
+                });
+              }
+            } catch {
+              // Activity poll is best-effort.
+            }
+          }
+        })();
+
+        const result = await dispatchPromise;
+        settled = true;
+        await pollLoop;
+
+        const payload = (result as { payload?: unknown }).payload;
+        const parsed =
+          typeof payload === "string"
+            ? (JSON.parse(payload) as { ok?: boolean; summary?: string; handRaised?: boolean; question?: string; error?: string })
+            : ((payload as { ok?: boolean; summary?: string; handRaised?: boolean; question?: string; error?: string } | undefined) ?? {});
+
+        onUpdate?.({
+          content: [{ type: "text", text: `Task complete: ${parsed.summary ?? "(no summary)"}` }],
+          details: { progress: "complete" },
+          progress: { text: "Task complete", visibility: "channel", privacy: "public" },
+        });
+
+        return jsonResult({
+          done: true,
+          ok: parsed.ok,
+          summary: parsed.summary,
+          handRaised: parsed.handRaised,
+          question: parsed.question,
+          error: parsed.error,
+          elapsedMs: Date.now() - startedAt,
+        });
+      },
+    });
+
+    api.registerTool({
       name: "fleet_provision",
       label: "Fleet Provision",
       description:

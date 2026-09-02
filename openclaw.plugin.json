@@ -33,6 +33,7 @@
   "contracts": {
     "tools": [
       "fleet_dispatch",
+      "fleet_watch",
       "fleet_answer",
       "fleet_iterate",
       "fleet_status",
