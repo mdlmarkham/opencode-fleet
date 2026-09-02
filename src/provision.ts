@@ -42,6 +42,8 @@ export interface ProvisionResult {
   branch?: string;
   commit?: string;
   error?: string;
+  /** True when the bundle was shipped via the node channel (SSH unavailable). */
+  viaChannel?: boolean;
 }
 
 /**
@@ -122,20 +124,50 @@ export async function cleanupNode(nodeHost: string, cwd?: string): Promise<{ ok:
  * Manager-side: ship a bundle to a worker via scp, then invoke the node command
  * to unpack it. Returns the checkout path.
  */
+/**
+ * Invoke params for one opencode.run node-command call (used by the SSH-free
+ * fallback so provision.ts stays decoupled from the plugin runtime).
+ */
+export type NodeInvokeFn = (
+  params: Record<string, unknown>,
+  timeoutMs?: number,
+) => Promise<unknown>;
+
 export async function provisionToNode(
   nodeHost: string,
   bundlePath: string,
   req: ProvisionRequest,
+  channelInvoke?: NodeInvokeFn,
 ): Promise<ProvisionResult> {
-  const remoteBundle = `/tmp/fleet-${Date.now()}.bundle`;
+  const transferId = `${Date.now()}`;
+  const remoteBundle = `/tmp/fleet-${transferId}.bundle`;
+  let shippedViaChannel = false;
   try {
-    // Ship the bundle to the worker.
-    await execFileP("scp", [...SSH_ARGS, bundlePath, `${nodeHost}:${remoteBundle}`], {
-      timeout: 120_000,
-    });
+    // Ship the bundle via SSH when available; fall back to the node channel
+    // (chunked base64 through opencode.run) when SSH is not reachable.
+    try {
+      await execFileP("scp", [...SSH_ARGS, bundlePath, `${nodeHost}:${remoteBundle}`], {
+        timeout: 120_000,
+      });
+    } catch (sshErr) {
+      if (!channelInvoke) throw sshErr;
+      shippedViaChannel = true;
+      const { chunkBuffer } = await import("./ledger.js");
+      const fs = await import("node:fs/promises");
+      const chunks = chunkBuffer(await fs.readFile(bundlePath));
+      // One invoke per chunk keeps each message small; the node accumulates.
+      for (let i = 0; i < chunks.length; i++) {
+        await channelInvoke(
+          { prompt: "__RECEIVE__", cwd: "/", transport: "http", transferId, chunkIndex: i, chunks: [chunks[i]] },
+          60_000,
+        );
+      }
+    }
 
     // Unpack on the worker (no credentials needed). Light GC only —
     // aggressive GC is too slow for large repos and belongs in fleet_cleanup.
+    // Uses the node channel when the bundle arrived via channel (SSH-free
+    // nodes, e.g. Windows) or when SSH unpack fails.
     const unpackCmd = [
       `rm -rf ${shq(req.cwd)}`,
       `mkdir -p ${shq(req.cwd)}`,
@@ -147,24 +179,44 @@ export async function provisionToNode(
       .filter(Boolean)
       .join(" && ");
 
-    const { stdout } = await execFileP("ssh", [...SSH_ARGS, nodeHost, unpackCmd], {
-      timeout: 120_000,
-    });
+    let unpackOut = "";
+    if (shippedViaChannel && channelInvoke) {
+      const res = (await channelInvoke(
+        { prompt: "__UNPACK__", cwd: req.cwd, transport: "http", transferId, commit: req.commit },
+        180_000,
+      )) as { payload?: unknown };
+      const pl = typeof res?.payload === "string" ? JSON.parse(res.payload) : (res?.payload ?? {});
+      if (!pl.ok) throw new Error(pl.error ?? "channel unpack failed");
+      unpackOut = String(pl.commit ?? "");
+    } else {
+      const { stdout } = await execFileP("ssh", [...SSH_ARGS, nodeHost, unpackCmd], {
+        timeout: 120_000,
+      });
+      unpackOut = stdout.trim();
+    }
 
     return {
       ok: true,
       cwd: req.cwd,
       branch: req.branch ?? "main",
-      commit: stdout.trim(),
+      commit: unpackOut,
+      ...(shippedViaChannel ? { viaChannel: true } : {}),
     };
   } catch (err) {
     return { ok: false, error: (err as Error).message };
   } finally {
     // Always remove the remote bundle, even on failure, to avoid bloat.
     try {
-      await execFileP("ssh", [...SSH_ARGS, nodeHost, `rm -f "${remoteBundle}"`], {
-        timeout: 30_000,
-      });
+      if (shippedViaChannel && channelInvoke) {
+        await channelInvoke(
+          { prompt: "__RECEIVE_CLEAN__", cwd: "/", transport: "http", transferId },
+          30_000,
+        );
+      } else {
+        await execFileP("ssh", [...SSH_ARGS, nodeHost, `rm -f "${remoteBundle}"`], {
+          timeout: 30_000,
+        });
+      }
     } catch {
       // Best-effort cleanup.
     }

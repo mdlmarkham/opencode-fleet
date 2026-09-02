@@ -1,6 +1,7 @@
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { buildJsonPluginConfigSchema, jsonResult } from "openclaw/plugin-sdk/core";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { shq } from "./shell.js";
 import { buildOpenCodeCommand, parseOpenCodeOutput, type OpenCodeTask } from "./opencode.js";
 import { SSH_ARGS } from "./ssh.js";
@@ -129,6 +130,78 @@ export default definePluginEntry({
           const [files, count] = st.split("---COUNT\\n");
           return JSON.stringify({ ok: true, cwd: task.cwd, uncommittedCount: parseInt((count ?? "0").trim(), 10) || 0, files: files.trim() });
         }
+        if (task.prompt === "__RECEIVE__") {
+          // Node-channel bundle transfer: accumulate base64 chunks into a
+          // temp file across multiple invokes. Used when SSH is unavailable
+          // (e.g. Windows nodes). task.chunks: { index, data }[]
+          const transferId = String(task.transferId ?? "t");
+          const accDir = join(tmpdir(), `fleet-xfer-${transferId}`);
+          await (await import("node:fs/promises")).mkdir(accDir, { recursive: true });
+          const target = join(accDir, "bundle.b64");
+          const expected = parseInt(String(task.chunkIndex ?? ""), 10);
+          const chunks = (task.chunks ?? []).slice();
+          for (const c of chunks) {
+            if (Number.isFinite(expected) && c.index !== expected) {
+              return JSON.stringify({ ok: false, error: `chunk out of order: expected ${expected}, got ${c.index}` });
+            }
+            await (await import("node:fs/promises")).appendFile(target, c.data);
+          }
+          return JSON.stringify({ ok: true, transferId, appended: chunks.length });
+        }
+        if (task.prompt === "__UNPACK__") {
+          // Decode accumulated base64 and clone into cwd (SSH-free path).
+          const transferId = String(task.transferId ?? "t");
+          const accDir = join(tmpdir(), `fleet-xfer-${transferId}`);
+          const accFile = join(accDir, "bundle.b64");
+          try {
+            const b64 = await (await import("node:fs/promises")).readFile(accFile, "utf8");
+            const bundlePath = remoteBundlePath(transferId);
+            await (await import("node:fs/promises")).writeFile(bundlePath, Buffer.from(b64, "base64"));
+            const unpackCmd = [
+              `rm -rf ${shq(task.cwd)}`,
+              `mkdir -p ${shq(task.cwd)}`,
+              `git clone -q ${shq(bundlePath)} ${shq(task.cwd)}`,
+              task.commit ? `cd ${shq(task.cwd)} && git checkout -q ${shq(task.commit)}` : "",
+              `cd ${shq(task.cwd)} && git rev-parse HEAD`,
+            ].filter(Boolean).join(" && ");
+            const out = await runShell(unpackCmd, 180_000, context?.signal);
+            if (!/^[0-9a-f]{7,40}/m.test(out.trim())) {
+              return JSON.stringify({ ok: false, error: `unpack failed: ${out.trim().slice(0, 300)}` });
+            }
+            return JSON.stringify({ ok: true, commit: out.trim().split("\n").pop(), bytes: b64.length });
+          } finally {
+            await (await import("node:fs/promises")).rm(accDir, { recursive: true, force: true }).catch(() => {});
+          }
+        }
+        if (task.prompt === "__RECEIVE_CLEAN__") {
+          const transferId = String(task.transferId ?? "t");
+          await (await import("node:fs/promises")).rm(remoteBundlePath(transferId), { force: true }).catch(() => {});
+          await (await import("node:fs/promises")).rm(join(tmpdir(), `fleet-xfer-${transferId}`), { recursive: true, force: true }).catch(() => {});
+          return JSON.stringify({ ok: true });
+        }
+
+        // Per-dispatch environment (issue: agent-specified environment).
+        // 1. Git ref selection: refuse when the checkout is dirty, to avoid
+        //    clobbering another run's uncommitted work on a shared cwd.
+        if (task.ref && (task.ref.branch || task.ref.commit)) {
+          const refCheck = await runShell(
+            `cd ${shq(task.cwd)} && test -z "$(git status --porcelain 2>/dev/null)" || echo DIRTY`,
+            15_000,
+            context?.signal,
+          );
+          if (refCheck.trim().includes("DIRTY")) {
+            return JSON.stringify({
+              ok: false,
+              error: `refused: ${task.cwd} has uncommitted changes; commit or sync them before dispatching with a ref`,
+            });
+          }
+          const refSpec = task.ref.commit ?? task.ref.branch;
+          await runShell(
+            `cd ${shq(task.cwd)} && git fetch --all --prune 2>/dev/null; git checkout -q ${shq(refSpec ?? "")} && git rev-parse HEAD`,
+            60_000,
+            context?.signal,
+          );
+        }
 
         const command = buildOpenCodeCommand(task);
         // Emit progress chunks to keep the node invoke alive during long runs.
@@ -223,6 +296,8 @@ export default definePluginEntry({
           timeoutMs: { type: "number", description: "Per-node timeout, ms." },
           maxIdleMs: { type: "number", description: "Kill the run if no output for this long, ms (stuck-loop guard). Default 120000." },
           maxDurationMs: { type: "number", description: "Kill the run if total runtime exceeds this, ms (stuck-loop guard). Default 600000." },
+          env: { type: "object", additionalProperties: { type: "string" }, description: "Environment variables for the worker process (per-dispatch environment). PATH/HOME/LD_* are ignored for safety." },
+          ref: { type: "object", additionalProperties: false, properties: { branch: { type: "string", description: "Branch to check out before running." }, commit: { type: "string", description: "Commit SHA to check out before running." } }, description: "Git ref to check out before running. Refused if the checkout has uncommitted changes." },
           requires: {
             type: "object",
             additionalProperties: false,
@@ -249,6 +324,8 @@ export default definePluginEntry({
           timeoutMs?: number;
           maxIdleMs?: number;
           maxDurationMs?: number;
+          env?: Record<string, string>;
+          ref?: { branch?: string; commit?: string };
           requires?: {
             gpu?: boolean;
             minDiskGb?: number;
@@ -309,6 +386,8 @@ export default definePluginEntry({
             timeoutMs: p.timeoutMs ?? cfg.defaultTimeoutMs,
             maxIdleMs: p.maxIdleMs,
             maxDurationMs: p.maxDurationMs,
+            env: p.env,
+            ref: p.ref,
           };
           // Ledger: record BEFORE the invoke so an agent/worker crash mid-run
           // still leaves a discoverable record (interruption handling).
@@ -839,12 +918,27 @@ export default definePluginEntry({
         const results: Record<string, unknown> = {};
         for (const node of targets) {
           const host = node.remoteIp ?? node.displayName ?? node.nodeId;
-          const r = await provisionToNode(host, bundle.bundlePath, {
-            repo: p.repo,
-            cwd: p.cwd,
-            branch: p.branch,
-            commit: p.commit,
-          });
+          // Node-channel fallback for SSH-free nodes (e.g. Windows): ships the
+          // bundle in chunks through opencode.run control messages.
+          const channelInvoke = async (params: Record<string, unknown>, timeoutMs?: number) =>
+            api.runtime.nodes.invoke({
+              nodeId: node.nodeId,
+              command: "opencode.run",
+              params,
+              timeoutMs: timeoutMs ?? 60_000,
+              signal,
+            });
+          const r = await provisionToNode(
+            host,
+            bundle.bundlePath,
+            {
+              repo: p.repo,
+              cwd: p.cwd,
+              branch: p.branch,
+              commit: p.commit,
+            },
+            channelInvoke,
+          );
           results[node.displayName ?? node.nodeId] = r;
         }
         // Clean up the manager-side bundle + staging dir to avoid bloat.
@@ -1391,6 +1485,11 @@ export default definePluginEntry({
 });
 
 /** ps command listing running OpenCode processes on a node. */
+function remoteBundlePath(transferId: string): string {
+  // Windows-safe temp path (no /tmp assumption).
+  return join(tmpdir(), `fleet-${transferId}.bundle`);
+}
+
 const OPCODE_PS_COMMAND =
   // Match any opencode invocation — including `timeout N opencode run ...`
   // wrapper processes and detached/`nohup` runs — so activity detection

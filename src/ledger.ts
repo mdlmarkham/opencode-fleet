@@ -31,6 +31,9 @@ export interface LedgerEntry {
   sessionId?: string;
   handRaised?: boolean;
   question?: string;
+  /** Env var NAMES dispatched with (values never stored in the ledger). */
+  env?: string[];
+  ref?: { branch?: string; commit?: string };
 }
 
 const LEDGER_FILE = "fleet-runs.json";
@@ -102,4 +105,18 @@ export async function probeRun(
 
 function procLines(raw: string): string[] {
   return raw.split("\n").map((l) => l.trim()).filter(Boolean);
+}
+/**
+ * Split a file into base64 chunks sized for the node channel (~48KB decoded
+ * per chunk keeps the invoke params well under message limits).
+ */
+export function chunkBuffer(buf: Buffer, chunkBytes = 48 * 1024): Array<{ index: number; data: string }> {
+  const b64 = buf.toString("base64");
+  // base64 expands 4/3; take decoded-chunk-bytes worth of base64 chars.
+  const per = Math.ceil((chunkBytes * 4) / 3);
+  const chunks: Array<{ index: number; data: string }> = [];
+  for (let i = 0; i < b64.length; i += per) {
+    chunks.push({ index: chunks.length, data: b64.slice(i, i + per) });
+  }
+  return chunks;
 }

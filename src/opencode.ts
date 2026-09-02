@@ -38,6 +38,18 @@ export interface OpenCodeTask {
   maxDurationMs?: number;
   /** Optional session id (used for abort/diff control messages). */
   sessionId?: string;
+  /** Environment variables for the worker process (per-dispatch environment). */
+  env?: Record<string, string>;
+  /** Git ref to check out before running (dispatch-time environment selection). Refused if the checkout has uncommitted changes. */
+  ref?: { branch?: string; commit?: string };
+  /** Node-channel transfer id (provisioning fallback when SSH unavailable). */
+  transferId?: string;
+  /** Node-channel transfer chunks: ordered base64 segments of a bundle. */
+  chunks?: Array<{ index: number; data: string }>;
+  /** Expected chunk index for ordered node-channel transfer. */
+  chunkIndex?: number;
+  /** Commit SHA for __UNPACK__ (channel path). */
+  commit?: string;
   /** Internal control flag: abort a running session. */
   abort?: boolean;
   /** Internal control flag: pull a diff for a session. */
@@ -72,23 +84,31 @@ export function buildOpenCodeCommand(task: OpenCodeTask): string {
   const modelFlag = task.model ? ` --model ${shq(task.model)}` : "";
   const agentFlag = task.agent ? ` --agent ${shq(task.agent)}` : "";
 
+  // Per-dispatch environment: emitted as leading `export` lines so the worker
+  // process (and anything it spawns) sees them. Keys/values are shell-escaped.
+  // PATH/HOME/LD_* are deliberately excluded — overriding those on a remote
+  // node is a footgun; use the node's own service config for that.
+  const envExports = Object.entries(task.env ?? {})
+    .filter(([k]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(k))
+    .filter(([k]) => !/^(PATH|HOME|LD_PRELOAD|LD_LIBRARY_PATH|SHELL|USER|LOGNAME|PWD|OLDPWD)$/i.test(k))
+    .map(([k, v]) => `export ${k}=${shq(String(v))}`)
+    .join("\n");
+
   if (task.transport === "acp") {
-    // ACP stdio: run `opencode acp` in the workspace. For v1 we run a
-    // one-shot prompt through the ACP server.
     return [
       `cd ${shq(cwd)}`,
+      envExports,
       `timeout ${Math.floor(timeout / 1000)} opencode acp${modelFlag}${agentFlag} --print-logs 2>&1 <<'OPENCODE_EOF'`,
       task.prompt,
       "OPENCODE_EOF",
-    ].join("\n");
+    ].filter(Boolean).join("\n");
   }
 
-  // HTTP transport: run `opencode run` directly (standalone, no server).
-  // Output is NDJSON streaming; we capture it and extract the final text.
   return [
     `cd ${shq(cwd)}`,
+    envExports,
     `timeout ${Math.floor(timeout / 1000)} opencode run${modelFlag}${agentFlag} ${shq(task.prompt)} --format json 2>&1`,
-  ].join("\n");
+  ].filter(Boolean).join("\n");
 }
 
 /**
