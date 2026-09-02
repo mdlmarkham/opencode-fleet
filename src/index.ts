@@ -312,9 +312,30 @@ export default definePluginEntry({
             params: task,
             timeoutMs: task.timeoutMs,
             signal,
-          });
+          }).catch((err: Error) => ({
+            invokeTimedOut: true as const,
+            message: err.message,
+          }));
+
+          // Issue #5: an invoke timeout is NOT proof the run failed — the
+          // worker may still be live on the node. Never report a bare
+          // TIMEOUT; tell the manager the run MAY be live and how to check.
+          const timedOut = (inv as { invokeTimedOut?: boolean }).invokeTimedOut === true;
+          let dispatchResult: unknown;
+          if (timedOut) {
+            dispatchResult = {
+              ok: false,
+              dispatchTimedOut: true,
+              note: `Invoke relay timed out after ${task.timeoutMs}ms waiting for the synchronous result. The run MAY still be live on the node. Do NOT re-dispatch blindly — check fleet_activity / __STATUS__ on this node first, then reattach via fleet_diff or fleet_watch.`,
+              error: (inv as { message?: string }).message,
+            };
+          } else {
+            dispatchResult = inv;
+          }
+
           // Post-dispatch working-tree state so the manager knows what state
-          // the node is in (issue #4).
+          // the node is in (issue #4). Also serves as the live-run probe for
+          // issue #5: fresh uncommitted changes mean the worker did something.
           let treeState: unknown;
           try {
             const stInv = await api.runtime.nodes.invoke({
@@ -330,7 +351,11 @@ export default definePluginEntry({
           } catch {
             treeState = { ok: false, note: "status check failed" };
           }
-          results[node.displayName ?? node.nodeId] = { result: inv, treeState };
+          results[node.displayName ?? node.nodeId] = {
+            result: dispatchResult,
+            treeState,
+            ...(timedOut ? { dispatchTimedOut: true, mayStillBeRunning: true } : {}),
+          };
         }
         return jsonResult(results);
       },
@@ -1242,7 +1267,10 @@ export default definePluginEntry({
 
 /** ps command listing running OpenCode processes on a node. */
 const OPCODE_PS_COMMAND =
-  `ps -eo pid,etime,pcpu,command | grep -E "[o]pencode (run|acp|serve)" | grep -v grep || true`;
+  // Match any opencode invocation — including `timeout N opencode run ...`
+  // wrapper processes and detached/`nohup` runs — so activity detection
+  // covers dispatch runs, not just serve/acp daemons (issue #5).
+  `ps -eo pid,etime,pcpu,command | grep -iE "[o]pencode" | grep -vE "grep|opencode-fleet|node-activity" | grep -vE "^[0-9]+ .*opencode (serve|acp) --hostname" || true`;
 
 /**
  * Parse `ps -eo pid,etime,pcpu,command` lines into activity entries.
