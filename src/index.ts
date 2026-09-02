@@ -294,8 +294,12 @@ export default definePluginEntry({
         }
 
         const transport = p.transport ?? cfg.defaultTransport ?? "http";
+        const { upsertRun, newRunId, probeRun, loadLedger } = await import("./ledger.js");
+        const rootDir = api.rootDir ?? process.cwd();
+
         const results: Record<string, unknown> = {};
         for (const node of targets) {
+          const runId = newRunId();
           const task: OpenCodeTask = {
             prompt: p.prompt,
             cwd: p.cwd,
@@ -306,6 +310,19 @@ export default definePluginEntry({
             maxIdleMs: p.maxIdleMs,
             maxDurationMs: p.maxDurationMs,
           };
+          // Ledger: record BEFORE the invoke so an agent/worker crash mid-run
+          // still leaves a discoverable record (interruption handling).
+          await upsertRun(rootDir, {
+            runId,
+            node: node.displayName ?? node.nodeId,
+            cwd: p.cwd,
+            prompt: p.prompt,
+            model: p.model,
+            transport,
+            startedAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+            state: "running",
+          });
           const inv = await api.runtime.nodes.invoke({
             nodeId: node.nodeId,
             command: "opencode.run",
@@ -351,13 +368,121 @@ export default definePluginEntry({
           } catch {
             treeState = { ok: false, note: "status check failed" };
           }
+          // Update the ledger with the outcome, extracting sessionId where
+          // present so runs can be reattached after interruption.
+          const payload = (dispatchResult as { payload?: unknown }).payload;
+          const parsedResult =
+            typeof payload === "string"
+              ? (JSON.parse(payload) as { ok?: boolean; summary?: string; sessionId?: string; handRaised?: boolean; question?: string })
+              : ((payload as { ok?: boolean; summary?: string; sessionId?: string; handRaised?: boolean; question?: string } | undefined) ?? {});
+          await upsertRun(rootDir, {
+            runId,
+            node: node.displayName ?? node.nodeId,
+            cwd: p.cwd,
+            prompt: p.prompt,
+            model: p.model,
+            transport,
+            startedAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+            state: timedOut ? "timed-out" : parsedResult.ok === false ? "failed" : "completed",
+            summary: parsedResult.summary,
+            sessionId: parsedResult.sessionId,
+            handRaised: parsedResult.handRaised,
+            question: parsedResult.question,
+          });
+
           results[node.displayName ?? node.nodeId] = {
+            runId,
             result: dispatchResult,
             treeState,
             ...(timedOut ? { dispatchTimedOut: true, mayStillBeRunning: true } : {}),
           };
         }
         return jsonResult(results);
+      },
+    });
+
+    api.registerTool({
+      name: "fleet_resume",
+      label: "Fleet Resume",
+      description:
+        "Discover fleet work that may be in-flight after an interruption (agent session died, gateway restart, or worker died). Lists ledger runs that are not completed, probes each node for live processes and uncommitted changes, and classifies each run as live / finished-uncommitted / dead. Returns adoption guidance: attach (fleet_diff/fleet_sync) or discard. Call this at the start of any fleet interaction after an interruption.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          runId: { type: "string", description: "Optional: inspect one run instead of all incomplete runs." },
+          discard: { type: "boolean", description: "Discard mode: abort any live process on the node for the matched run(s) and mark them discarded. Default false (report only)." },
+        },
+      },
+      execute: async (toolCallId, params, signal) => {
+        const p = params as { runId?: string; discard?: boolean };
+        const { loadLedger, upsertRun, probeRun } = await import("./ledger.js");
+        const rootDir = api.rootDir ?? process.cwd();
+        const runs = await loadLedger(rootDir);
+        const list = await api.runtime.nodes.list();
+        const nodes = list.nodes ?? [];
+        const hostFor = (name: string) =>
+          nodes.find((n) => (n.displayName ?? n.nodeId) === name)?.remoteIp ?? name;
+
+        const incomplete = runs.filter(
+          (r) => (p.runId ? r.runId === p.runId : r.state === "running" || r.state === "timed-out"),
+        );
+        if (!incomplete.length) {
+          return jsonResult({ incomplete: 0, note: "No in-flight fleet runs in the ledger." });
+        }
+
+        const findings: Array<Record<string, unknown>> = [];
+        for (const run of incomplete) {
+          const host = hostFor(run.node);
+          const probe = await probeRun(host, run.cwd);
+          let status: string;
+          if (probe.procRunning) status = "live";
+          else if ((probe.uncommitted ?? -1) > 0) status = "finished-uncommitted";
+          else status = "dead";
+
+          const guidance =
+            status === "live"
+              ? "Run is LIVE on the node. Wait or reattach with fleet_diff/fleet_watch; do not re-dispatch."
+              : status === "finished-uncommitted"
+                ? `Worker finished (or died) with ${probe.uncommitted} uncommitted change(s). Adopt: run fleet_sync to commit+push them, or discard.`
+                : "No live process and no changes — run died before doing work. Safe to re-dispatch or discard.";
+
+          findings.push({
+            runId: run.runId,
+            node: run.node,
+            cwd: run.cwd,
+            prompt: run.prompt.slice(0, 120),
+            startedAt: run.startedAt,
+            ledgerState: run.state,
+            procsRunning: probe.procRunning,
+            procs: probe.procs,
+            uncommittedChanges: probe.uncommitted,
+            status,
+            guidance,
+          });
+
+          if (p.discard) {
+            try {
+              await api.runtime.nodes.invoke({
+                nodeId: (nodes.find((n) => (n.displayName ?? n.nodeId) === run.node)?.nodeId) ?? run.node,
+                command: "opencode.run",
+                params: { prompt: "__ABORT__", cwd: run.cwd, transport: "http" },
+                timeoutMs: 20000,
+                signal,
+              });
+            } catch {
+              // best-effort abort
+            }
+            await upsertRun(rootDir, { ...run, state: "discarded", updatedAt: new Date().toISOString() });
+          }
+        }
+
+        return jsonResult({
+          incomplete: incomplete.length,
+          discarded: p.discard === true,
+          runs: findings,
+        });
       },
     });
 

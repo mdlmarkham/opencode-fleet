@@ -10,13 +10,20 @@
     "properties": {
       "defaultTransport": {
         "type": "string",
-        "enum": ["http", "acp"],
+        "enum": [
+          "http",
+          "acp"
+        ],
         "default": "http"
       },
       "nodePrefixes": {
         "type": "array",
-        "items": { "type": "string" },
-        "default": ["dev"]
+        "items": {
+          "type": "string"
+        },
+        "default": [
+          "dev"
+        ]
       },
       "defaultTimeoutMs": {
         "type": "number",
@@ -49,7 +56,8 @@
       "fleet_recipe_recommend",
       "fleet_recipe_record",
       "fleet_recipe_list",
-      "fleet_deploy"
+      "fleet_deploy",
+      "fleet_resume"
     ]
   }
 }
