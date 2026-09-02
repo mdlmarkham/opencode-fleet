@@ -179,6 +179,48 @@ export default definePluginEntry({
           await (await import("node:fs/promises")).rm(join(tmpdir(), `fleet-xfer-${transferId}`), { recursive: true, force: true }).catch(() => {});
           return JSON.stringify({ ok: true });
         }
+        if (task.prompt === "__BUNDLE__") {
+          // SSH-free sync, worker side: bundle current state (auto-committing
+          // uncommitted changes first, same as the SSH path) and stage as base64.
+          const transferId = String(task.transferId ?? "t");
+          const accDir = join(tmpdir(), `fleet-xfer-${transferId}`);
+          await (await import("node:fs/promises")).mkdir(accDir, { recursive: true });
+          const bundlePath = join(accDir, "sync.bundle");
+          const commitOut = await runShell(
+            [
+              `cd ${shq(task.cwd)}`,
+              `test -z "$(git status --porcelain 2>/dev/null)" || git add -A`,
+              `test -z "$(git status --porcelain 2>/dev/null)" || git -c user.email=fleet-worker@node -c user.name="fleet-worker" commit -m "fleet_sync: auto-commit worker working-tree changes before sync"`,
+              `git bundle create ${shq(join(accDir, "sync.bundle"))} --all`,
+              `echo "---B64---"`,
+              `base64 ${shq(join(accDir, "sync.bundle"))}`,
+            ].filter(Boolean).join(" && "),
+            120_000,
+            context?.signal,
+          );
+          const [meta, ...b64Lines] = commitOut.split("---B64---\\n");
+          if (!b64Lines.length) {
+            return JSON.stringify({ ok: false, error: `bundle failed: ${meta.slice(0, 200)}` });
+          }
+          await (await import("node:fs/promises")).writeFile(join(accDir, "bundle.b64"), b64Lines.join(""));
+          return JSON.stringify({ ok: true, transferId, staged: true, head: meta.trim().slice(-40) });
+        }
+        if (task.prompt === "__SEND_CHUNK__") {
+          // Manager pulls staged base64 back in ~64KB pieces.
+          const transferId = String(task.transferId ?? "t");
+          const accFile = join(tmpdir(), `fleet-xfer-${transferId}`, "bundle.b64");
+          try {
+            const b64 = await (await import("node:fs/promises")).readFile(accFile, "utf8");
+            const per = 64 * 1024;
+            const idx = Number(task.chunkIndex ?? 0);
+            if (idx * per >= b64.length) {
+              return JSON.stringify({ ok: true, done: true, chunks: idx });
+            }
+            return JSON.stringify({ ok: true, done: false, index: idx, data: b64.slice(idx * per, (idx + 1) * per) });
+          } catch {
+            return JSON.stringify({ ok: false, error: "no staged transfer for this id" });
+          }
+        }
 
         // Per-dispatch environment (issue: agent-specified environment).
         // 1. Git ref selection: refuse when the checkout is dirty, to avoid
@@ -1019,11 +1061,47 @@ export default definePluginEntry({
       },
       execute: async (toolCallId, params, signal) => {
         const p = params as { node: string; cwd: string; repo: string; branch?: string };
-        const { syncFromNode } = await import("./provision.js");
         const list = await api.runtime.nodes.list();
-        const node = (list.nodes ?? []).find((n) => n.displayName === p.node || n.nodeId === p.node);
+        const nodes = list.nodes ?? [];
+        const node = nodes.find((n) => n.displayName === p.node || n.nodeId === p.node);
         if (!node) return jsonResult(`Node "${p.node}" not found.`);
         const host = node.remoteIp ?? node.displayName ?? node.nodeId;
+        const cfg = (api.pluginConfig ?? {}) as FleetConfig;
+        const fleet = (await import("./membership.js")).resolveFleetNodes(nodes, cfg);
+        const member = fleet.find((t) => (t.displayName ?? t.nodeId) === (node.displayName ?? node.nodeId))?.member;
+
+        // SSH-free node: bundle on the worker via the node channel, pull the
+        // base64 back in chunks, then push with manager credentials.
+        if (member?.ssh === false) {
+          const transferId = `sync-${Date.now()}`;
+          const invoke = async (params: Record<string, unknown>, timeoutMs?: number) =>
+            api.runtime.nodes.invoke({
+              nodeId: node.nodeId,
+              command: "opencode.run",
+              params,
+              timeoutMs: timeoutMs ?? 60_000,
+              signal,
+            });
+          const bundleInv = await invoke({ prompt: "__BUNDLE__", cwd: p.cwd, transport: "http", transferId }, 120_000);
+          const bundlePl = payloadOf(bundleInv);
+          if (!bundlePl.ok) return jsonResult({ ok: false, error: bundlePl.error ?? "worker bundle failed" });
+          const parts: string[] = [];
+          for (let i = 0; ; i++) {
+            const c = payloadOf(await invoke({ prompt: "__SEND_CHUNK__", cwd: "/", transport: "http", transferId, chunkIndex: i }, 60_000));
+            if (c.done) break;
+            if (!c.ok || typeof c.data !== "string") return jsonResult({ ok: false, error: c.error ?? "chunk read failed" });
+            parts.push(c.data);
+          }
+          const { syncFromNode } = await import("./provision.js");
+          const r = await syncFromNode("local", p.cwd, p.repo, p.branch ?? "main", {
+            mode: "from-base64",
+            base64: parts.join(""),
+            branch: p.branch ?? "main",
+          });
+          return jsonResult({ ...r, viaChannel: true });
+        }
+
+        const { syncFromNode } = await import("./provision.js");
         const r = await syncFromNode(host, p.cwd, p.repo, p.branch ?? "main");
         return jsonResult(r);
       },
@@ -1638,4 +1716,13 @@ async function runShell(
       else signal.addEventListener("abort", () => child.kill(), { once: true });
     }
   });
+}
+
+/** Extract the parsed payload object from a node invoke result. */
+function payloadOf(inv: unknown): Record<string, unknown> {
+  const payload = (inv as { payload?: unknown }).payload;
+  if (typeof payload === "string") {
+    try { return JSON.parse(payload) as Record<string, unknown>; } catch { return {}; }
+  }
+  return ((payload as Record<string, unknown> | undefined) ?? {});
 }

@@ -138,6 +138,7 @@ export async function provisionToNode(
   bundlePath: string,
   req: ProvisionRequest,
   channelInvoke?: NodeInvokeFn,
+  opts?: { sshAvailable?: boolean },
 ): Promise<ProvisionResult> {
   const transferId = `${Date.now()}`;
   const remoteBundle = `/tmp/fleet-${transferId}.bundle`;
@@ -146,12 +147,18 @@ export async function provisionToNode(
     // Ship the bundle via SSH when available; fall back to the node channel
     // (chunked base64 through opencode.run) when SSH is not reachable.
     try {
+      if (opts?.sshAvailable === false) {
+        // Membership config says SSH is unavailable — go straight to the
+        // node channel instead of burning an scp timeout.
+        if (!channelInvoke) throw new Error("ssh unavailable and no channel invoke provided");
+        throw new Error("use-channel"); // routed below via catch
+      }
       await execFileP("scp", [...SSH_ARGS, bundlePath, `${nodeHost}:${remoteBundle}`], {
         timeout: 120_000,
       });
     } catch (sshErr) {
-      if (!channelInvoke) throw sshErr;
       shippedViaChannel = true;
+      if (!channelInvoke) throw new Error("channel invoke required for SSH-free provisioning");
       const { chunkBuffer } = await import("./ledger.js");
       const fs = await import("node:fs/promises");
       const chunks = chunkBuffer(await fs.readFile(bundlePath));
@@ -232,9 +239,28 @@ export async function syncFromNode(
   cwd: string,
   repo: string,
   branch: string,
+  prebuilt?: { mode: "from-base64"; base64: string; branch?: string },
 ): Promise<ProvisionResult & { synced?: boolean; uncommittedFiles?: number; detail?: string }> {
   const work = await mkdtemp(join(tmpdir(), "fleet-sync-"));
   try {
+    if (prebuilt?.mode === "from-base64") {
+      // SSH-free path: the manager already holds the worker's bundle as base64.
+      const localBundle = join(work, "worker.bundle");
+      await (await import("node:fs/promises")).writeFile(localBundle, Buffer.from(prebuilt.base64, "base64"));
+      const cloneDir = join(work, "repo");
+      await execFileP("git", ["clone", "--branch", prebuilt.branch ?? branch, repo, cloneDir], { timeout: 120_000 });
+      await execFileP("git", ["-C", cloneDir, "pull", localBundle, prebuilt.branch ?? branch], { timeout: 120_000 });
+      await execFileP("git", ["-C", cloneDir, "push", "origin", prebuilt.branch ?? branch], { timeout: 120_000 });
+      return {
+        ok: true,
+        cwd,
+        branch: prebuilt.branch ?? branch,
+        commit: "pushed",
+        synced: true,
+        viaChannel: true,
+        detail: "synced via node channel",
+      };
+    }
     // Step 1: detect uncommitted working-tree changes on the node.
     const statusCmd = `cd ${shq(cwd)} && git status --porcelain 2>/dev/null | wc -l`;
     const { stdout: dirtyOut } = await execFileP(
