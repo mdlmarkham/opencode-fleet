@@ -3,6 +3,7 @@ import { buildJsonPluginConfigSchema, jsonResult } from "openclaw/plugin-sdk/cor
 import { join } from "node:path";
 import { shq } from "./shell.js";
 import { buildOpenCodeCommand, parseOpenCodeOutput, type OpenCodeTask } from "./opencode.js";
+import { SSH_ARGS } from "./ssh.js";
 
 /** OpenCode task plus the dispatch watchdog knobs (idle/duration guards). */
 type FleetOpenCodeTask = OpenCodeTask & {
@@ -117,6 +118,16 @@ export default definePluginEntry({
           // List running OpenCode processes on this node (local ps, no SSH needed here).
           const activity = await runShell(OPCODE_PS_COMMAND, 15_000, context?.signal);
           return JSON.stringify({ ok: true, activity: parseActivity(activity) });
+        }
+        if (task.prompt === "__STATUS__") {
+          // Working-tree state of the checkout (issue #4: manager visibility).
+          const st = await runShell(
+            `cd ${shq(task.cwd)} && git status --porcelain 2>/dev/null | head -50; echo "---COUNT---"; git status --porcelain 2>/dev/null | wc -l`,
+            20_000,
+            context?.signal,
+          );
+          const [files, count] = st.split("---COUNT\\n");
+          return JSON.stringify({ ok: true, cwd: task.cwd, uncommittedCount: parseInt((count ?? "0").trim(), 10) || 0, files: files.trim() });
         }
 
         const command = buildOpenCodeCommand(task);
@@ -302,7 +313,24 @@ export default definePluginEntry({
             timeoutMs: task.timeoutMs,
             signal,
           });
-          results[node.displayName ?? node.nodeId] = inv;
+          // Post-dispatch working-tree state so the manager knows what state
+          // the node is in (issue #4).
+          let treeState: unknown;
+          try {
+            const stInv = await api.runtime.nodes.invoke({
+              nodeId: node.nodeId,
+              command: "opencode.run",
+              params: { prompt: "__STATUS__", cwd: p.cwd, transport: "http" },
+              timeoutMs: 20000,
+              signal,
+            });
+            const stPayload = (stInv as { payload?: unknown }).payload;
+            treeState =
+              typeof stPayload === "string" ? JSON.parse(stPayload) : stPayload;
+          } catch {
+            treeState = { ok: false, note: "status check failed" };
+          }
+          results[node.displayName ?? node.nodeId] = { result: inv, treeState };
         }
         return jsonResult(results);
       },
@@ -708,11 +736,16 @@ export default definePluginEntry({
           : fleet;
         if (!targets.length) return jsonResult(`No fleet nodes found.`);
 
-        // Discover what config is available to ship.
+        // Discover what config is available to ship (report search paths).
         const baseDir = p.configDir ?? join(api.rootDir ?? process.cwd(), "config");
         const local = await discoverLocalConfig(baseDir);
         if (!local.agentsDir && !local.globalRulesFile && !local.skillsDir && !local.opencodeConfigFile) {
-          return jsonResult(`No config found in ${baseDir}. Create agents/, skills/, AGENTS.md, or opencode.json there.`);
+          return jsonResult({
+            ok: false,
+            searched: local.report.searched,
+            missing: local.report.missing,
+            note: `No config found. Create agents/, skills/, AGENTS.md, or opencode.json under the searched paths above.`,
+          });
         }
 
         const results: Record<string, unknown> = {};
@@ -786,7 +819,24 @@ export default definePluginEntry({
         const results: Record<string, unknown> = {};
         for (const node of targets) {
           const host = node.remoteIp ?? node.displayName ?? node.nodeId;
-          results[node.displayName ?? node.nodeId] = await cleanupNode(host, p.cwd);
+          const entry: Record<string, unknown> = await cleanupNode(host, p.cwd);
+          // Report (not delete) uncommitted worker changes (issue #4).
+          if (p.cwd) {
+            try {
+              const stInv = await api.runtime.nodes.invoke({
+                nodeId: node.nodeId,
+                command: "opencode.run",
+                params: { prompt: "__STATUS__", cwd: p.cwd, transport: "http" },
+                timeoutMs: 20000,
+                signal,
+              });
+              const stPayload = (stInv as { payload?: unknown }).payload;
+              entry.treeState = typeof stPayload === "string" ? JSON.parse(stPayload) : stPayload;
+            } catch {
+              entry.treeState = { ok: false, note: "status check failed" };
+            }
+          }
+          results[node.displayName ?? node.nodeId] = entry;
         }
         return jsonResult(results);
       },
@@ -1230,7 +1280,7 @@ async function getNodeActivity(
   try {
     const { stdout } = await execFileP(
       "ssh",
-      ["-o", "ConnectTimeout=10", "-o", "BatchMode=yes", host, OPCODE_PS_COMMAND],
+      [...SSH_ARGS, host, OPCODE_PS_COMMAND],
       { timeout: 20_000 },
     );
     return parseActivity(stdout);

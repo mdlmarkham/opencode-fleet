@@ -15,8 +15,10 @@
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { readdir, readFile, stat, mkdir } from "node:fs/promises";
+import { readdir, readFile, mkdir, stat } from "node:fs/promises";
+import { statSync } from "node:fs";
 import { join, basename } from "node:path";
+import { SSH_ARGS } from "./ssh.js";
 
 const execFileP = promisify(execFile);
 
@@ -52,7 +54,7 @@ export async function provisionConfigToNode(
     // Ensure remote config dirs exist.
     await execFileP(
       "ssh",
-      ["-o", "ConnectTimeout=10", "-o", "BatchMode=yes", nodeHost, `mkdir -p ~/.config/opencode/agents ~/.claude/skills`],
+      [...SSH_ARGS, nodeHost, `mkdir -p ~/.config/opencode/agents ~/.claude/skills`],
       { timeout: 30_000 },
     );
 
@@ -64,7 +66,7 @@ export async function provisionConfigToNode(
       for (const f of mdFiles) {
         const local = join(req.agentsDir, f);
         const remote = `~/.config/opencode/agents/${f}`;
-        await execFileP("scp", ["-o", "ConnectTimeout=10", "-o", "BatchMode=yes", local, `${nodeHost}:${remote}`], {
+        await execFileP("scp", [...SSH_ARGS, local, `${nodeHost}:${remote}`], {
           timeout: 30_000,
         });
         result.agents.push(f);
@@ -75,7 +77,7 @@ export async function provisionConfigToNode(
     if (req.globalRulesFile) {
       await execFileP(
         "scp",
-        ["-o", "ConnectTimeout=10", "-o", "BatchMode=yes", req.globalRulesFile, `${nodeHost}:~/.config/opencode/AGENTS.md`],
+        [...SSH_ARGS, req.globalRulesFile, `${nodeHost}:~/.config/opencode/AGENTS.md`],
         { timeout: 30_000 },
       );
       result.globalRules = true;
@@ -92,7 +94,7 @@ export async function provisionConfigToNode(
           // Ship the whole skill dir.
           await execFileP(
             "scp",
-            ["-o", "ConnectTimeout=10", "-o", "BatchMode=yes", "-r", local, `${nodeHost}:~/.claude/skills/`],
+            [...SSH_ARGS, "-r", local, `${nodeHost}:~/.claude/skills/`],
             { timeout: 60_000 },
           );
           result.skills.push(skill);
@@ -104,7 +106,7 @@ export async function provisionConfigToNode(
     if (req.opencodeConfigFile) {
       await execFileP(
         "scp",
-        ["-o", "ConnectTimeout=10", "-o", "BatchMode=yes", req.opencodeConfigFile, `${nodeHost}:~/.config/opencode/opencode.json`],
+        [...SSH_ARGS, req.opencodeConfigFile, `${nodeHost}:~/.config/opencode/opencode.json`],
         { timeout: 30_000 },
       );
       result.opencodeConfig = true;
@@ -118,31 +120,50 @@ export async function provisionConfigToNode(
 
 /**
  * Read the manager's local config dirs to discover what's available to ship.
+ * Reports the search paths consulted and what was found/missed so a silent
+ * no-op is impossible (issue #3).
  */
 export async function discoverLocalConfig(
   baseDir: string,
-): Promise<{ agentsDir?: string; globalRulesFile?: string; skillsDir?: string; opencodeConfigFile?: string }> {
-  const out: { agentsDir?: string; globalRulesFile?: string; skillsDir?: string; opencodeConfigFile?: string } = {};
+): Promise<{
+  agentsDir?: string;
+  globalRulesFile?: string;
+  skillsDir?: string;
+  opencodeConfigFile?: string;
+  report: { baseDir: string; searched: Record<string, string>; found: Record<string, boolean>; missing: string[] };
+}> {
+  const out: {
+    agentsDir?: string;
+    globalRulesFile?: string;
+    skillsDir?: string;
+    opencodeConfigFile?: string;
+    report: { baseDir: string; searched: Record<string, string>; found: Record<string, boolean>; missing: string[] };
+  } = {
+    report: { baseDir, searched: {}, found: {}, missing: [] },
+  };
   const agentsDir = join(baseDir, "agents");
   const skillsDir = join(baseDir, "skills");
   const globalRules = join(baseDir, "AGENTS.md");
   const opencodeConfig = join(baseDir, "opencode.json");
+  out.report.searched = { agentsDir, skillsDir, globalRulesFile: globalRules, opencodeConfigFile: opencodeConfig };
 
-  try {
-    const a = await stat(agentsDir);
-    if (a.isDirectory()) out.agentsDir = agentsDir;
-  } catch {}
-  try {
-    const s = await stat(skillsDir);
-    if (s.isDirectory()) out.skillsDir = skillsDir;
-  } catch {}
-  try {
-    const g = await stat(globalRules);
-    if (g.isFile()) out.globalRulesFile = globalRules;
-  } catch {}
-  try {
-    const o = await stat(opencodeConfig);
-    if (o.isFile()) out.opencodeConfigFile = opencodeConfig;
-  } catch {}
+  const check = (path: string, key: string, kind: "dir" | "file") => {
+    try {
+      const st = statSync(path);
+      const hit = kind === "dir" ? st.isDirectory() : st.isFile();
+      out.report.found[key] = hit;
+      if (hit) (out as Record<string, unknown>)[key === "agents" ? "agentsDir" : key] = path;
+      else out.report.missing.push(key);
+      return hit;
+    } catch {
+      out.report.found[key] = false;
+      out.report.missing.push(key);
+      return false;
+    }
+  };
+  if (check(agentsDir, "agentsDir", "dir")) out.agentsDir = agentsDir;
+  if (check(skillsDir, "skillsDir", "dir")) out.skillsDir = skillsDir;
+  if (check(globalRules, "globalRulesFile", "file")) out.globalRulesFile = globalRules;
+  if (check(opencodeConfig, "opencodeConfigFile", "file")) out.opencodeConfigFile = opencodeConfig;
   return out;
 }

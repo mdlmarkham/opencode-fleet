@@ -15,6 +15,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { SSH_ARGS } from "./ssh.js";
 
 const execFileP = promisify(execFile);
 
@@ -77,16 +78,13 @@ export async function deployPlugin(req: DeployRequest): Promise<DeployResult> {
     // 4. Copy + install on each node.
     for (const host of req.nodes) {
       try {
-        await execFileP("scp", ["-o", "ConnectTimeout=10", "-o", "BatchMode=yes", tarball, `${host}:/tmp/`], {
+        await execFileP("scp", [...SSH_ARGS, tarball, `${host}:/tmp/`], {
           timeout: 120_000,
         });
         await execFileP(
           "ssh",
           [
-            "-o",
-            "ConnectTimeout=10",
-            "-o",
-            "BatchMode=yes",
+            ...SSH_ARGS,
             host,
             `cd /tmp && openclaw plugins install ${tarball.split("/").pop()} --force --accept-capabilities 2>&1 | tail -2`,
           ],
@@ -104,7 +102,7 @@ export async function deployPlugin(req: DeployRequest): Promise<DeployResult> {
         try {
           await execFileP(
             "ssh",
-            ["-o", "ConnectTimeout=10", "-o", "BatchMode=yes", host, "systemctl --user restart openclaw-node.service"],
+            [...SSH_ARGS, host, "systemctl --user restart openclaw-node.service"],
             { timeout: 60_000 },
           );
           add(`restart-${host}`, true);

@@ -11,6 +11,7 @@ import { promisify } from "node:util";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { SSH_ARGS } from "./ssh.js";
 
 const execFileP = promisify(execFile);
 
@@ -53,7 +54,7 @@ export async function detectNodeCapabilities(nodeHost: string, nodeName: string)
       `echo "TOOLS=$(which docker node npm python3 go rustc 2>/dev/null | xargs -n1 basename 2>/dev/null | tr '\\n' ',')"`,
       `echo "OPENCODE=$(opencode --version 2>/dev/null || echo none)"`,
     ].join(" && ");
-    const { stdout } = await execFileP("ssh", ["-o", "ConnectTimeout=10", "-o", "BatchMode=yes", nodeHost, cmd], {
+    const { stdout } = await execFileP("ssh", [...SSH_ARGS, nodeHost, cmd], {
       timeout: 30_000,
     });
 

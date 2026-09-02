@@ -21,6 +21,7 @@ import { mkdtemp, rm, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { shq } from "./shell.js";
+import { SSH_ARGS } from "./ssh.js";
 
 const execFileP = promisify(execFile);
 
@@ -108,7 +109,7 @@ export async function cleanupNode(nodeHost: string, cwd?: string): Promise<{ ok:
     ]
       .filter(Boolean)
       .join(" && ");
-    const { stdout } = await execFileP("ssh", ["-o", "ConnectTimeout=10", "-o", "BatchMode=yes", nodeHost, cmds], {
+    const { stdout } = await execFileP("ssh", [...SSH_ARGS, nodeHost, cmds], {
       timeout: 300_000,
     });
     return { ok: true, detail: stdout.trim() };
@@ -129,7 +130,7 @@ export async function provisionToNode(
   const remoteBundle = `/tmp/fleet-${Date.now()}.bundle`;
   try {
     // Ship the bundle to the worker.
-    await execFileP("scp", ["-o", "ConnectTimeout=10", "-o", "BatchMode=yes", bundlePath, `${nodeHost}:${remoteBundle}`], {
+    await execFileP("scp", [...SSH_ARGS, bundlePath, `${nodeHost}:${remoteBundle}`], {
       timeout: 120_000,
     });
 
@@ -146,7 +147,7 @@ export async function provisionToNode(
       .filter(Boolean)
       .join(" && ");
 
-    const { stdout } = await execFileP("ssh", ["-o", "ConnectTimeout=10", "-o", "BatchMode=yes", nodeHost, unpackCmd], {
+    const { stdout } = await execFileP("ssh", [...SSH_ARGS, nodeHost, unpackCmd], {
       timeout: 120_000,
     });
 
@@ -161,7 +162,7 @@ export async function provisionToNode(
   } finally {
     // Always remove the remote bundle, even on failure, to avoid bloat.
     try {
-      await execFileP("ssh", ["-o", "ConnectTimeout=10", "-o", "BatchMode=yes", nodeHost, `rm -f "${remoteBundle}"`], {
+      await execFileP("ssh", [...SSH_ARGS, nodeHost, `rm -f "${remoteBundle}"`], {
         timeout: 30_000,
       });
     } catch {
@@ -179,19 +180,54 @@ export async function syncFromNode(
   cwd: string,
   repo: string,
   branch: string,
-): Promise<ProvisionResult> {
+): Promise<ProvisionResult & { synced?: boolean; uncommittedFiles?: number; detail?: string }> {
   const work = await mkdtemp(join(tmpdir(), "fleet-sync-"));
   try {
-    // Worker creates a bundle of its current state.
+    // Step 1: detect uncommitted working-tree changes on the node.
+    const statusCmd = `cd ${shq(cwd)} && git status --porcelain 2>/dev/null | wc -l`;
+    const { stdout: dirtyOut } = await execFileP(
+      "ssh",
+      [...SSH_ARGS, nodeHost, statusCmd],
+      { timeout: 30_000 },
+    );
+    const uncommitted = parseInt(dirtyOut.trim(), 10) || 0;
+
+    // Step 2: commit uncommitted changes on the node before bundling, so the
+    // sync actually carries the worker's work (issue #1: silent data loss).
+    if (uncommitted > 0) {
+      const commitCmd = [
+        `cd ${shq(cwd)}`,
+        `git add -A`,
+        `git -c user.email=fleet-worker@${nodeHost} -c user.name="fleet-worker (${nodeHost})" commit -m "fleet_sync: auto-commit worker working-tree changes before sync"`,
+      ].join(" && ");
+      await execFileP("ssh", [...SSH_ARGS, nodeHost, commitCmd], {
+        timeout: 60_000,
+      });
+    }
+
+    // Step 2: check whether there are any commits to sync vs the remote.
+    const aheadCmd = `cd ${shq(cwd)} && git rev-list --count origin/${branch}..HEAD 2>/dev/null || echo 0`;
+    const { stdout: aheadOut } = await execFileP(
+      "ssh",
+      [...SSH_ARGS, nodeHost, aheadCmd],
+      { timeout: 30_000 },
+    );
+    const ahead = parseInt(aheadOut.trim(), 10) || 0;
+
+    if (uncommitted === 0 && ahead === 0) {
+      return { ok: true, cwd, branch, commit: "no-changes", detail: "no uncommitted changes and no commits ahead — nothing to sync" };
+    }
+
+    // Step 3: worker creates a bundle of its current state.
     const remoteBundle = `/tmp/fleet-sync-${Date.now()}.bundle`;
-    const workerCmd = `cd "${cwd}" && git bundle create "${remoteBundle}" --all 2>/dev/null; echo "BUNDLE_READY"`;
-    await execFileP("ssh", ["-o", "ConnectTimeout=10", "-o", "BatchMode=yes", nodeHost, workerCmd], {
+    const workerCmd = `cd ${shq(cwd)} && git bundle create ${shq(remoteBundle)} --all 2>/dev/null; echo "BUNDLE_READY"`;
+    await execFileP("ssh", [...SSH_ARGS, nodeHost, workerCmd], {
       timeout: 120_000,
     });
 
-    // Pull the bundle back to the manager.
+    // Step 4: pull the bundle back to the manager.
     const localBundle = join(work, "worker.bundle");
-    await execFileP("scp", ["-o", "ConnectTimeout=10", "-o", "BatchMode=yes", `${nodeHost}:${remoteBundle}`, localBundle], {
+    await execFileP("scp", [...SSH_ARGS, `${nodeHost}:${remoteBundle}`, localBundle], {
       timeout: 120_000,
     });
 
@@ -202,11 +238,19 @@ export async function syncFromNode(
     await execFileP("git", ["-C", cloneDir, "push", "origin", branch], { timeout: 120_000 });
 
     // Clean up the remote bundle.
-    await execFileP("ssh", ["-o", "ConnectTimeout=10", "-o", "BatchMode=yes", nodeHost, `rm -f "${remoteBundle}"`], {
+    await execFileP("ssh", [...SSH_ARGS, nodeHost, `rm -f ${shq(remoteBundle)}`], {
       timeout: 30_000,
     });
 
-    return { ok: true, cwd, branch, commit: "pushed" };
+    return {
+      ok: true,
+      cwd,
+      branch,
+      commit: "pushed",
+      synced: true,
+      uncommittedFiles: uncommitted,
+      detail: uncommitted > 0 ? `committed ${uncommitted} uncommitted file(s) on node before sync` : "pushed worker commits",
+    };
   } catch (err) {
     return { ok: false, error: (err as Error).message };
   } finally {
