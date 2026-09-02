@@ -34,6 +34,7 @@
     "tools": [
       "fleet_dispatch",
       "fleet_answer",
+      "fleet_iterate",
       "fleet_status",
       "fleet_abort",
       "fleet_diff",
@@ -46,7 +47,8 @@
       "fleet_provision_config",
       "fleet_recipe_recommend",
       "fleet_recipe_record",
-      "fleet_recipe_list"
+      "fleet_recipe_list",
+      "fleet_deploy"
     ]
   }
 }

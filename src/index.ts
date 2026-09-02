@@ -370,6 +370,104 @@ export default definePluginEntry({
     });
 
     api.registerTool({
+      name: "fleet_iterate",
+      label: "Fleet Iterate",
+      description:
+        "Dispatch a task and auto-iterate: if the worker's result indicates failure (build errors, test failures, or a hand-raise), re-dispatch with the errors appended until success or maxIterations. This is the Ralph-loop pattern for workers — turns a worker into a colleague that fixes its own mistakes.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          node: { type: "string", description: "Node display name or id." },
+          cwd: { type: "string", description: "Working directory on the node." },
+          prompt: { type: "string", description: "The task / goal for OpenCode." },
+          maxIterations: { type: "number", description: "Max iterations before giving up (default 5)." },
+          model: { type: "string", description: "Optional model override." },
+          transport: { type: "string", enum: ["http", "acp"], description: "Transport." },
+          timeoutMs: { type: "number", description: "Per-iteration timeout, ms." },
+          successMarker: {
+            type: "string",
+            description: "Optional string that indicates success (e.g. 'build succeeded'). If absent, treats any non-error result as success.",
+          },
+        },
+        required: ["node", "cwd", "prompt"],
+      },
+      execute: async (toolCallId, params, signal) => {
+        const p = params as {
+          node: string;
+          cwd: string;
+          prompt: string;
+          maxIterations?: number;
+          model?: string;
+          transport?: "http" | "acp";
+          timeoutMs?: number;
+          successMarker?: string;
+        };
+        const list = await api.runtime.nodes.list();
+        const node = (list.nodes ?? []).find((n) => n.displayName === p.node || n.nodeId === p.node);
+        if (!node) return jsonResult(`Node "${p.node}" not found.`);
+
+        const maxIter = p.maxIterations ?? 5;
+        const iterations: Array<{ iter: number; summary?: string; handRaised?: boolean; question?: string; error?: string }> = [];
+        let currentPrompt = p.prompt;
+
+        for (let i = 1; i <= maxIter; i++) {
+          const inv = await api.runtime.nodes.invoke({
+            nodeId: node.nodeId,
+            command: "opencode.run",
+            params: {
+              prompt: currentPrompt,
+              cwd: p.cwd,
+              transport: p.transport ?? "http",
+              model: p.model,
+              timeoutMs: p.timeoutMs ?? 300_000,
+            },
+            timeoutMs: p.timeoutMs ?? 300_000,
+            signal,
+          });
+          const payload = (inv as { payload?: unknown }).payload;
+          const parsed =
+            typeof payload === "string"
+              ? (JSON.parse(payload) as { ok?: boolean; summary?: string; handRaised?: boolean; question?: string; error?: string })
+              : ((payload as { ok?: boolean; summary?: string; handRaised?: boolean; question?: string; error?: string } | undefined) ?? {});
+
+          iterations.push({
+            iter: i,
+            summary: parsed.summary,
+            handRaised: parsed.handRaised,
+            question: parsed.question,
+            error: parsed.error,
+          });
+
+          // Hand-raise: stop and let the caller answer.
+          if (parsed.handRaised) {
+            return jsonResult({ iterations, handRaised: true, question: parsed.question, done: false });
+          }
+
+          // Success check.
+          const looksFailed = parsed.ok === false || /error|failed|timed out|stuck/i.test(parsed.summary ?? "");
+          const success = p.successMarker ? (parsed.summary ?? "").includes(p.successMarker) : !looksFailed;
+          if (success) {
+            return jsonResult({ iterations, done: true, success: true, finalSummary: parsed.summary });
+          }
+
+          // Re-dispatch with the failure context appended.
+          currentPrompt = [
+            p.prompt,
+            "",
+            `Iteration ${i} did not succeed. The worker reported:`,
+            parsed.summary ? `Output: ${parsed.summary.slice(0, 2000)}` : "",
+            parsed.error ? `Error: ${parsed.error.slice(0, 2000)}` : "",
+            "",
+            "Fix the issues above and try again. Do not repeat the same approach.",
+          ].join("\n");
+        }
+
+        return jsonResult({ iterations, done: true, success: false, note: `exceeded ${maxIter} iterations` });
+      },
+    });
+
+    api.registerTool({
       name: "fleet_provision",
       label: "Fleet Provision",
       description:
@@ -545,6 +643,49 @@ export default definePluginEntry({
           results[node.displayName ?? node.nodeId] = await cleanupNode(host, p.cwd);
         }
         return jsonResult(results);
+      },
+    });
+
+    api.registerTool({
+      name: "fleet_deploy",
+      label: "Fleet Deploy",
+      description:
+        "One-command deploy of the opencode-fleet plugin: build, pack, install on the gateway + all worker nodes, restart node services. Returns a gatewayRestartRequired signal — the caller must perform the final gateway restart (it kills the session). Use after any plugin code change.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          pluginDir: {
+            type: "string",
+            description: "Plugin repo root (where package.json lives). Defaults to the plugin's own dir.",
+          },
+          nodes: {
+            type: "array",
+            items: { type: "string" },
+            description: "Node SSH hosts to deploy to. Omit for all fleet nodes.",
+          },
+          restartNodes: { type: "boolean", description: "Restart node services after install (default true)." },
+        },
+      },
+      execute: async (toolCallId, params, signal) => {
+        const p = params as { pluginDir?: string; nodes?: string[]; restartNodes?: boolean };
+        const { deployPlugin } = await import("./deploy.js");
+        const list = await api.runtime.nodes.list();
+        const nodes = list.nodes ?? [];
+        const fleet = nodes.filter((n) =>
+          (cfg.nodePrefixes ?? ["dev"]).some((prefix) => (n.displayName ?? n.nodeId).startsWith(prefix)),
+        );
+        const targets = p.nodes?.length
+          ? fleet.filter((n) => p.nodes!.includes(n.displayName ?? n.nodeId) || p.nodes!.includes(n.nodeId))
+          : fleet;
+        const hosts = targets.map((n) => n.remoteIp ?? n.displayName ?? n.nodeId);
+        const pluginDir = p.pluginDir ?? join(api.rootDir ?? process.cwd(), "..");
+        const r = await deployPlugin({
+          pluginDir,
+          nodes: hosts,
+          restartNodes: p.restartNodes ?? true,
+        });
+        return jsonResult(r);
       },
     });
 
