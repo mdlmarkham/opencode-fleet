@@ -32,6 +32,10 @@ export interface OpenCodeTask {
   completionPromise?: string;
   /** Timeout for the whole run, ms. */
   timeoutMs?: number;
+  /** Kill the run if no output chunk arrives for this long, ms (stuck-loop guard). */
+  maxIdleMs?: number;
+  /** Kill the run if total runtime exceeds this, ms (stuck-loop guard). */
+  maxDurationMs?: number;
   /** Optional session id (used for abort/diff control messages). */
   sessionId?: string;
   /** Internal control flag: abort a running session. */
@@ -49,6 +53,10 @@ export interface OpenCodeRunResult {
   iterations?: number;
   durationMs?: number;
   error?: string;
+  /** True when the worker stopped to ask a clarifying question. */
+  handRaised?: boolean;
+  /** The worker's clarifying question (when handRaised). */
+  question?: string;
 }
 
 /**
@@ -107,11 +115,19 @@ export function parseOpenCodeOutput(raw: string): OpenCodeRunResult {
 
   const summary = texts.join("\n").trim();
   const ok = !/error|failed|timed out/i.test(raw) || summary.length > 0;
+
+  // Detect a hand-raise: the worker stopped to ask a clarifying question.
+  const handRaiseMatch = summary.match(/HAND_RAISE\s*[:\-]?\s*([\s\S]{1,500})/i);
+  const handRaised = Boolean(handRaiseMatch);
+  const question = handRaiseMatch ? handRaiseMatch[1].trim() : undefined;
+
   return {
     ok,
     transport: "http",
     sessionId,
-    summary: summary || raw.slice(0, 500),
+    summary: handRaised ? summary.replace(/HAND_RAISE\s*[:\-]?\s*/i, "").trim() : summary,
+    handRaised,
+    question,
     iterations: 1,
     diffSummary: undefined,
     error: ok ? undefined : raw.slice(0, 500),

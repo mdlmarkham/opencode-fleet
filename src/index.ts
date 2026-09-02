@@ -3,6 +3,23 @@ import { buildJsonPluginConfigSchema, jsonResult } from "openclaw/plugin-sdk/cor
 import { join } from "node:path";
 import { buildOpenCodeCommand, parseOpenCodeOutput, type OpenCodeTask } from "./opencode.js";
 
+/** OpenCode task plus the dispatch watchdog knobs (idle/duration guards). */
+type FleetOpenCodeTask = OpenCodeTask & {
+  /** Kill the run if no output chunk arrives for this long, ms. */
+  maxIdleMs?: number;
+  /** Kill the run if total runtime exceeds this, ms. */
+  maxDurationMs?: number;
+};
+
+/** One running OpenCode process on a node (from `ps`). */
+interface NodeActivityEntry {
+  pid?: number;
+  elapsed?: string;
+  cpu?: string;
+  command?: string;
+  error?: string;
+}
+
 /**
  * opencode-fleet — orchestrate OpenCode across multiple remote OpenClaw nodes.
  *
@@ -95,6 +112,11 @@ export default definePluginEntry({
           const models = await readNodeModels();
           return JSON.stringify({ ok: true, models });
         }
+        if (task.prompt === "__ACTIVITY__") {
+          // List running OpenCode processes on this node (local ps, no SSH needed here).
+          const activity = await runShell(OPCODE_PS_COMMAND, 15_000, context?.signal);
+          return JSON.stringify({ ok: true, activity: parseActivity(activity) });
+        }
 
         const command = buildOpenCodeCommand(task);
         // Emit progress chunks to keep the node invoke alive during long runs.
@@ -121,7 +143,14 @@ export default definePluginEntry({
           return JSON.stringify(acpResult);
         }
 
-        const result = await runShell(command, task.timeoutMs ?? 300_000, context?.signal, onChunk);
+        const result = await runShell(
+          command,
+          task.timeoutMs ?? 300_000,
+          context?.signal,
+          onChunk,
+          task.maxIdleMs,
+          task.maxDurationMs,
+        );
         return JSON.stringify(parseOpenCodeOutput(result));
       },
     },
@@ -180,6 +209,8 @@ export default definePluginEntry({
           model: { type: "string", description: "Optional model override (must exist on node)." },
           agent: { type: "string", description: "Optional OpenCode agent (build/plan)." },
           timeoutMs: { type: "number", description: "Per-node timeout, ms." },
+          maxIdleMs: { type: "number", description: "Kill the run if no output for this long, ms (stuck-loop guard). Default 120000." },
+          maxDurationMs: { type: "number", description: "Kill the run if total runtime exceeds this, ms (stuck-loop guard). Default 600000." },
           requires: {
             type: "object",
             additionalProperties: false,
@@ -204,6 +235,8 @@ export default definePluginEntry({
           model?: string;
           agent?: string;
           timeoutMs?: number;
+          maxIdleMs?: number;
+          maxDurationMs?: number;
           requires?: {
             gpu?: boolean;
             minDiskGb?: number;
@@ -258,6 +291,8 @@ export default definePluginEntry({
             model: p.model,
             agent: p.agent,
             timeoutMs: p.timeoutMs ?? cfg.defaultTimeoutMs,
+            maxIdleMs: p.maxIdleMs,
+            maxDurationMs: p.maxDurationMs,
           };
           const inv = await api.runtime.nodes.invoke({
             nodeId: node.nodeId,
@@ -269,6 +304,68 @@ export default definePluginEntry({
           results[node.displayName ?? node.nodeId] = inv;
         }
         return jsonResult(results);
+      },
+    });
+
+    api.registerTool({
+      name: "fleet_answer",
+      label: "Fleet Answer",
+      description:
+        "Answer a worker's hand-raised clarifying question and re-dispatch the task with the answer + prior context. Use when fleet_dispatch returns handRaised:true. The worker gets the answer and continues where it stopped.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          node: { type: "string", description: "Node display name or id." },
+          cwd: { type: "string", description: "Working directory on the node." },
+          question: { type: "string", description: "The worker's question (from the handRaised result)." },
+          answer: { type: "string", description: "Your answer / decision." },
+          priorContext: { type: "string", description: "The original task prompt (so the worker keeps context)." },
+          model: { type: "string", description: "Optional model override." },
+          transport: { type: "string", enum: ["http", "acp"], description: "Transport." },
+          timeoutMs: { type: "number", description: "Per-node timeout, ms." },
+        },
+        required: ["node", "cwd", "question", "answer", "priorContext"],
+      },
+      execute: async (toolCallId, params, signal) => {
+        const p = params as {
+          node: string;
+          cwd: string;
+          question: string;
+          answer: string;
+          priorContext: string;
+          model?: string;
+          transport?: "http" | "acp";
+          timeoutMs?: number;
+        };
+        const list = await api.runtime.nodes.list();
+        const node = (list.nodes ?? []).find((n) => n.displayName === p.node || n.nodeId === p.node);
+        if (!node) return jsonResult(`Node "${p.node}" not found.`);
+
+        // Re-dispatch with the answer appended to the original context.
+        const prompt = [
+          p.priorContext,
+          "",
+          "A clarifying question was raised and answered:",
+          `Q: ${p.question}`,
+          `A: ${p.answer}`,
+          "Continue the task with this answer. Do not re-ask the same question.",
+        ].join("\n");
+
+        const inv = await api.runtime.nodes.invoke({
+          nodeId: node.nodeId,
+          command: "opencode.run",
+          params: {
+            prompt,
+            cwd: p.cwd,
+            transport: p.transport ?? "http",
+            model: p.model,
+            timeoutMs: p.timeoutMs ?? 300_000,
+          },
+          timeoutMs: p.timeoutMs ?? 300_000,
+          signal,
+        });
+        return jsonResult(inv);
       },
     });
 
@@ -654,6 +751,62 @@ export default definePluginEntry({
     });
 
     api.registerTool({
+      name: "fleet_activity",
+      label: "Fleet Activity",
+      description:
+        "Show running OpenCode processes on fleet nodes: pid, elapsed time, cpu, and command. SSHes into each node and inspects its process table so you can see which nodes are busy before dispatching more work.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          nodes: {
+            type: "array",
+            items: { type: "string" },
+            description: "Node display names or ids. Omit for all fleet nodes.",
+          },
+        },
+      },
+      execute: async (toolCallId, params, signal) => {
+        const p = params as { nodes?: string[] };
+        const list = await api.runtime.nodes.list();
+        const nodes = list.nodes ?? [];
+        const fleet = nodes.filter((n) =>
+          (cfg.nodePrefixes ?? ["dev"]).some((prefix) => (n.displayName ?? n.nodeId).startsWith(prefix)),
+        );
+        const targets = p.nodes?.length
+          ? fleet.filter((n) => p.nodes!.includes(n.displayName ?? n.nodeId) || p.nodes!.includes(n.nodeId))
+          : fleet;
+        if (!targets.length) {
+          return jsonResult(
+            `No fleet nodes found. Paired nodes: ${nodes.map((n) => n.displayName ?? n.nodeId).join(", ") || "none"}`,
+          );
+        }
+        const results: Record<string, NodeActivityEntry[] | { error: string }> = {};
+        for (const node of targets) {
+          const host = node.remoteIp ?? node.displayName ?? node.nodeId;
+          results[node.displayName ?? node.nodeId] = await getNodeActivity(host, async () => {
+            // Fallback: ask the node host command to run ps locally.
+            const inv = await api.runtime.nodes.invoke({
+              nodeId: node.nodeId,
+              command: "opencode.run",
+              params: { prompt: "__ACTIVITY__", cwd: "/", transport: "http" },
+              timeoutMs: 20000,
+              signal,
+            });
+            const payload = (inv as { payload?: unknown }).payload;
+            const parsed =
+              typeof payload === "string"
+                ? (JSON.parse(payload) as { activity?: NodeActivityEntry[]; error?: string })
+                : ((payload as { activity?: NodeActivityEntry[]; error?: string } | undefined) ?? {});
+            if (parsed.activity) return parsed.activity;
+            return { error: parsed.error ?? "node returned no activity" };
+          });
+        }
+        return jsonResult(results);
+      },
+    });
+
+    api.registerTool({
       name: "fleet_capabilities",
       label: "Fleet Capabilities",
       description:
@@ -750,6 +903,57 @@ export default definePluginEntry({
   },
 });
 
+/** ps command listing running OpenCode processes on a node. */
+const OPCODE_PS_COMMAND =
+  `ps -eo pid,etime,pcpu,command | grep -E "[o]pencode (run|acp|serve)" | grep -v grep || true`;
+
+/**
+ * Parse `ps -eo pid,etime,pcpu,command` lines into activity entries.
+ */
+function parseActivity(raw: string): NodeActivityEntry[] {
+  const out: NodeActivityEntry[] = [];
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const [pid, elapsed, cpu, ...rest] = trimmed.split(/\s+/);
+    const command = rest.join(" ");
+    if (!pid || !command) continue;
+    out.push({
+      pid: Number.isFinite(Number(pid)) ? Number(pid) : undefined,
+      elapsed,
+      cpu,
+      command,
+    });
+  }
+  return out;
+}
+
+/**
+ * Manager-side: list running OpenCode processes on a node over SSH
+ * (same execFile ssh pattern as provision.ts). Falls back to the node
+ * invoke command (`__ACTIVITY__`) when SSH is unavailable.
+ */
+async function getNodeActivity(
+  host: string,
+  invokeFallback?: () => Promise<NodeActivityEntry[] | { error: string }>,
+): Promise<NodeActivityEntry[] | { error: string }> {
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const execFileP = promisify(execFile);
+  try {
+    const { stdout } = await execFileP(
+      "ssh",
+      ["-o", "ConnectTimeout=10", "-o", "BatchMode=yes", host, OPCODE_PS_COMMAND],
+      { timeout: 20_000 },
+    );
+    return parseActivity(stdout);
+  } catch (sshErr) {
+    // Fall back to the node host command channel when SSH is unavailable.
+    if (invokeFallback) return invokeFallback();
+    return { error: (sshErr as Error).message };
+  }
+}
+
 /**
  * Read the model catalog from the node's OpenCode config.
  */
@@ -778,12 +982,16 @@ async function readNodeModels(): Promise<Array<Record<string, unknown>>> {
 
 /**
  * Run a shell command on the node host, streaming output chunks.
+ * Watchdog: kills the process if no output arrives within maxIdleMs, or if
+ * total runtime exceeds maxDurationMs (stuck-loop guard).
  */
 async function runShell(
   command: string,
   timeoutMs: number,
   signal?: AbortSignal,
   onChunk?: (chunk: string) => Promise<void>,
+  maxIdleMs?: number,
+  maxDurationMs?: number,
 ): Promise<string> {
   const { spawn } = await import("node:child_process");
   return new Promise<string>((resolve) => {
@@ -791,36 +999,49 @@ async function runShell(
     let stdout = "";
     let stderr = "";
     let settled = false;
+    let lastChunkAt = Date.now();
+    const startedAt = Date.now();
+
+    const finish = (extra: string) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearInterval(idleTimer);
+      resolve(stdout + (stderr ? `\n${stderr}` : "") + extra);
+    };
 
     const timer = setTimeout(() => {
-      if (!settled) {
-        child.kill("SIGKILL");
-        resolve(stdout + (stderr ? `\n${stderr}` : "") + "\n[timeout]");
-        settled = true;
-      }
+      child.kill("SIGKILL");
+      finish("\n[timeout]");
     }, timeoutMs);
+
+    // Idle watchdog: kill if no output for maxIdleMs.
+    const idleTimer = setInterval(() => {
+      if (settled) return;
+      if (maxIdleMs && Date.now() - lastChunkAt > maxIdleMs) {
+        child.kill("SIGKILL");
+        finish(`\n[stuck: no output for ${Math.round((Date.now() - lastChunkAt) / 1000)}s]`);
+      }
+      if (maxDurationMs && Date.now() - startedAt > maxDurationMs) {
+        child.kill("SIGKILL");
+        finish(`\n[stuck: exceeded max duration ${Math.round(maxDurationMs / 1000)}s]`);
+      }
+    }, 5000);
 
     child.stdout.on("data", (d: Buffer) => {
       const s = d.toString();
       stdout += s;
+      lastChunkAt = Date.now();
       if (onChunk) onChunk(s).catch(() => {});
     });
     child.stderr.on("data", (d: Buffer) => {
       stderr += d.toString();
     });
     child.on("error", (err) => {
-      if (!settled) {
-        clearTimeout(timer);
-        resolve(stdout + (stderr ? `\n${stderr}` : "") + `\nERROR: ${err.message}`);
-        settled = true;
-      }
+      finish(`\nERROR: ${err.message}`);
     });
     child.on("close", (code) => {
-      if (!settled) {
-        clearTimeout(timer);
-        resolve(stdout + (stderr ? `\n${stderr}` : ""));
-        settled = true;
-      }
+      finish("");
     });
 
     if (signal) {
