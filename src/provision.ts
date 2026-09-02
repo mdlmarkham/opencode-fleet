@@ -20,6 +20,7 @@ import { promisify } from "node:util";
 import { mkdtemp, rm, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { shq } from "./shell.js";
 
 const execFileP = promisify(execFile);
 
@@ -101,9 +102,9 @@ export async function cleanupNode(nodeHost: string, cwd?: string): Promise<{ ok:
       // Remove any leftover fleet bundles.
       `rm -f /tmp/fleet-*.bundle`,
       // GC the checkout if provided (light GC; aggressive is too slow).
-      cwd ? `cd "${cwd}" && git gc --prune=now 2>/dev/null` : "",
+      cwd ? `cd ${shq(cwd)} && git gc --prune=now 2>/dev/null` : "",
       // Report disk usage of the checkout.
-      cwd ? `du -sh "${cwd}" 2>/dev/null` : "",
+      cwd ? `du -sh ${shq(cwd)} 2>/dev/null` : "",
     ]
       .filter(Boolean)
       .join(" && ");
@@ -135,12 +136,12 @@ export async function provisionToNode(
     // Unpack on the worker (no credentials needed). Light GC only —
     // aggressive GC is too slow for large repos and belongs in fleet_cleanup.
     const unpackCmd = [
-      `rm -rf "${req.cwd}"`,
-      `mkdir -p "${req.cwd}"`,
-      `git clone -q "${remoteBundle}" "${req.cwd}"`,
-      req.commit ? `cd "${req.cwd}" && git checkout -q ${req.commit}` : "",
-      `cd "${req.cwd}" && git gc --prune=now 2>/dev/null`,
-      `cd "${req.cwd}" && git rev-parse HEAD`,
+      `rm -rf ${shq(req.cwd)}`,
+      `mkdir -p ${shq(req.cwd)}`,
+      `git clone -q ${shq(remoteBundle)} ${shq(req.cwd)}`,
+      req.commit ? `cd ${shq(req.cwd)} && git checkout -q ${shq(req.commit)}` : "",
+      `cd ${shq(req.cwd)} && git gc --prune=now 2>/dev/null`,
+      `cd ${shq(req.cwd)} && git rev-parse HEAD`,
     ]
       .filter(Boolean)
       .join(" && ");

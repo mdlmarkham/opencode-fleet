@@ -1,6 +1,7 @@
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { buildJsonPluginConfigSchema, jsonResult } from "openclaw/plugin-sdk/core";
 import { join } from "node:path";
+import { shq } from "./shell.js";
 import { buildOpenCodeCommand, parseOpenCodeOutput, type OpenCodeTask } from "./opencode.js";
 
 /** OpenCode task plus the dispatch watchdog knobs (idle/duration guards). */
@@ -102,7 +103,7 @@ export default definePluginEntry({
         if (task.prompt === "__DIFF__") {
           // Show the working-tree diff in the checkout (real diff).
           const diff = await runShell(
-            `cd "${task.cwd}" && git diff --stat 2>/dev/null; echo "---"; git diff 2>/dev/null | head -200`,
+            `cd ${shq(task.cwd)} && git diff --stat 2>/dev/null; echo "---"; git diff 2>/dev/null | head -200`,
             30_000,
             context?.signal,
           );

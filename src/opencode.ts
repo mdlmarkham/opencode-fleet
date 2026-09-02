@@ -59,21 +59,24 @@ export interface OpenCodeRunResult {
   question?: string;
 }
 
+import { shq } from "./shell.js";
+
 /**
  * Build the shell command that runs OpenCode on the node for a given task.
  * Returns a single command string executed via the node's shell.
+ * All interpolated values are shell-escaped (shq) to prevent injection.
  */
 export function buildOpenCodeCommand(task: OpenCodeTask): string {
   const cwd = task.cwd || ".";
   const timeout = task.timeoutMs ?? 300_000;
-  const modelFlag = task.model ? ` --model "${task.model}"` : "";
-  const agentFlag = task.agent ? ` --agent "${task.agent}"` : "";
+  const modelFlag = task.model ? ` --model ${shq(task.model)}` : "";
+  const agentFlag = task.agent ? ` --agent ${shq(task.agent)}` : "";
 
   if (task.transport === "acp") {
     // ACP stdio: run `opencode acp` in the workspace. For v1 we run a
     // one-shot prompt through the ACP server.
     return [
-      `cd "${cwd}"`,
+      `cd ${shq(cwd)}`,
       `timeout ${Math.floor(timeout / 1000)} opencode acp${modelFlag}${agentFlag} --print-logs 2>&1 <<'OPENCODE_EOF'`,
       task.prompt,
       "OPENCODE_EOF",
@@ -83,8 +86,8 @@ export function buildOpenCodeCommand(task: OpenCodeTask): string {
   // HTTP transport: run `opencode run` directly (standalone, no server).
   // Output is NDJSON streaming; we capture it and extract the final text.
   return [
-    `cd "${cwd}"`,
-    `timeout ${Math.floor(timeout / 1000)} opencode run${modelFlag}${agentFlag} "${task.prompt}" --format json 2>&1`,
+    `cd ${shq(cwd)}`,
+    `timeout ${Math.floor(timeout / 1000)} opencode run${modelFlag}${agentFlag} ${shq(task.prompt)} --format json 2>&1`,
   ].join("\n");
 }
 
