@@ -1,5 +1,6 @@
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { buildJsonPluginConfigSchema, jsonResult } from "openclaw/plugin-sdk/core";
+import { join } from "node:path";
 import { buildOpenCodeCommand, parseOpenCodeOutput, type OpenCodeTask } from "./opencode.js";
 
 /**
@@ -73,10 +74,22 @@ export default definePluginEntry({
 
         // Special control messages (abort / diff / models) handled by the gateway tool.
         if (task.prompt === "__ABORT__") {
-          return JSON.stringify({ ok: true, aborted: true, sessionId: task.sessionId });
+          // Kill running OpenCode processes on the node (real abort).
+          const killed = await runShell(
+            `pkill -f "opencode (run|acp|serve)" 2>/dev/null; echo "aborted"`,
+            15_000,
+            context?.signal,
+          );
+          return JSON.stringify({ ok: true, aborted: true, sessionId: task.sessionId, detail: killed.trim() });
         }
         if (task.prompt === "__DIFF__") {
-          return JSON.stringify({ ok: true, diff: "diff not available for this session", sessionId: task.sessionId });
+          // Show the working-tree diff in the checkout (real diff).
+          const diff = await runShell(
+            `cd "${task.cwd}" && git diff --stat 2>/dev/null; echo "---"; git diff 2>/dev/null | head -200`,
+            30_000,
+            context?.signal,
+          );
+          return JSON.stringify({ ok: true, diff: diff.trim(), sessionId: task.sessionId });
         }
         if (task.prompt === "__MODELS__") {
           const models = await readNodeModels();
@@ -151,7 +164,7 @@ export default definePluginEntry({
       name: "fleet_dispatch",
       label: "Fleet Dispatch",
       description:
-        "Dispatch an OpenCode coding task to one or more remote OpenClaw nodes (dev2, dev3, ...). Returns per-node results. Use for multi-file coding work on remote dev hosts.",
+        "Dispatch an OpenCode coding task to one or more remote OpenClaw nodes (dev2, dev3, ...). Returns per-node results. Use for multi-file coding work on remote dev hosts. Optionally filter nodes by capability constraints (GPU, disk, RAM, tools, models) so work routes to nodes that can actually handle it.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -167,6 +180,18 @@ export default definePluginEntry({
           model: { type: "string", description: "Optional model override (must exist on node)." },
           agent: { type: "string", description: "Optional OpenCode agent (build/plan)." },
           timeoutMs: { type: "number", description: "Per-node timeout, ms." },
+          requires: {
+            type: "object",
+            additionalProperties: false,
+            description: "Capability constraints. Only nodes satisfying ALL constraints receive the task.",
+            properties: {
+              gpu: { type: "boolean", description: "Require a GPU (true) or a specific GPU substring." },
+              minDiskGb: { type: "number", description: "Minimum free disk in GB." },
+              minMemGb: { type: "number", description: "Minimum RAM in GB." },
+              tools: { type: "array", items: { type: "string" }, description: "Required installed tools (e.g. docker, node)." },
+              models: { type: "array", items: { type: "string" }, description: "Required available models." },
+            },
+          },
         },
         required: ["prompt", "cwd"],
       },
@@ -179,15 +204,43 @@ export default definePluginEntry({
           model?: string;
           agent?: string;
           timeoutMs?: number;
+          requires?: {
+            gpu?: boolean;
+            minDiskGb?: number;
+            minMemGb?: number;
+            tools?: string[];
+            models?: string[];
+          };
         };
         const list = await api.runtime.nodes.list();
         const nodes = list.nodes ?? [];
         const fleet = nodes.filter((n) =>
           (cfg.nodePrefixes ?? ["dev"]).some((prefix) => (n.displayName ?? n.nodeId).startsWith(prefix)),
         );
-        const targets = p.nodes?.length
+        let targets = p.nodes?.length
           ? fleet.filter((n) => p.nodes!.includes(n.displayName ?? n.nodeId) || p.nodes!.includes(n.nodeId))
           : fleet;
+
+        // Apply capability constraints if provided.
+        if (p.requires) {
+          const { detectNodeCapabilities, satisfiesConstraints } = await import("./capabilities.js");
+          const filtered: typeof targets = [];
+          const skipped: string[] = [];
+          for (const node of targets) {
+            const host = node.remoteIp ?? node.displayName ?? node.nodeId;
+            const caps = await detectNodeCapabilities(host, node.displayName ?? node.nodeId);
+            const check = satisfiesConstraints(caps, p.requires);
+            if (check.ok) filtered.push(node);
+            else skipped.push(`${node.displayName ?? node.nodeId} (${check.reason})`);
+          }
+          targets = filtered;
+          if (skipped.length) {
+            return jsonResult({
+              skipped: skipped,
+              note: "Nodes skipped for not meeting capability constraints.",
+            });
+          }
+        }
 
         if (!targets.length) {
           return jsonResult(
@@ -277,6 +330,55 @@ export default definePluginEntry({
         }
         // Clean up the manager-side bundle + staging dir to avoid bloat.
         await cleanupBundle(bundle.bundlePath);
+        return jsonResult(results);
+      },
+    });
+
+    api.registerTool({
+      name: "fleet_provision_config",
+      label: "Fleet Provision Config",
+      description:
+        "Ship OpenCode agent definitions, global rules (AGENTS.md), skills, and opencode.json to fleet nodes so workers work consistently with the manager. The manager holds the source-of-truth config; workers get it via SSH (no worker credentials needed).",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          nodes: {
+            type: "array",
+            items: { type: "string" },
+            description: "Node display names or ids. Omit for all fleet nodes.",
+          },
+          configDir: {
+            type: "string",
+            description: "Local dir containing agents/, skills/, AGENTS.md, opencode.json to ship. Defaults to plugin's config dir.",
+          },
+        },
+      },
+      execute: async (toolCallId, params, signal) => {
+        const p = params as { nodes?: string[]; configDir?: string };
+        const { provisionConfigToNode, discoverLocalConfig } = await import("./config-provision.js");
+        const list = await api.runtime.nodes.list();
+        const nodes = list.nodes ?? [];
+        const fleet = nodes.filter((n) =>
+          (cfg.nodePrefixes ?? ["dev"]).some((prefix) => (n.displayName ?? n.nodeId).startsWith(prefix)),
+        );
+        const targets = p.nodes?.length
+          ? fleet.filter((n) => p.nodes!.includes(n.displayName ?? n.nodeId) || p.nodes!.includes(n.nodeId))
+          : fleet;
+        if (!targets.length) return jsonResult(`No fleet nodes found.`);
+
+        // Discover what config is available to ship.
+        const baseDir = p.configDir ?? join(api.rootDir ?? process.cwd(), "config");
+        const local = await discoverLocalConfig(baseDir);
+        if (!local.agentsDir && !local.globalRulesFile && !local.skillsDir && !local.opencodeConfigFile) {
+          return jsonResult(`No config found in ${baseDir}. Create agents/, skills/, AGENTS.md, or opencode.json there.`);
+        }
+
+        const results: Record<string, unknown> = {};
+        for (const node of targets) {
+          const host = node.remoteIp ?? node.displayName ?? node.nodeId;
+          results[node.displayName ?? node.nodeId] = await provisionConfigToNode(host, local);
+        }
         return jsonResult(results);
       },
     });
@@ -418,6 +520,43 @@ export default definePluginEntry({
             invocable: n.invocableCommands ?? [],
           })),
         );
+      },
+    });
+
+    api.registerTool({
+      name: "fleet_capabilities",
+      label: "Fleet Capabilities",
+      description:
+        "Detect and report each fleet node's capabilities (CPU, RAM, disk, GPU, installed tools, available models). Use this to route work to nodes that can handle it, especially when nodes have diverging capabilities.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          nodes: {
+            type: "array",
+            items: { type: "string" },
+            description: "Node display names or ids. Omit for all fleet nodes.",
+          },
+        },
+      },
+      execute: async (toolCallId, params, signal) => {
+        const p = params as { nodes?: string[] };
+        const { detectNodeCapabilities } = await import("./capabilities.js");
+        const list = await api.runtime.nodes.list();
+        const nodes = list.nodes ?? [];
+        const fleet = nodes.filter((n) =>
+          (cfg.nodePrefixes ?? ["dev"]).some((prefix) => (n.displayName ?? n.nodeId).startsWith(prefix)),
+        );
+        const targets = p.nodes?.length
+          ? fleet.filter((n) => p.nodes!.includes(n.displayName ?? n.nodeId) || p.nodes!.includes(n.nodeId))
+          : fleet;
+        if (!targets.length) return jsonResult(`No fleet nodes found.`);
+        const results: Record<string, unknown> = {};
+        for (const node of targets) {
+          const host = node.remoteIp ?? node.displayName ?? node.nodeId;
+          results[node.displayName ?? node.nodeId] = await detectNodeCapabilities(host, node.displayName ?? node.nodeId);
+        }
+        return jsonResult(results);
       },
     });
 

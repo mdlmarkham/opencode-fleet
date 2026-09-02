@@ -36,7 +36,9 @@
       "fleet_models",
       "fleet_provision",
       "fleet_sync",
-      "fleet_cleanup"
+      "fleet_cleanup",
+      "fleet_capabilities",
+      "fleet_provision_config"
     ]
   }
 }
