@@ -41,7 +41,10 @@
       "fleet_sync",
       "fleet_cleanup",
       "fleet_capabilities",
-      "fleet_provision_config"
+      "fleet_provision_config",
+      "fleet_recipe_recommend",
+      "fleet_recipe_record",
+      "fleet_recipe_list"
     ]
   }
 }
