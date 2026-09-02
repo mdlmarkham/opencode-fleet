@@ -12,7 +12,8 @@
   "files": [
     "dist",
     "openclaw.plugin.json",
-    "README.md"
+    "README.md",
+    "skills"
   ],
   "peerDependencies": {
     "openclaw": ">=2026.5.17"

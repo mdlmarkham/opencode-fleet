@@ -27,6 +27,9 @@
   "activation": {
     "onStartup": true
   },
+  "skills": [
+    "skills/opencode-fleet"
+  ],
   "contracts": {
     "tools": [
       "fleet_dispatch",
