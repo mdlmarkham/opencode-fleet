@@ -85,7 +85,8 @@
       "fleet_recipe_record",
       "fleet_recipe_list",
       "fleet_deploy",
-      "fleet_resume"
+      "fleet_resume",
+      "fleet_run_status"
     ]
   }
 }

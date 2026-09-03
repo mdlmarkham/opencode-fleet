@@ -205,6 +205,91 @@ export default definePluginEntry({
           await (await import("node:fs/promises")).writeFile(join(accDir, "bundle.b64"), b64Lines.join(""));
           return JSON.stringify({ ok: true, transferId, staged: true, head: meta.trim().slice(-40) });
         }
+        if (task.prompt === "__RUN_START__") {
+          // Issue #6: detached execution. The child survives relay timeouts
+          // and gateway cancellations; its completion is recorded in a run
+          // state file that the manager polls.
+          const runId = String(task.runId ?? "");
+          if (!runId || !/^[-a-zA-Z0-9_]+$/.test(runId)) {
+            return JSON.stringify({ ok: false, error: "runId required for detached run" });
+          }
+          const statePath = runStatePath(runId);
+          const logPath = join(tmpdir(), `fleet-run-${runId}.log`);
+          const scriptPath = runScriptPath(runId);
+          // The script re-echoes the launch command with its own timeout, then
+          // writes the final output into the state file on exit.
+          const inner = buildOpenCodeCommand({ ...task, timeoutMs: task.maxDurationMs ?? task.timeoutMs ?? 600_000 });
+          // Completion is written to a SEPARATE file so the manager's JSON
+          // state write (below) and the worker's completion write never race.
+          const donePath = join(tmpdir(), `fleet-done-${runId}.json`);
+          const script = [
+            "#!/bin/bash",
+            inner,
+            `EC=$?`,
+            `printf '{"done":1,"exitCode":%s,"finishedAt":"%s"}\\n' "$EC" "$(date -u +%FT%TZ)" > ${shq(donePath)}`,
+            `exit $EC`,
+          ].join("\n");
+          await (await import("node:fs/promises")).writeFile(scriptPath, script, { mode: 0o755 });
+          const launchOut = await runShell(detachedLaunchCommand(runId, scriptPath, statePath), 15_000, context?.signal);
+          const pidMatch = launchOut.match(/LAUNCHED_PID=(\d+)/);
+          if (!pidMatch) {
+            return JSON.stringify({ ok: false, error: `launch failed: ${launchOut.trim().slice(0, 200)}` });
+          }
+          await (await import("node:fs/promises")).writeFile(
+            statePath,
+            JSON.stringify({ runId, pid: Number(pidMatch[1]), startedAt: new Date().toISOString(), state: "running" }),
+          );
+          return JSON.stringify({ ok: true, detached: true, runId, pid: Number(pidMatch[1]), statePath, logPath });
+        }
+        if (task.prompt === "__RUN_STATUS__") {
+          // Read the run-state file + liveness; never blocks on the run.
+          const runId = String(task.runId ?? "");
+          const statePath = runStatePath(runId);
+          try {
+            const raw = await (await import("node:fs/promises")).readFile(statePath, "utf8");
+            const st = JSON.parse(raw) as { pid?: number; state?: string; startedAt?: string; finishedAt?: string; exitCode?: number };
+            // Merge worker completion record when present (issue #6).
+            try {
+              const doneRaw = await (await import("node:fs/promises")).readFile(join(tmpdir(), `fleet-done-${runId}.json`), "utf8");
+              const done = JSON.parse(doneRaw) as { exitCode?: number; finishedAt?: string };
+              st.state = "finished";
+              st.exitCode = done.exitCode;
+              st.finishedAt = done.finishedAt;
+            } catch { /* still running or not finished */ }
+            // Liveness: is the pid still alive?
+            let alive = false;
+            if (st.pid) {
+              const ps = await runShell(`kill -0 ${st.pid} 2>/dev/null && echo ALIVE || echo DEAD`, 10_000, context?.signal);
+              alive = ps.includes("ALIVE");
+            }
+            return JSON.stringify({ ok: true, runId, ...st, alive });
+          } catch {
+            return JSON.stringify({ ok: false, error: "no run state (never started or already cleaned)" });
+          }
+        }
+        if (task.prompt === "__RUN_RESULT__") {
+          // Final output of a detached run: tail of the log + state.
+          const runId = String(task.runId ?? "");
+          const logPath = join(tmpdir(), `fleet-run-${runId}.log`);
+          const tail = await runShell(`tail -c 64000 ${shq(logPath)} 2>/dev/null || true`, 15_000, context?.signal);
+          const parsed = parseOpenCodeOutput(tail);
+          return JSON.stringify({ ok: true, runId, result: parsed });
+        }
+        if (task.prompt === "__RUN_ABORT__") {
+          const runId = String(task.runId ?? "");
+          try {
+            const raw = await (await import("node:fs/promises")).readFile(runStatePath(runId), "utf8");
+            const st = JSON.parse(raw) as { pid?: number };
+            if (st.pid) await runShell(`kill -TERM -- -${st.pid} 2>/dev/null; kill -9 ${st.pid} 2>/dev/null; echo ABORTED`, 10_000, context?.signal);
+            await (await import("node:fs/promises")).writeFile(
+              runStatePath(runId),
+              JSON.stringify({ runId, pid: st.pid, state: "aborted", finishedAt: new Date().toISOString() }),
+            );
+            return JSON.stringify({ ok: true, aborted: true, pid: st.pid });
+          } catch {
+            return JSON.stringify({ ok: false, error: "no run state" });
+          }
+        }
         if (task.prompt === "__SEND_CHUNK__") {
           // Manager pulls staged base64 back in ~64KB pieces.
           const transferId = String(task.transferId ?? "t");
@@ -338,6 +423,7 @@ export default definePluginEntry({
           timeoutMs: { type: "number", description: "Per-node timeout, ms." },
           maxIdleMs: { type: "number", description: "Kill the run if no output for this long, ms (stuck-loop guard). Default 120000." },
           maxDurationMs: { type: "number", description: "Kill the run if total runtime exceeds this, ms (stuck-loop guard). Default 600000." },
+          async: { type: "boolean", description: "Run detached: returns a run handle immediately (runId + pid); the worker survives relay timeouts and its completion is recorded. Poll with fleet_watch or fleet_run_status. Default true." },
           env: { type: "object", additionalProperties: { type: "string" }, description: "Environment variables for the worker process (per-dispatch environment). PATH/HOME/LD_* are ignored for safety." },
           ref: { type: "object", additionalProperties: false, properties: { branch: { type: "string", description: "Branch to check out before running." }, commit: { type: "string", description: "Commit SHA to check out before running." } }, description: "Git ref to check out before running. Refused if the checkout has uncommitted changes." },
           requires: {
@@ -366,6 +452,7 @@ export default definePluginEntry({
           timeoutMs?: number;
           maxIdleMs?: number;
           maxDurationMs?: number;
+          async?: boolean;
           env?: Record<string, string>;
           ref?: { branch?: string; commit?: string };
           requires?: {
@@ -378,9 +465,7 @@ export default definePluginEntry({
         };
         const list = await api.runtime.nodes.list();
         const nodes = list.nodes ?? [];
-        const fleet = nodes.filter((n) =>
-          (cfg.nodePrefixes ?? ["dev"]).some((prefix) => (n.displayName ?? n.nodeId).startsWith(prefix)),
-        );
+        const fleet = (await import("./membership.js")).resolveFleetNodes(nodes, cfg);
         let targets = p.nodes?.length
           ? fleet.filter((n) => p.nodes!.includes(n.displayName ?? n.nodeId) || p.nodes!.includes(n.nodeId))
           : fleet;
@@ -430,6 +515,7 @@ export default definePluginEntry({
             maxDurationMs: p.maxDurationMs,
             env: p.env,
             ref: p.ref,
+            async: p.async !== false,
           };
           // Ledger: record BEFORE the invoke so an agent/worker crash mid-run
           // still leaves a discoverable record (interruption handling).
@@ -444,16 +530,69 @@ export default definePluginEntry({
             updatedAt: new Date().toISOString(),
             state: "running",
           });
-          const inv = await api.runtime.nodes.invoke({
-            nodeId: node.nodeId,
-            command: "opencode.run",
-            params: task,
-            timeoutMs: task.timeoutMs,
-            signal,
-          }).catch((err: Error) => ({
-            invokeTimedOut: true as const,
-            message: err.message,
-          }));
+          // Issue #6: default to DETACHED execution. The node returns a run
+          // handle immediately; the child survives relay timeouts/cancels and
+          // records its own completion. fleet_watch/fleet_run_status poll it.
+          const detached = task.async !== false && transport === "http";
+          let inv: unknown;
+          if (detached) {
+            const launchParams = { ...task, prompt: "__RUN_START__" };
+            inv = await api.runtime.nodes
+              .invoke({
+                nodeId: node.nodeId,
+                command: "opencode.run",
+                params: launchParams,
+                timeoutMs: 30_000,
+                signal,
+              })
+              .catch((err: Error) => ({
+                invokeTimedOut: true as const,
+                message: err.message,
+              }));
+          } else {
+            inv = await api.runtime.nodes
+              .invoke({
+                nodeId: node.nodeId,
+                command: "opencode.run",
+                params: task,
+                timeoutMs: task.timeoutMs,
+                signal,
+              })
+              .catch((err: Error) => ({
+                invokeTimedOut: true as const,
+                message: err.message,
+              }));
+          }
+
+          // Detached launch: verify the ack and update the ledger with pid.
+          const launchPayload = payloadOf(inv) as {
+            ok?: boolean;
+            detached?: boolean;
+            runId?: string;
+            pid?: number;
+            error?: string;
+          };
+          if (detached && launchPayload.detached) {
+            await upsertRun(rootDir, {
+              runId,
+              node: node.displayName ?? node.nodeId,
+              cwd: p.cwd,
+              prompt: p.prompt,
+              model: p.model,
+              transport,
+              startedAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+              state: "running",
+              sessionId: `detached:${launchPayload.pid ?? 0}`,
+            });
+            results[node.displayName ?? node.nodeId] = {
+              runId,
+              detached: true,
+              pid: launchPayload.pid,
+              note: "Worker launched detached and survives relay timeouts. Poll with fleet_run_status(runId) or fleet_watch; fleet_resume finds it after interruptions.",
+            };
+            continue;
+          }
 
           // Issue #5: an invoke timeout is NOT proof the run failed — the
           // worker may still be live on the node. Never report a bare
@@ -603,6 +742,85 @@ export default definePluginEntry({
           incomplete: incomplete.length,
           discarded: p.discard === true,
           runs: findings,
+        });
+      },
+    });
+
+    api.registerTool({
+      name: "fleet_run_status",
+      label: "Fleet Run Status",
+      description:
+        "Poll a detached fleet run: liveness, state (running/finished/aborted), exit code, and final output when complete. Reconciles the run ledger on terminal state. Use with the runId returned by an async fleet_dispatch; also detects the issue-#6 inconsistent state (ledger says running, no live process, no completion record).",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          node: { type: "string", description: "Node display name or id." },
+          runId: { type: "string", description: "The fleet run id from the async dispatch result." },
+          includeOutput: { type: "boolean", description: "Include the worker's final output when the run is finished (default true)." },
+        },
+        required: ["node", "runId"],
+      },
+      execute: async (toolCallId, params, signal) => {
+        const p = params as { node: string; runId: string; includeOutput?: boolean };
+        const list = await api.runtime.nodes.list();
+        const node = (list.nodes ?? []).find((n) => n.displayName === p.node || n.nodeId === p.node);
+        if (!node) return jsonResult(`Node "${p.node}" not found.`);
+        const invoke = async (params: Record<string, unknown>, timeoutMs?: number) =>
+          api.runtime.nodes.invoke({
+            nodeId: node.nodeId,
+            command: "opencode.run",
+            params,
+            timeoutMs: timeoutMs ?? 20_000,
+            signal,
+          });
+
+        const st = payloadOf(await invoke({ prompt: "__RUN_STATUS__", cwd: "/", transport: "http", runId: p.runId }));
+        if (!st.ok && st.error) {
+          // Issue #6 inconsistency probe: no run state at all.
+          return jsonResult({ runId: p.runId, node: p.node, status: "missing-state", note: String(st.error) });
+        }
+        const alive = st.alive === true;
+        const finished = st.state === "finished" || st.state === "aborted" || typeof st.exitCode === "number";
+
+        // Reconcile ledger when terminal.
+        const { loadLedger, upsertRun } = await import("./ledger.js");
+        const rootDir = api.rootDir ?? process.cwd();
+        const ledger = await loadLedger(rootDir);
+        const entry = ledger.find((r) => r.runId === p.runId);
+        if (entry && (finished || entry.state === "running") && (st.finishedAt || !alive)) {
+          // Worker process gone without a completion marker = silent death
+          // (the exact issue #6 signature). Record it explicitly.
+          const state = st.finishedAt ? (st.exitCode === 0 ? "completed" : "failed") : "failed";
+          await upsertRun(rootDir, {
+            ...(entry ?? { runId: p.runId, node: p.node, cwd: "", prompt: "", startedAt: new Date().toISOString() }),
+            runId: p.runId,
+            node: entry?.node ?? p.node,
+            cwd: entry?.cwd ?? "",
+            prompt: entry?.prompt ?? "",
+            startedAt: entry?.startedAt ?? new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+            state,
+            summary: state === "failed" && !st.finishedAt ? "worker process died without completion record (silent death)" : undefined,
+          });
+        }
+
+        let output: unknown;
+        if (st.finishedAt && p.includeOutput !== false) {
+          const res = payloadOf(await invoke({ prompt: "__RUN_RESULT__", cwd: "/", transport: "http", runId: p.runId }, 30_000));
+          output = res.result;
+        }
+
+        return jsonResult({
+          runId: p.runId,
+          node: p.node,
+          pid: st.pid,
+          alive,
+          state: st.state ?? (alive ? "running" : "unknown"),
+          startedAt: st.startedAt,
+          finishedAt: st.finishedAt,
+          exitCode: st.exitCode,
+          output,
         });
       },
     });
@@ -940,9 +1158,7 @@ export default definePluginEntry({
         // Resolve target nodes.
         const list = await api.runtime.nodes.list();
         const nodes = list.nodes ?? [];
-        const fleet = nodes.filter((n) =>
-          (cfg.nodePrefixes ?? ["dev"]).some((prefix) => (n.displayName ?? n.nodeId).startsWith(prefix)),
-        );
+        const fleet = (await import("./membership.js")).resolveFleetNodes(nodes, cfg);
         const targets = p.nodes?.length
           ? fleet.filter((n) => p.nodes!.includes(n.displayName ?? n.nodeId) || p.nodes!.includes(n.nodeId))
           : fleet;
@@ -1014,9 +1230,7 @@ export default definePluginEntry({
         const { provisionConfigToNode, discoverLocalConfig } = await import("./config-provision.js");
         const list = await api.runtime.nodes.list();
         const nodes = list.nodes ?? [];
-        const fleet = nodes.filter((n) =>
-          (cfg.nodePrefixes ?? ["dev"]).some((prefix) => (n.displayName ?? n.nodeId).startsWith(prefix)),
-        );
+        const fleet = (await import("./membership.js")).resolveFleetNodes(nodes, cfg);
         const targets = p.nodes?.length
           ? fleet.filter((n) => p.nodes!.includes(n.displayName ?? n.nodeId) || p.nodes!.includes(n.nodeId))
           : fleet;
@@ -1129,9 +1343,7 @@ export default definePluginEntry({
         const { cleanupNode } = await import("./provision.js");
         const list = await api.runtime.nodes.list();
         const nodes = list.nodes ?? [];
-        const fleet = nodes.filter((n) =>
-          (cfg.nodePrefixes ?? ["dev"]).some((prefix) => (n.displayName ?? n.nodeId).startsWith(prefix)),
-        );
+        const fleet = (await import("./membership.js")).resolveFleetNodes(nodes, cfg);
         const targets = p.nodes?.length
           ? fleet.filter((n) => p.nodes!.includes(n.displayName ?? n.nodeId) || p.nodes!.includes(n.nodeId))
           : fleet;
@@ -1190,9 +1402,7 @@ export default definePluginEntry({
         const { deployPlugin } = await import("./deploy.js");
         const list = await api.runtime.nodes.list();
         const nodes = list.nodes ?? [];
-        const fleet = nodes.filter((n) =>
-          (cfg.nodePrefixes ?? ["dev"]).some((prefix) => (n.displayName ?? n.nodeId).startsWith(prefix)),
-        );
+        const fleet = (await import("./membership.js")).resolveFleetNodes(nodes, cfg);
         const targets = p.nodes?.length
           ? fleet.filter((n) => p.nodes!.includes(n.displayName ?? n.nodeId) || p.nodes!.includes(n.nodeId))
           : fleet;
@@ -1429,9 +1639,7 @@ export default definePluginEntry({
         const p = params as { nodes?: string[] };
         const list = await api.runtime.nodes.list();
         const nodes = list.nodes ?? [];
-        const fleet = nodes.filter((n) =>
-          (cfg.nodePrefixes ?? ["dev"]).some((prefix) => (n.displayName ?? n.nodeId).startsWith(prefix)),
-        );
+        const fleet = (await import("./membership.js")).resolveFleetNodes(nodes, cfg);
         const targets = p.nodes?.length
           ? fleet.filter((n) => p.nodes!.includes(n.displayName ?? n.nodeId) || p.nodes!.includes(n.nodeId))
           : fleet;
@@ -1486,9 +1694,7 @@ export default definePluginEntry({
         const { detectNodeCapabilities } = await import("./capabilities.js");
         const list = await api.runtime.nodes.list();
         const nodes = list.nodes ?? [];
-        const fleet = nodes.filter((n) =>
-          (cfg.nodePrefixes ?? ["dev"]).some((prefix) => (n.displayName ?? n.nodeId).startsWith(prefix)),
-        );
+        const fleet = (await import("./membership.js")).resolveFleetNodes(nodes, cfg);
         const targets = p.nodes?.length
           ? fleet.filter((n) => p.nodes!.includes(n.displayName ?? n.nodeId) || p.nodes!.includes(n.nodeId))
           : fleet;
@@ -1748,4 +1954,37 @@ function payloadOf(inv: unknown): Record<string, unknown> {
     try { return JSON.parse(payload) as Record<string, unknown>; } catch { return {}; }
   }
   return ((payload as Record<string, unknown> | undefined) ?? {});
+}
+
+/**
+ * Node-side run-state directory helpers (issue #6: detached execution with a
+ * durable completion record).
+ *
+ * Flow:
+ *  1. __RUN_START__ spawns the opencode command DETACHED (nohup + setsid on
+ *     unix) and records pid + startedAt in the run-state file. Returns
+ *     immediately, so the invoke relay can never kill the run.
+ *  2. The worker writes __RUN_RESULT__-readable state (exit marker + final
+ *     output) into the same file when it finishes.
+ *  3. Manager polls __RUN_STATUS__; reconciles ledger + reports result.
+ */
+
+function runStatePath(runId: string): string {
+  return join(tmpdir(), `fleet-run-${runId.replace(/[^a-zA-Z0-9_-]/g, "")}.json`);
+}
+
+function runScriptPath(runId: string): string {
+  return join(tmpdir(), `fleet-run-${runId.replace(/[^a-z0-9_-]/gi, "")}.sh`);
+}
+
+/** Build the detached launcher command for a run (unix; git-bash handles it on Windows). */
+function detachedLaunchCommand(runId: string, scriptPath: string, statePath: string): string {
+  return [
+    `rm -f ${shq(statePath)}`,
+    `printf 'pid=0\\nstartedAt=%s\\n' "$(date +%s)" > ${shq(statePath)}`,
+    // setsid detaches from the node-host process group so relay cancellation
+    // (node.invoke.cancel kills the process tree) cannot reach the child.
+    `setsid nohup /bin/bash ${shq(scriptPath)} > ${shq(join(tmpdir(), `fleet-run-${runId}.log`))} 2>&1 &`,
+    `echo "LAUNCHED_PID=$!"`,
+  ].join(" && ");
 }

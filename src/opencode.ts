@@ -42,6 +42,12 @@ export interface OpenCodeTask {
   env?: Record<string, string>;
   /** Git ref to check out before running (dispatch-time environment selection). Refused if the checkout has uncommitted changes. */
   ref?: { branch?: string; commit?: string };
+  /** Fleet run id — enables detached execution + durable completion record. */
+  runId?: string;
+  /** Detached execution (default true): node returns immediately with a run handle. */
+  async?: boolean;
+  /** Worker pid from the detached-start ack (for liveness checks). */
+  pid?: number;
   /** Node-channel transfer id (provisioning fallback when SSH unavailable). */
   transferId?: string;
   /** Node-channel transfer chunks: ordered base64 segments of a bundle. */
