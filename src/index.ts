@@ -1651,7 +1651,29 @@ async function readNodeModels(): Promise<Array<Record<string, unknown>>> {
  * Run a shell command on the node host, streaming output chunks.
  * Watchdog: kills the process if no output arrives within maxIdleMs, or if
  * total runtime exceeds maxDurationMs (stuck-loop guard).
+ *
+ * Shell selection: bash on Unix; on Windows prefer git-bash (keeps POSIX
+ * command grammar working), fall back to cmd.exe.
  */
+function nodeShellCommand(): { file: string; argsPrefix: string[] } {
+  if (process.platform === "win32") {
+    for (const candidate of [
+      "C:\\Program Files\\Git\\bin\\bash.exe",
+      "C:\\Program Files (x86)\\Git\\bin\\bash.exe",
+    ]) {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const fs = require("node:fs");
+        if (fs.existsSync(candidate)) return { file: candidate, argsPrefix: ["-c"] };
+      } catch {
+        // probe failed — try next candidate
+      }
+    }
+    return { file: process.env.ComSpec ?? "cmd.exe", argsPrefix: ["/d", "/s", "/c"] };
+  }
+  return { file: "/bin/bash", argsPrefix: ["-c"] };
+}
+
 async function runShell(
   command: string,
   timeoutMs: number,
@@ -1661,8 +1683,9 @@ async function runShell(
   maxDurationMs?: number,
 ): Promise<string> {
   const { spawn } = await import("node:child_process");
+  const shell = nodeShellCommand();
   return new Promise<string>((resolve) => {
-    const child = spawn("/bin/bash", ["-c", command], { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(shell.file, [...shell.argsPrefix, command], { stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     let settled = false;

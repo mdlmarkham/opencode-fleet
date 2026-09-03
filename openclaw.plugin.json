@@ -23,11 +23,39 @@
         },
         "default": [
           "dev"
-        ]
+        ],
+        "description": "Fallback: prefixes treated as fleet members when nodes is not configured"
       },
       "defaultTimeoutMs": {
         "type": "number",
         "default": 300000
+      },
+      "nodes": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "roles": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "ssh": {
+              "type": "boolean"
+            },
+            "platform": {
+              "type": "string"
+            },
+            "tags": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
       }
     }
   },
