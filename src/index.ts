@@ -417,6 +417,7 @@ export default definePluginEntry({
             items: { type: "string" },
             description: "Node display names or ids. Omit for all fleet nodes.",
           },
+          node: { type: "string", description: "Singular alias for nodes: [node]. Convenience for single-node dispatch." },
           transport: { type: "string", enum: ["http", "acp"], description: "OpenCode transport." },
           model: { type: "string", description: "Optional model override (must exist on node)." },
           agent: { type: "string", description: "Optional OpenCode agent (build/plan)." },
@@ -446,6 +447,7 @@ export default definePluginEntry({
           prompt: string;
           cwd: string;
           nodes?: string[];
+          node?: string;
           transport?: "http" | "acp";
           model?: string;
           agent?: string;
@@ -466,8 +468,9 @@ export default definePluginEntry({
         const list = await api.runtime.nodes.list();
         const nodes = list.nodes ?? [];
         const fleet = (await import("./membership.js")).resolveFleetNodes(nodes, cfg);
-        let targets = p.nodes?.length
-          ? fleet.filter((n) => p.nodes!.includes(n.displayName ?? n.nodeId) || p.nodes!.includes(n.nodeId))
+        const nodeFilter = p.node ? [p.node] : p.nodes;
+        let targets = nodeFilter?.length
+          ? fleet.filter((n) => nodeFilter!.includes(n.displayName ?? n.nodeId) || nodeFilter!.includes(n.nodeId))
           : fleet;
 
         // Apply capability constraints if provided.
@@ -501,8 +504,19 @@ export default definePluginEntry({
         const { upsertRun, newRunId, probeRun, loadLedger } = await import("./ledger.js");
         const rootDir = api.rootDir ?? process.cwd();
 
+        // Issue #8: unfiltered dispatch must not fail on non-OpenCode nodes.
+        const skippedNodes: string[] = [];
+        const opencodeTargets = targets.filter((n) => {
+          const invocable = (n as { invocableCommands?: string[] }).invocableCommands ?? [];
+          if (!invocable.includes("opencode.run")) {
+            skippedNodes.push(`${n.displayName ?? n.nodeId} (not an opencode node)`);
+            return false;
+          }
+          return true;
+        });
         const results: Record<string, unknown> = {};
-        for (const node of targets) {
+        if (skippedNodes.length) results.skipped = skippedNodes;
+        for (const node of opencodeTargets) {
           const runId = newRunId();
           const task: OpenCodeTask = {
             prompt: p.prompt,
@@ -564,46 +578,78 @@ export default definePluginEntry({
               }));
           }
 
-          // Detached launch: verify the ack and update the ledger with pid.
-          const launchPayload = payloadOf(inv) as {
-            ok?: boolean;
-            detached?: boolean;
-            runId?: string;
-            pid?: number;
-            error?: string;
-          };
-          if (detached && launchPayload.detached) {
-            await upsertRun(rootDir, {
-              runId,
-              node: node.displayName ?? node.nodeId,
-              cwd: p.cwd,
-              prompt: p.prompt,
-              model: p.model,
-              transport,
-              startedAt: new Date().toISOString(),
-              updatedAt: new Date().toISOString(),
-              state: "running",
-              sessionId: `detached:${launchPayload.pid ?? 0}`,
-            });
+          // Detached launch (issue #9): NEVER block the manager on the ack.
+          // The ledger is already written; the node-side __RUN_START__ writes
+          // the pid into the run-state file, which fleet_run_status reads.
+          // Return the handle optimistically even if the ack is slow.
+          if (detached) {
+            const launchPayload = payloadOf(inv) as {
+              ok?: boolean;
+              detached?: boolean;
+              runId?: string;
+              pid?: number;
+              error?: string;
+            };
+            const ackPending = !launchPayload.detached;
             results[node.displayName ?? node.nodeId] = {
               runId,
               detached: true,
               pid: launchPayload.pid,
-              note: "Worker launched detached and survives relay timeouts. Poll with fleet_run_status(runId) or fleet_watch; fleet_resume finds it after interruptions.",
+              ackPending,
+              note: ackPending
+                ? "Detached launch dispatched; ack pending (node may be slow to spawn). Poll fleet_run_status(runId) — the run handle is valid regardless."
+                : "Worker launched detached and survives relay timeouts. Poll with fleet_run_status(runId) or fleet_watch; fleet_resume finds it after interruptions.",
             };
             continue;
           }
 
-          // Issue #5: an invoke timeout is NOT proof the run failed — the
-          // worker may still be live on the node. Never report a bare
-          // TIMEOUT; tell the manager the run MAY be live and how to check.
+          // Issue #5/#11: an invoke timeout is NOT proof the run failed — but
+          // neither is it proof the run is alive. Probe liveness and report
+          // the actual state instead of the ambiguous "MAY still be live".
           const timedOut = (inv as { invokeTimedOut?: boolean }).invokeTimedOut === true;
           let dispatchResult: unknown;
           if (timedOut) {
+            let probe: Record<string, unknown> = { probed: false };
+            try {
+              const stInv = await api.runtime.nodes.invoke({
+                nodeId: node.nodeId,
+                command: "opencode.run",
+                params: { prompt: "__RUN_STATUS__", cwd: "/", transport: "http", runId },
+                timeoutMs: 20_000,
+                signal,
+              });
+              probe = payloadOf(stInv);
+            } catch {
+              probe = { probed: false, error: "liveness probe failed" };
+            }
+            const alive = probe.alive === true;
+            const hasCompletion = Boolean(probe.finishedAt || probe.state === "finished" || probe.state === "aborted");
+            const dead = !alive && !hasCompletion;
+            // Reconcile the ledger: a dead run with no completion record is
+            // marked failed, not left as timed-out/running (issue #11).
+            if (dead) {
+              await upsertRun(rootDir, {
+                runId,
+                node: node.displayName ?? node.nodeId,
+                cwd: p.cwd,
+                prompt: p.prompt,
+                model: p.model,
+                transport,
+                startedAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+                state: "failed",
+                summary: "run died without completion record (silent death)",
+              });
+            }
             dispatchResult = {
               ok: false,
               dispatchTimedOut: true,
-              note: `Invoke relay timed out after ${task.timeoutMs}ms waiting for the synchronous result. The run MAY still be live on the node. Do NOT re-dispatch blindly — check fleet_activity / __STATUS__ on this node first, then reattach via fleet_diff or fleet_watch.`,
+              runState: dead ? "dead" : alive ? "running" : "unknown",
+              note: dead
+                ? `Run died without a completion record (no live process, no completion file). Marked failed in the ledger. Safe to re-dispatch.`
+                : alive
+                  ? `Run is LIVE on the node (pid ${probe.pid}). Poll with fleet_run_status(runId) or fleet_watch.`
+                  : `Run state unknown after relay timeout. Check fleet_run_status(runId) before re-dispatching.`,
               error: (inv as { message?: string }).message,
             };
           } else {
@@ -1648,8 +1694,15 @@ export default definePluginEntry({
             `No fleet nodes found. Paired nodes: ${nodes.map((n) => n.displayName ?? n.nodeId).join(", ") || "none"}`,
           );
         }
-        const results: Record<string, NodeActivityEntry[] | { error: string }> = {};
+        const results: Record<string, NodeActivityEntry[] | { error: string } | { skipped: string }> = {};
         for (const node of targets) {
+          // Issue #8: skip nodes that don't support opencode.run (e.g. the
+          // Windows desktop node) instead of failing the whole call.
+          const invocable = (node as { invocableCommands?: string[] }).invocableCommands ?? [];
+          if (!invocable.includes("opencode.run")) {
+            results[node.displayName ?? node.nodeId] = { skipped: "not an opencode node (no opencode.run command)" };
+            continue;
+          }
           const host = node.remoteIp ?? node.displayName ?? node.nodeId;
           results[node.displayName ?? node.nodeId] = await getNodeActivity(host, async () => {
             // Fallback: ask the node host command to run ps locally.
