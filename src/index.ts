@@ -236,10 +236,20 @@ export default definePluginEntry({
             `exit $EC`,
           ].join("\n");
           await (await import("node:fs/promises")).writeFile(scriptPath, script, { mode: 0o755 });
-          const launchOut = await runShell(detachedLaunchCommand(runId, scriptPath, statePath), 15_000, context?.signal);
+          // Issue #21: a slow node host was the likely trigger for the launch
+          // ack timing out. Give the local spawn a more generous window than the
+          // old 15s — setsid/nohup return immediately, so this only matters when
+          // the host itself is under load. The manager still never blocks on
+          // the run (the child is detached).
+          const launchOut = await runShell(detachedLaunchCommand(runId, scriptPath, statePath), 45_000, context?.signal);
           const pidMatch = launchOut.match(/LAUNCHED_PID=(\d+)/);
           if (!pidMatch) {
-            return JSON.stringify({ ok: false, error: `launch failed: ${launchOut.trim().slice(0, 200)}` });
+            // Fail closed: no pid means no receipt. Report the real reason
+            // rather than letting the manager mint an optimistic handle.
+            return JSON.stringify({
+              ok: false,
+              error: `launch failed (no LAUNCHED_PID): ${launchOut.trim().slice(0, 200) || "empty launcher output"}`,
+            });
           }
           await (await import("node:fs/promises")).writeFile(
             statePath,
@@ -270,7 +280,25 @@ export default definePluginEntry({
             }
             return JSON.stringify({ ok: true, runId, ...st, alive });
           } catch {
-            return JSON.stringify({ ok: false, error: "no run state (never started or already cleaned)" });
+            // Distinguish never-started from cleaned (issue #21): if the
+            // launch was never acked, no state file was ever written. We can't
+            // tell "never started" from "cleaned up" by absence alone, so look
+            // for the worker script and log as corroborating evidence.
+            const scriptExists = await (await import("node:fs/promises"))
+              .stat(runScriptPath(runId))
+              .then(() => true)
+              .catch(() => false);
+            const logExists = await (await import("node:fs/promises"))
+              .stat(join(tmpdir(), `fleet-run-${runId}.log`))
+              .then(() => true)
+              .catch(() => false);
+            return JSON.stringify({
+              ok: false,
+              status: scriptExists || logExists ? "cleaned" : "never-started",
+              error: scriptExists || logExists
+                ? "no run state (script/log present, state cleaned)"
+                : "no run state (never started)",
+            });
           }
         }
         if (task.prompt === "__RUN_RESULT__") {
@@ -584,10 +612,11 @@ export default definePluginEntry({
               }));
           }
 
-          // Detached launch (issue #9): NEVER block the manager on the ack.
-          // The ledger is already written; the node-side __RUN_START__ writes
-          // the pid into the run-state file, which fleet_run_status reads.
-          // Return the handle optimistically even if the ack is slow.
+          // Detached launch (issues #9, #21): NEVER block the manager on the
+          // ack. But also never MINT a success: if the invoke timed out or the
+          // node returned {ok:false}, we have no receipt for a launch that
+          // happened, and must say so — not assert "the run handle is valid
+          // regardless". A false-success here hides the real relay diagnostic.
           if (detached) {
             const launchPayload = payloadOf(inv) as {
               ok?: boolean;
@@ -596,15 +625,51 @@ export default definePluginEntry({
               pid?: number;
               error?: string;
             };
-            const ackPending = !launchPayload.detached;
+            const invokeTimedOut = (inv as { invokeTimedOut?: boolean }).invokeTimedOut === true;
+            const nodeRejected = launchPayload.ok === false;
+            const ackOk = launchPayload.detached === true;
+
+            // Hard failure: the node explicitly reported the launch failed, or
+            // the relay never returned AND we got no positive ack. Either way
+            // no run state exists, so returning an optimistic handle would be
+            // a fabricated receipt.
+            if (nodeRejected || (invokeTimedOut && !ackOk)) {
+              const errMsg = launchPayload.error
+                ?? (inv as { message?: string }).message
+                ?? "detached launch not acknowledged";
+              results[node.displayName ?? node.nodeId] = {
+                runId,
+                detached: true,
+                ok: false,
+                ackPending: !ackOk,
+                ...(invokeTimedOut ? { invokeTimedOut: true } : {}),
+                error: nodeRejected ? `launch failed: ${errMsg}` : `launch ack not received: ${errMsg}`,
+                note:
+                  "Launch was NOT confirmed. No run state was written; fleet_run_status will report never-started. Do not rely on this handle.",
+              };
+              continue;
+            }
+
+            // Positive ack: the node wrote the pid into the run-state file.
+            if (ackOk) {
+              results[node.displayName ?? node.nodeId] = {
+                runId,
+                detached: true,
+                pid: launchPayload.pid,
+                ackPending: false,
+                note: "Worker launched detached and survives relay timeouts. Poll with fleet_run_status(runId) or fleet_watch; fleet_resume finds it after interruptions.",
+              };
+              continue;
+            }
+
+            // Ambiguous: no error and no ack (unexpected shape). Report
+            // honestly rather than inventing a valid handle.
             results[node.displayName ?? node.nodeId] = {
               runId,
               detached: true,
-              pid: launchPayload.pid,
-              ackPending,
-              note: ackPending
-                ? "Detached launch dispatched; ack pending (node may be slow to spawn). Poll fleet_run_status(runId) — the run handle is valid regardless."
-                : "Worker launched detached and survives relay timeouts. Poll with fleet_run_status(runId) or fleet_watch; fleet_resume finds it after interruptions.",
+              ackPending: true,
+              note:
+                "Launch ack not received — the run may not have started. Verify with fleet_run_status(runId) before relying on this handle.",
             };
             continue;
           }
@@ -829,8 +894,22 @@ export default definePluginEntry({
 
         const st = payloadOf(await invoke({ prompt: "__RUN_STATUS__", cwd: "/", transport: "http", runId: p.runId }));
         if (!st.ok && st.error) {
-          // Issue #6 inconsistency probe: no run state at all.
-          return jsonResult({ runId: p.runId, node: p.node, status: "missing-state", note: String(st.error) });
+          // Issue #6 inconsistency probe: no run state at all. Issue #21:
+          // distinguish never-started from cleaned rather than one ambiguous
+          // message, so an operator can tell a failed launch from a tidied run.
+          const rawStatus = String(st.status ?? "missing-state");
+          const status = rawStatus === "never-started" || rawStatus === "cleaned" ? rawStatus : "missing-state";
+          return jsonResult({
+            runId: p.runId,
+            node: p.node,
+            status,
+            note: String(st.error),
+            ...(status === "never-started"
+              ? { guidance: "Launch was never acknowledged — the run did not start. Re-dispatch if work is expected." }
+              : status === "cleaned"
+                ? { guidance: "Run artifacts exist but state was cleaned; the run did start. See fleet_cleanup/logs." }
+                : {}),
+          });
         }
         const alive = st.alive === true;
         const finished = st.state === "finished" || st.state === "aborted" || typeof st.exitCode === "number";
@@ -2044,9 +2123,13 @@ function runScriptPath(runId: string): string {
 
 /** Build the detached launcher command for a run (unix; git-bash handles it on Windows). */
 function detachedLaunchCommand(runId: string, scriptPath: string, statePath: string): string {
+  // Issue #21: the launcher must be fast and must never block on the child.
+  // We bound the whole launch sequence so a wedged node host cannot burn the
+  // manager's 30s invoke budget: setsid/nohup return immediately, and the
+  // `wait`-free structure means LAUNCHED_PID is echoed right after spawn.
   return [
     `rm -f ${shq(statePath)}`,
-    `printf 'pid=0\\nstartedAt=%s\\n' "$(date +%s)" > ${shq(statePath)}`,
+    `printf 'pid=0\nstartedAt=%s\n' "$(date +%s)" > ${shq(statePath)}`,
     // setsid detaches from the node-host process group so relay cancellation
     // (node.invoke.cancel kills the process tree) cannot reach the child.
     `setsid nohup /bin/bash ${shq(scriptPath)} > ${shq(join(tmpdir(), `fleet-run-${runId}.log`))} 2>&1 &`,
