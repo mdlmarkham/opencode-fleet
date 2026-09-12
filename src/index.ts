@@ -584,7 +584,7 @@ export default definePluginEntry({
           const detached = task.async !== false && transport === "http";
           let inv: unknown;
           if (detached) {
-            const launchParams = { ...task, prompt: "__RUN_START__" };
+            const launchParams = { ...task, prompt: "__RUN_START__", runId };
             inv = await api.runtime.nodes
               .invoke({
                 nodeId: node.nodeId,
@@ -2132,7 +2132,10 @@ function detachedLaunchCommand(runId: string, scriptPath: string, statePath: str
     `printf 'pid=0\nstartedAt=%s\n' "$(date +%s)" > ${shq(statePath)}`,
     // setsid detaches from the node-host process group so relay cancellation
     // (node.invoke.cancel kills the process tree) cannot reach the child.
-    `setsid nohup /bin/bash ${shq(scriptPath)} > ${shq(join(tmpdir(), `fleet-run-${runId}.log`))} 2>&1 &`,
-    `echo "LAUNCHED_PID=$!"`,
-  ].join(" && ");
+    // NOTE: the background `&` must terminate the whole chain, not sit inside a
+    // `&&`-joined element — `... 2>&1 & && echo` is a bash syntax error. So we
+    // join the setup steps with `&&`, background that entire chain, then emit
+    // the LAUNCHED_PID line as a separate statement.
+    `setsid nohup /bin/bash ${shq(scriptPath)} > ${shq(join(tmpdir(), `fleet-run-${runId}.log`))} 2>&1`,
+  ].join(" && ") + ` &\necho "LAUNCHED_PID=$!"`;
 }
