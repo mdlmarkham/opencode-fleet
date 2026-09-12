@@ -25,6 +25,39 @@ import { SSH_ARGS } from "./ssh.js";
 
 const execFileP = promisify(execFile);
 
+/**
+ * Resolve a caller-supplied repo reference into something `git clone` can use.
+ *
+ * `git clone` treats a bare `owner/repo` as a LOCAL filesystem path, so a
+ * shorthand like `mdlmarkham/OHM_ts_sidecar` fails with `fatal: repository
+ * ... does not exist` unless the machine happens to carry a `url.insteadOf`
+ * rewrite. Fleet nodes and the manager do not, by default. Normalize the
+ * common GitHub shorthand to an HTTPS URL; leave anything that already looks
+ * like a URL, an scp-style address, an absolute/local path, or a file:// URL
+ * untouched so explicit forms keep working.
+ */
+export function normalizeRepo(repo: string): string {
+    const r = repo.trim();
+    if (!r)
+        return r;
+    // Already a URL or remote scheme (https://, ssh://, git://, file://, git@host:path).
+    if (/^(?:[a-z][a-z0-9+.-]*:\/\/|git@[^:]+:)/i.test(r))
+        return r;
+    // Absolute or explicit relative filesystem path.
+    if (r.startsWith("/") || r.startsWith("./") || r.startsWith("../") || r.startsWith("~"))
+        return r;
+    // Windows drive path.
+    if (/^[a-zA-Z]:[\\/]/.test(r))
+        return r;
+    // GitHub-style shorthand: owner/repo (optionally with a .git suffix).
+    if (/^[\w.-]+\/[\w.-]+(?:\.git)?$/.test(r)) {
+        const cleaned = r.endsWith(".git") ? r : `${r}.git`;
+        return `https://github.com/${cleaned}`;
+    }
+    // Unknown shape — hand it back unchanged rather than guessing.
+    return r;
+}
+
 export interface ProvisionRequest {
   /** Git URL or repo path the manager can access (e.g. git@github.com:org/repo or https://...). */
   repo: string;
@@ -47,6 +80,9 @@ export interface ProvisionResult {
   ok: boolean;
   cwd?: string;
   branch?: string;
+  /** The worker's checked-out branch that carried the synced work, when it
+   * differed from the destination branch. */
+  workerBranch?: string;
   commit?: string;
   error?: string;
   /** True when the bundle was shipped via the node channel (SSH unavailable). */
@@ -73,7 +109,7 @@ export async function createRepoBundle(req: ProvisionRequest): Promise<{
     // Clone with manager credentials (uses ambient gh/git auth).
     // Full clone (no --depth) so the bundle carries complete history the
     // worker can traverse.
-    await execFileP("git", ["clone", "--branch", branch, req.repo, cloneDir], {
+    await execFileP("git", ["clone", "--branch", branch, normalizeRepo(req.repo), cloneDir], {
       timeout: 300_000,
     });
 
@@ -283,7 +319,7 @@ export async function syncFromNode(
   cwd: string,
   repo: string,
   branch: string,
-  prebuilt?: { mode: "from-base64"; base64: string; branch?: string; base?: string },
+  prebuilt?: { mode: "from-base64"; base64: string; branch?: string; base?: string; workerBranch?: string },
 ): Promise<ProvisionResult & { synced?: boolean; uncommittedFiles?: number; detail?: string }> {
   const work = await mkdtemp(join(tmpdir(), "fleet-sync-"));
   try {
@@ -304,28 +340,72 @@ export async function syncFromNode(
       const localBundle = join(work, "worker.bundle");
       await (await import("node:fs/promises")).writeFile(localBundle, Buffer.from(prebuilt.base64, "base64"));
       const cloneDir = join(work, "repo");
-      await execFileP("git", ["clone", "--branch", prebuilt.branch ?? branch, repo, cloneDir], { timeout: 120_000 });
-      await execFileP("git", ["-C", cloneDir, "pull", localBundle, prebuilt.branch ?? branch], { timeout: 120_000 });
-      // Verify the pull actually advanced HEAD; otherwise this is a no-op that
-      // must not be reported as a successful push.
-      const { stdout: localHead } = await execFileP("git", ["-C", cloneDir, "rev-parse", "HEAD"], { timeout: 30_000 });
-      const { stdout: remoteHead } = await execFileP("git", ["-C", cloneDir, "rev-parse", `origin/${prebuilt.branch ?? branch}`], { timeout: 30_000 });
-      if (localHead.trim() === remoteHead.trim()) {
+      // Clone a branch that EXISTS on origin (the destination branch). The
+      // worker's own branch usually does NOT exist remotely yet — creating it
+      // is the entire purpose of sync — so `--branch <worker-branch>` would
+      // fail with "Remote branch ... not found in upstream origin". Clone the
+      // destination branch, then fetch the worker's refs from the bundle.
+      const destBranch = prebuilt.branch ?? branch;
+      await execFileP("git", ["clone", "--branch", destBranch, normalizeRepo(repo), cloneDir], { timeout: 120_000 });
+      const workerBranch = prebuilt.workerBranch ?? destBranch;
+      // Fetch every bundle ref under refs/remotes/bundler/* so we can push the
+      // worker's actual branch even when it is not the destination branch.
+      await execFileP("git", ["-C", cloneDir, "fetch", localBundle,
+          "refs/heads/*:refs/remotes/bundler/*"], { timeout: 120_000 });
+      const bundleRef = `refs/remotes/bundler/${workerBranch}`;
+      try {
+        await execFileP("git", ["-C", cloneDir, "rev-parse", "--verify", "--quiet", bundleRef], { timeout: 30_000 });
+      }
+      catch {
+        return {
+          ok: false,
+          cwd,
+          branch: destBranch,
+          commit: "detection-failed",
+          error: `worker bundle did not contain branch "${workerBranch}"`,
+          detail: "refusing to report success when the worker branch is absent from the bundle (fail-closed)",
+        };
+      }
+      // Verify the push will actually advance origin/<destBranch>.
+      const { stdout: preHead } = await execFileP("git", ["-C", cloneDir, "rev-parse", `origin/${destBranch}`], { timeout: 30_000 });
+      try {
+        await execFileP("git", ["-C", cloneDir, "push", "origin", `${bundleRef}:refs/heads/${destBranch}`], { timeout: 120_000 });
+      }
+      catch (pushErr) {
+        const msg = (pushErr as Error).message;
+        if (/non-fast-forward|\[rejected\]|fetch first/i.test(msg)) {
+          return {
+            ok: false,
+            cwd,
+            branch: destBranch,
+            workerBranch,
+            commit: "push-rejected",
+            synced: false,
+            viaChannel: true,
+            error: `push to origin/${destBranch} rejected (non-fast-forward)`,
+            detail: `origin/${destBranch} has advanced past the worker's base; the worker's commits are in the bundle but were NOT published. Rebasing the worker branch onto origin/${destBranch} is required.`,
+          };
+        }
+        throw pushErr;
+      }
+      const { stdout: postHead } = await execFileP("git", ["-C", cloneDir, "rev-parse", `origin/${destBranch}`], { timeout: 30_000 });
+      if (preHead.trim() === postHead.trim()) {
         return {
           ok: true,
           cwd,
-          branch: prebuilt.branch ?? branch,
+          branch: destBranch,
+          workerBranch,
           commit: "no-changes",
           synced: false,
           viaChannel: true,
-          detail: "worker bundle carried no new commits — nothing to sync",
+          detail: `worker branch "${workerBranch}" carried no commits new to origin/${destBranch} — nothing pushed`,
         };
       }
-      await execFileP("git", ["-C", cloneDir, "push", "origin", prebuilt.branch ?? branch], { timeout: 120_000 });
       return {
         ok: true,
         cwd,
-        branch: prebuilt.branch ?? branch,
+        branch: destBranch,
+        workerBranch,
         commit: "pushed",
         synced: true,
         viaChannel: true,
@@ -444,23 +524,106 @@ export async function syncFromNode(
 
     // Apply the bundle to a fresh clone and push with manager creds.
     const cloneDir = join(work, "repo");
-    await execFileP("git", ["clone", "--branch", branch, repo, cloneDir], { timeout: 120_000 });
-    await execFileP("git", ["-C", cloneDir, "pull", localBundle, branch], { timeout: 120_000 });
-    await execFileP("git", ["-C", cloneDir, "push", "origin", branch], { timeout: 120_000 });
+    // Clone a branch that EXISTS on origin (the destination branch). The
+    // worker's own branch usually does NOT exist remotely yet — creating it is
+    // the purpose of sync — so `--branch <worker-branch>` fails. Clone the
+    // destination branch, then fetch the worker's refs from the bundle.
+    await execFileP("git", ["clone", "--branch", branch, normalizeRepo(repo), cloneDir], { timeout: 120_000 });
+    // Detect the worker's checked-out branch (its work often lives on a feature
+    // branch, not `main`); fall back to the destination branch when HEAD is
+    // detached or unavailable.
+    let workerBranch = branch;
+    try {
+      const { stdout: curOut } = await execFileP("ssh", [...SSH_ARGS, nodeHost,
+          `cd ${shq(cwd)} && git rev-parse --abbrev-ref HEAD 2>/dev/null || echo ""`], { timeout: 30_000 });
+      const cur = curOut.trim();
+      if (cur && cur !== "HEAD") workerBranch = cur;
+    }
+    catch {
+      // Keep the destination branch fallback.
+    }
+    await execFileP("git", ["-C", cloneDir, "fetch", localBundle,
+        "refs/heads/*:refs/remotes/bundler/*"], { timeout: 120_000 });
+    const bundleRef = `refs/remotes/bundler/${workerBranch}`;
+    try {
+      await execFileP("git", ["-C", cloneDir, "rev-parse", "--verify", "--quiet", bundleRef], { timeout: 30_000 });
+    }
+    catch {
+      // Clean up the remote bundle before failing closed.
+      await execFileP("ssh", [...SSH_ARGS, nodeHost, `rm -f ${shq(remoteBundle)}`], { timeout: 30_000 });
+      return {
+        ok: false,
+        cwd,
+        branch,
+        commit: "detection-failed",
+        error: `worker bundle did not contain branch "${workerBranch}"`,
+        detail: "refusing to report success when the worker branch is absent from the bundle (fail-closed)",
+      };
+    }
+    const { stdout: preHead } = await execFileP("git", ["-C", cloneDir, "rev-parse", `origin/${branch}`], { timeout: 30_000 });
+    // Push the worker's commits to a destination branch that mirrors the work.
+    // Pushing a feature branch straight onto `main` is both semantically wrong
+    // (it bypasses review) and frequently NON-fast-forward, since origin/main
+    // may have advanced past the worker's base. When the caller did not pin an
+    // explicit destination and the worker is on a feature branch, publish the
+    // SAME branch name remotely (creating it if absent) so the work can be
+    // reviewed/PR'd. Then report the real destination in the result.
+    const destBranch = workerBranch !== branch ? workerBranch : branch;
+    let pushOutcome = "pushed";
+    try {
+      await execFileP("git", ["-C", cloneDir, "push", "origin", `${bundleRef}:refs/heads/${destBranch}`], { timeout: 120_000 });
+    }
+    catch (pushErr) {
+      const msg = (pushErr as Error).message;
+      // Non-fast-forward: origin/<destBranch> advanced past the worker's base.
+      // Do NOT fabricate success. Report the real rejection so the operator can
+      // rebase/merge; silently dropping the worker's work is the bug class we
+      // are eliminating.
+      if (/non-fast-forward|\[rejected\]|fetch first/i.test(msg)) {
+        return {
+          ok: false,
+          cwd,
+          branch,
+          workerBranch,
+          commit: "push-rejected",
+          synced: false,
+          uncommittedFiles: uncommitted,
+          error: `push to origin/${destBranch} rejected (non-fast-forward)`,
+          detail: `origin/${destBranch} has advanced past the worker's base; the worker's commits are in the bundle but were NOT published. Rebasing the worker branch onto origin/${destBranch} is required.`,
+        };
+      }
+      throw pushErr;
+    }
+    const { stdout: postHead } = await execFileP("git", ["-C", cloneDir, "rev-parse", `origin/${destBranch}`], { timeout: 30_000 });
 
     // Clean up the remote bundle.
     await execFileP("ssh", [...SSH_ARGS, nodeHost, `rm -f ${shq(remoteBundle)}`], {
       timeout: 30_000,
     });
 
+    if (preHead.trim() === postHead.trim()) {
+      return {
+        ok: true,
+        cwd,
+        branch,
+        workerBranch,
+        commit: "no-changes",
+        synced: false,
+        uncommittedFiles: uncommitted,
+        detail: `worker branch "${workerBranch}" carried no commits new to origin/${destBranch} — nothing pushed`,
+      };
+    }
     return {
       ok: true,
       cwd,
       branch,
+      workerBranch,
       commit: "pushed",
       synced: true,
       uncommittedFiles: uncommitted,
-      detail: uncommitted > 0 ? `committed ${uncommitted} uncommitted file(s) on node before sync` : "pushed worker commits",
+      detail: uncommitted > 0
+          ? `committed ${uncommitted} uncommitted file(s) on node, then pushed worker branch "${destBranch}"`
+          : `pushed worker branch "${destBranch}"`,
     };
   } catch (err) {
     return { ok: false, error: (err as Error).message };
