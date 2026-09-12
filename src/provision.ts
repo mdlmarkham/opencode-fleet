@@ -34,6 +34,13 @@ export interface ProvisionRequest {
   cwd: string;
   /** Optional commit SHA to check out. */
   commit?: string;
+  /**
+   * Optional repo-declared setup command to run on the node after checkout
+   * (issue #19). Configuration over limits: the plugin does not bake in
+   * dependency assumptions — the repo declares how to prepare its own
+   * environment (e.g. "scripts/setup.sh"). Runs as the node's checkout user.
+   */
+  setup?: string;
 }
 
 export interface ProvisionResult {
@@ -44,6 +51,8 @@ export interface ProvisionResult {
   error?: string;
   /** True when the bundle was shipped via the node channel (SSH unavailable). */
   viaChannel?: boolean;
+  /** Result of the optional repo-declared setup step (issue #19). */
+  setup?: { ran: boolean; command?: string; ok?: boolean; output?: string; error?: string };
 }
 
 /**
@@ -202,12 +211,47 @@ export async function provisionToNode(
       unpackOut = stdout.trim();
     }
 
+    // Optional repo-declared setup step (issue #19): run the repo's own
+    // environment bootstrap after checkout, so "provisioned" means "can run
+    // the tests", not merely "has the files". Configurable per repo via the
+    // `setup` param (e.g. "scripts/setup.sh" or a full command); never
+    // hardcoded. Failures are reported, not swallowed.
+    let setupResult: ProvisionResult["setup"];
+    if (req.setup && req.setup.trim()) {
+      const setupCmd = `cd ${shq(req.cwd)} && (${req.setup}) && echo "---FLEET_SETUP_RC=$?"`;
+      try {
+        let out = "";
+        if (shippedViaChannel && channelInvoke) {
+          const res = (await channelInvoke(
+            { prompt: setupCmd, cwd: req.cwd, transport: "http" },
+            300_000,
+          )) as { payload?: unknown };
+          const pl = typeof res?.payload === "string" ? JSON.parse(res.payload) : (res?.payload ?? {});
+          out = String(pl.output ?? pl.stdout ?? "");
+          const rcMatch = out.match(/---FLEET_SETUP_RC=(-?\d+)/);
+          const rc = rcMatch ? parseInt(rcMatch[1], 10) : (pl.ok === false ? 1 : 0);
+          setupResult = { ran: true, command: req.setup, ok: rc === 0, output: out.slice(-2000) };
+        } else {
+          const { stdout } = await execFileP("ssh", [...SSH_ARGS, nodeHost, setupCmd], {
+            timeout: 300_000,
+          });
+          out = stdout.trim();
+          const rcMatch = out.match(/---FLEET_SETUP_RC=(-?\d+)/);
+          const rc = rcMatch ? parseInt(rcMatch[1], 10) : 0;
+          setupResult = { ran: true, command: req.setup, ok: rc === 0, output: out.slice(-2000) };
+        }
+      } catch (setupErr) {
+        setupResult = { ran: true, command: req.setup, ok: false, error: (setupErr as Error).message };
+      }
+    }
+
     return {
       ok: true,
       cwd: req.cwd,
       branch: req.branch ?? "main",
       commit: unpackOut,
       ...(shippedViaChannel ? { viaChannel: true } : {}),
+      ...(setupResult ? { setup: setupResult } : {}),
     };
   } catch (err) {
     return { ok: false, error: (err as Error).message };
@@ -239,17 +283,44 @@ export async function syncFromNode(
   cwd: string,
   repo: string,
   branch: string,
-  prebuilt?: { mode: "from-base64"; base64: string; branch?: string },
+  prebuilt?: { mode: "from-base64"; base64: string; branch?: string; base?: string },
 ): Promise<ProvisionResult & { synced?: boolean; uncommittedFiles?: number; detail?: string }> {
   const work = await mkdtemp(join(tmpdir(), "fleet-sync-"));
   try {
     if (prebuilt?.mode === "from-base64") {
       // SSH-free path: the manager already holds the worker's bundle as base64.
+      // Guard: an empty/whitespace payload means the worker's __BUNDLE__ step
+      // staged nothing — fail closed rather than reporting a false "pushed".
+      if (!prebuilt.base64 || prebuilt.base64.trim().length === 0) {
+        return {
+          ok: false,
+          cwd,
+          branch: prebuilt.branch ?? branch,
+          commit: "detection-failed",
+          error: "worker returned an empty bundle — nothing was staged",
+          detail: "refusing to report success on an empty worker bundle (fail-closed)",
+        };
+      }
       const localBundle = join(work, "worker.bundle");
       await (await import("node:fs/promises")).writeFile(localBundle, Buffer.from(prebuilt.base64, "base64"));
       const cloneDir = join(work, "repo");
       await execFileP("git", ["clone", "--branch", prebuilt.branch ?? branch, repo, cloneDir], { timeout: 120_000 });
       await execFileP("git", ["-C", cloneDir, "pull", localBundle, prebuilt.branch ?? branch], { timeout: 120_000 });
+      // Verify the pull actually advanced HEAD; otherwise this is a no-op that
+      // must not be reported as a successful push.
+      const { stdout: localHead } = await execFileP("git", ["-C", cloneDir, "rev-parse", "HEAD"], { timeout: 30_000 });
+      const { stdout: remoteHead } = await execFileP("git", ["-C", cloneDir, "rev-parse", `origin/${prebuilt.branch ?? branch}`], { timeout: 30_000 });
+      if (localHead.trim() === remoteHead.trim()) {
+        return {
+          ok: true,
+          cwd,
+          branch: prebuilt.branch ?? branch,
+          commit: "no-changes",
+          synced: false,
+          viaChannel: true,
+          detail: "worker bundle carried no new commits — nothing to sync",
+        };
+      }
       await execFileP("git", ["-C", cloneDir, "push", "origin", prebuilt.branch ?? branch], { timeout: 120_000 });
       return {
         ok: true,
@@ -261,14 +332,46 @@ export async function syncFromNode(
         detail: "synced via node channel",
       };
     }
-    // Step 1: detect uncommitted working-tree changes on the node.
-    const statusCmd = `cd ${shq(cwd)} && git status --porcelain 2>/dev/null | wc -l`;
-    const { stdout: dirtyOut } = await execFileP(
-      "ssh",
-      [...SSH_ARGS, nodeHost, statusCmd],
-      { timeout: 30_000 },
-    );
-    const uncommitted = parseInt(dirtyOut.trim(), 10) || 0;
+    // Step 1: detect uncommitted working-tree changes on the node, INCLUDING
+    // untracked files (issue #18: untracked paths were silently missed).
+    //
+    // CRITICAL: never mask the detector's own failure. The previous form
+    // (`git status --porcelain 2>/dev/null | wc -l`) turned any error (bad cwd,
+    // bad permissions, git missing) into a confident 0 = "clean tree", which
+    // reads as a successful no-op and silently drops the worker's work. We now
+    // capture git's exit status explicitly and fail CLOSED: if we cannot
+    // measure, we say so instead of reporting "no-changes".
+    const statusCmd = [
+      `cd ${shq(cwd)}`,
+      `git status --porcelain --untracked-files=all`,
+      `echo "---FLEET_STATUS_RC=$?"`,
+    ].join("; ");
+    let uncommitted = 0;
+    let dirtyErr: string | undefined;
+    {
+      const { stdout } = await execFileP("ssh", [...SSH_ARGS, nodeHost, statusCmd], {
+        timeout: 30_000,
+      });
+      const m = stdout.match(/---FLEET_STATUS_RC=(-?\d+)/);
+      const rc = m ? parseInt(m[1], 10) : NaN;
+      if (!Number.isFinite(rc) || rc !== 0) {
+        dirtyErr = `git status failed on ${nodeHost} (rc=${Number.isFinite(rc) ? rc : "unknown"}) — cannot determine tree state`;
+      } else {
+        const body = stdout.split("---FLEET_STATUS_RC=")[0];
+        uncommitted = body.split("\n").filter((l) => l.trim().length > 0).length;
+      }
+    }
+    if (dirtyErr) {
+      // Fail closed: distinguish "detection failed" from a genuine clean tree.
+      return {
+        ok: false,
+        cwd,
+        branch,
+        commit: "detection-failed",
+        error: dirtyErr,
+        detail: `could not evaluate working tree on ${nodeHost}; refusing to report no-changes (fail-closed)`.replace("${nodeHost}", nodeHost),
+      };
+    }
 
     // Step 2: commit uncommitted changes on the node before bundling, so the
     // sync actually carries the worker's work (issue #1: silent data loss).
@@ -283,14 +386,44 @@ export async function syncFromNode(
       });
     }
 
-    // Step 2: check whether there are any commits to sync vs the remote.
-    const aheadCmd = `cd ${shq(cwd)} && git rev-list --count origin/${branch}..HEAD 2>/dev/null || echo 0`;
+    // Step 2b: check whether there are any commits to sync. Do NOT trust a
+    // bare `origin/${branch}` ref: bundle-provisioned workers have either no
+    // usable `origin` remote or a stale one pointing at a deleted bundle, so
+    // `origin/main..HEAD` resolves to nothing and reports 0 ahead forever
+    // (issue #18). Resolve a *real* comparison base instead, in order:
+    //   1. an explicit base (the provision commit) recorded by the caller
+    //   2. origin/<branch> if it actually resolves
+    //   3. the remote-tracking base of a bundle-backed checkout
+    //   4. otherwise: any commit not reachable from the branch tip's upstream
+    const resolveBaseCmd = [
+      `cd ${shq(cwd)}`,
+      `BASE=""`,
+      prebuilt?.base ? `git rev-parse --verify --quiet ${shq(prebuilt.base)} >/dev/null && BASE=${shq(prebuilt.base)}` : `true`,
+      `[ -z "$BASE" ] && git rev-parse --verify --quiet ${shq(`origin/${branch}`)} >/dev/null && BASE=${shq(`origin/${branch}`)}`,
+      `[ -z "$BASE" ] && git rev-parse --verify --quiet ${shq(`refs/remotes/origin/${branch}`)} >/dev/null && BASE=${shq(`refs/remotes/origin/${branch}`)}`,
+      `[ -z "$BASE" ] && BASE=$(git rev-list --max-parents=0 HEAD | tail -1)`,
+      `echo "---FLEET_BASE=$BASE"`,
+      `if [ -n "$BASE" ]; then git rev-list --count "$BASE..HEAD"; else echo "ERR"; fi`,
+    ].join("; ");
     const { stdout: aheadOut } = await execFileP(
       "ssh",
-      [...SSH_ARGS, nodeHost, aheadCmd],
+      [...SSH_ARGS, nodeHost, resolveBaseCmd],
       { timeout: 30_000 },
     );
-    const ahead = parseInt(aheadOut.trim(), 10) || 0;
+    const baseMatch = aheadOut.match(/---FLEET_BASE=(\S+)/);
+    const resolvedBase = baseMatch?.[1] ?? "";
+    const aheadStr = aheadOut.split("---FLEET_BASE=")[1]?.split("\n")[1]?.trim() ?? "";
+    if (!resolvedBase || resolvedBase === "ERR" || !/^\d+$/.test(aheadStr)) {
+      return {
+        ok: false,
+        cwd,
+        branch,
+        commit: "detection-failed",
+        error: `could not resolve a comparison base for ${nodeHost}:${cwd}`,
+        detail: "could not evaluate commits ahead; refusing to report no-changes (fail-closed)",
+      };
+    }
+    const ahead = parseInt(aheadStr, 10);
 
     if (uncommitted === 0 && ahead === 0) {
       return { ok: true, cwd, branch, commit: "no-changes", detail: "no uncommitted changes and no commits ahead — nothing to sync" };

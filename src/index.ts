@@ -186,11 +186,17 @@ export default definePluginEntry({
           const accDir = join(tmpdir(), `fleet-xfer-${transferId}`);
           await (await import("node:fs/promises")).mkdir(accDir, { recursive: true });
           const bundlePath = join(accDir, "sync.bundle");
+          // Fail-closed worker bundle (issue #18): the old form masked every
+          // git error with `2>/dev/null`, so a bad cwd produced an empty (or
+          // stale-ref) bundle that the manager then reported as "pushed".
+          // Now: verify we are in a work tree, stage untracked files too, and
+          // abort the bundle if git itself fails.
           const commitOut = await runShell(
             [
               `cd ${shq(task.cwd)}`,
-              `test -z "$(git status --porcelain 2>/dev/null)" || git add -A`,
-              `test -z "$(git status --porcelain 2>/dev/null)" || git -c user.email=fleet-worker@node -c user.name="fleet-worker" commit -m "fleet_sync: auto-commit worker working-tree changes before sync"`,
+              `git rev-parse --is-inside-work-tree >/dev/null`,
+              `DIRTY=$(git status --porcelain --untracked-files=all)`,
+              `if [ -n "$DIRTY" ]; then git add -A && git -c user.email=fleet-worker@node -c user.name="fleet-worker" commit -q -m "fleet_sync: auto-commit worker working-tree changes before sync"; fi`,
               `git bundle create ${shq(join(accDir, "sync.bundle"))} --all`,
               `echo "---B64---"`,
               `base64 ${shq(join(accDir, "sync.bundle"))}`,
@@ -199,8 +205,8 @@ export default definePluginEntry({
             context?.signal,
           );
           const [meta, ...b64Lines] = commitOut.split("---B64---\\n");
-          if (!b64Lines.length) {
-            return JSON.stringify({ ok: false, error: `bundle failed: ${meta.slice(0, 200)}` });
+          if (!b64Lines.length || !b64Lines.join("").trim()) {
+            return JSON.stringify({ ok: false, error: `bundle failed: ${meta.slice(0, 300)}` });
           }
           await (await import("node:fs/promises")).writeFile(join(accDir, "bundle.b64"), b64Lines.join(""));
           return JSON.stringify({ ok: true, transferId, staged: true, head: meta.trim().slice(-40) });
@@ -1194,11 +1200,16 @@ export default definePluginEntry({
           },
           branch: { type: "string", description: "Branch to check out (default main)." },
           commit: { type: "string", description: "Optional commit SHA to check out." },
+          setup: {
+            type: "string",
+            description:
+              "Optional repo-declared setup command to run on each node after checkout (issue #19), e.g. \"scripts/setup.sh\" or \"python3 -m venv .venv && .venv/bin/pip install -r requirements.txt\". Lets a repo declare its own environment bootstrap so 'provisioned' means 'can run the tests'. Reported per node; never hardcoded.",
+          },
         },
         required: ["repo", "cwd"],
       },
       execute: async (toolCallId, params, signal) => {
-        const p = params as { repo: string; cwd: string; nodes?: string[]; branch?: string; commit?: string };
+        const p = params as { repo: string; cwd: string; nodes?: string[]; branch?: string; commit?: string; setup?: string };
         const { createRepoBundle, provisionToNode, cleanupBundle } = await import("./provision.js");
 
         // Resolve target nodes.
@@ -1240,6 +1251,7 @@ export default definePluginEntry({
               cwd: p.cwd,
               branch: p.branch,
               commit: p.commit,
+              setup: p.setup,
             },
             channelInvoke,
           );

@@ -24,6 +24,21 @@ export interface NodeCapabilities {
   tools?: string[];
   models?: string[];
   opencode?: string;
+  /**
+   * Python environment facts (issue #19). A manager needs these to pick a
+   * working dependency-install strategy per node — the fleet nodes differ
+   * (PEP 668 vs bare venv), and the same command fails on one of them.
+   */
+  python?: {
+    /** python3 version string, if present. */
+    version?: string;
+    /** Whether `python3 -m venv` is usable (ensurepip available). */
+    venvAvailable?: boolean;
+    /** Which pip install strategy the node requires. */
+    pipStrategy?: "venv" | "user-break-system-packages" | "none";
+    /** True when PEP 668 marks the system env externally-managed. */
+    externallyManaged?: boolean;
+  };
   error?: string;
 }
 
@@ -53,6 +68,11 @@ export async function detectNodeCapabilities(nodeHost: string, nodeName: string)
       `echo "GPU=$(lspci 2>/dev/null | grep -iE 'vga|3d|nvidia|amd' | head -1 || echo none)"`,
       `echo "TOOLS=$(which docker node npm python3 go rustc 2>/dev/null | xargs -n1 basename 2>/dev/null | tr '\\n' ',')"`,
       `echo "OPENCODE=$(opencode --version 2>/dev/null || echo none)"`,
+      // Python environment facts (issue #19).
+      `echo "PYVER=$(python3 --version 2>/dev/null | awk '{print $2}' || echo none)"`,
+      `echo "PYVENV=$(python3 -c 'import ensurepip' 2>/dev/null && echo yes || echo no)"`,
+      `echo "PYPEP668=$(python3 -c 'import sysconfig,os; p=sysconfig.get_path("stdlib"); f=os.path.join(p,"EXTERNALLY-MANAGED"); print("yes" if os.path.exists(f) else "no")' 2>/dev/null || echo unknown)"`,
+      `echo "PIPUSER=$(python3 -m pip --version >/dev/null 2>&1 && echo yes || echo no)"`,
     ].join(" && ");
     const { stdout } = await execFileP("ssh", [...SSH_ARGS, nodeHost, cmd], {
       timeout: 30_000,
@@ -82,6 +102,32 @@ export async function detectNodeCapabilities(nodeHost: string, nodeName: string)
         case "OPENCODE":
           caps.opencode = val;
           break;
+        case "PYVER":
+          if (val && val !== "none") (caps.python ??= {}).version = val;
+          break;
+        case "PYVENV":
+          (caps.python ??= {}).venvAvailable = val === "yes";
+          break;
+        case "PYPEP668":
+          if (val === "yes" || val === "no") (caps.python ??= {}).externallyManaged = val === "yes";
+          break;
+        case "PIPUSER":
+          break;
+      }
+    }
+
+    // Derive the pip install strategy from the facts (issue #19). This is the
+    // signal a manager needs to avoid the per-node asymmetry: on dev2 (PEP 668
+    // externally-managed) use a venv; on dev3 (bare venv, no ensurepip) use
+    // --user --break-system-packages.
+    {
+      const py = (caps.python ??= {});
+      if (py.version) {
+        if (py.venvAvailable) py.pipStrategy = "venv";
+        else if (py.externallyManaged) py.pipStrategy = "user-break-system-packages";
+        else py.pipStrategy = "user-break-system-packages";
+      } else {
+        py.pipStrategy = "none";
       }
     }
 
