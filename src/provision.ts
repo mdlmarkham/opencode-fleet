@@ -319,8 +319,26 @@ export async function syncFromNode(
   cwd: string,
   repo: string,
   branch: string,
-  prebuilt?: { mode: "from-base64"; base64: string; branch?: string; base?: string; workerBranch?: string },
+  prebuilt?: { mode: "from-base64"; base64: string; branch?: string; base?: string; workerBranch?: string; destBranch?: string },
+  destBranchPinned?: string,
 ): Promise<ProvisionResult & { synced?: boolean; uncommittedFiles?: number; detail?: string }> {
+  // Destination-branch resolution (issue #13, layer 3).
+  //
+  // `branch` is the CLONE BASE: the branch that exists on origin and that we
+  // check out to apply the worker's bundle. It is NOT necessarily where the
+  // worker's work should land. Conflating the two is the layer-3 defect:
+  //   - the from-base64 path collapsed `destBranch` to `prebuilt.branch ?? branch`,
+  //     so a feature-branch worker was always pushed at `main`;
+  //   - the SSH path inferred the destination from `workerBranch !== branch`,
+  //     which is always TRUE when the caller passes a defaulted `main`, so it
+  //     silently took the feature-branch arm (and could not express "pin main").
+  //
+  // A destination is PINNED only when the caller explicitly names one. Otherwise
+  // we auto-select: publish the worker's own branch when it differs from the
+  // clone base (feature-branch work stays reviewable), else the clone base.
+  const chooseDest = (workerBranch: string, pinnedDest?: string): string =>
+    pinnedDest ?? (workerBranch && workerBranch !== branch ? workerBranch : branch);
+
   const work = await mkdtemp(join(tmpdir(), "fleet-sync-"));
   try {
     if (prebuilt?.mode === "from-base64") {
@@ -340,14 +358,14 @@ export async function syncFromNode(
       const localBundle = join(work, "worker.bundle");
       await (await import("node:fs/promises")).writeFile(localBundle, Buffer.from(prebuilt.base64, "base64"));
       const cloneDir = join(work, "repo");
-      // Clone a branch that EXISTS on origin (the destination branch). The
-      // worker's own branch usually does NOT exist remotely yet — creating it
-      // is the entire purpose of sync — so `--branch <worker-branch>` would
-      // fail with "Remote branch ... not found in upstream origin". Clone the
-      // destination branch, then fetch the worker's refs from the bundle.
-      const destBranch = prebuilt.branch ?? branch;
-      await execFileP("git", ["clone", "--branch", destBranch, normalizeRepo(repo), cloneDir], { timeout: 120_000 });
-      const workerBranch = prebuilt.workerBranch ?? destBranch;
+      // Clone a branch that EXISTS on origin (the clone base). The worker's own
+      // branch usually does NOT exist remotely yet — creating it is the entire
+      // purpose of sync — so `--branch <worker-branch>` would fail with "Remote
+      // branch ... not found in upstream origin". Clone the base, then fetch
+      // the worker's refs from the bundle, and push to the RESOLVED destination.
+      await execFileP("git", ["clone", "--branch", branch, normalizeRepo(repo), cloneDir], { timeout: 120_000 });
+      const workerBranch = prebuilt.workerBranch ?? branch;
+      const destBranch = chooseDest(workerBranch, prebuilt.destBranch);
       // Fetch every bundle ref under refs/remotes/bundler/* so we can push the
       // worker's actual branch even when it is not the destination branch.
       await execFileP("git", ["-C", cloneDir, "fetch", localBundle,
@@ -366,8 +384,19 @@ export async function syncFromNode(
           detail: "refusing to report success when the worker branch is absent from the bundle (fail-closed)",
         };
       }
-      // Verify the push will actually advance origin/<destBranch>.
-      const { stdout: preHead } = await execFileP("git", ["-C", cloneDir, "rev-parse", `origin/${destBranch}`], { timeout: 30_000 });
+      // Record the destination's current head BEFORE pushing, so we can tell a
+      // real push from a no-op. A destination branch that does not exist yet is
+      // NOT an error — creating it remotely is the whole point of sync — so a
+      // missing ref resolves to an empty prior head rather than throwing.
+      const priorHead = await (async () => {
+        try {
+          const { stdout } = await execFileP("git", ["-C", cloneDir, "rev-parse", `refs/remotes/origin/${destBranch}`], { timeout: 30_000 });
+          return stdout.trim();
+        }
+        catch {
+          return "";
+        }
+      })();
       try {
         await execFileP("git", ["-C", cloneDir, "push", "origin", `${bundleRef}:refs/heads/${destBranch}`], { timeout: 120_000 });
       }
@@ -388,8 +417,20 @@ export async function syncFromNode(
         }
         throw pushErr;
       }
-      const { stdout: postHead } = await execFileP("git", ["-C", cloneDir, "rev-parse", `origin/${destBranch}`], { timeout: 30_000 });
-      if (preHead.trim() === postHead.trim()) {
+      // Confirm the push actually published NEW work. Two checks, because a
+      // destination branch may or may not have pre-existed:
+      //   1. if it existed, the remote ref must have MOVED (priorHead differs);
+      //   2. if it did not exist (a freshly created branch), the worker's ref
+      //      must at least differ from the clone base tip — otherwise we just
+      //      created a branch identical to its base and there is nothing new.
+      // Without (2), a worker with zero new commits reports "pushed".
+      await execFileP("git", ["-C", cloneDir, "fetch", "origin", `refs/heads/${destBranch}:refs/remotes/origin/${destBranch}`], { timeout: 60_000 });
+      const { stdout: postHead } = await execFileP("git", ["-C", cloneDir, "rev-parse", `refs/remotes/origin/${destBranch}`], { timeout: 30_000 });
+      const { stdout: bundleTip } = await execFileP("git", ["-C", cloneDir, "rev-parse", bundleRef], { timeout: 30_000 });
+      const { stdout: baseTip } = await execFileP("git", ["-C", cloneDir, "rev-parse", `origin/${branch}`], { timeout: 30_000 });
+      const movedRemote = priorHead !== "" && priorHead !== postHead.trim();
+      const hasNewWork = bundleTip.trim() !== baseTip.trim();
+      if (!movedRemote && !hasNewWork) {
         return {
           ok: true,
           cwd,
@@ -398,7 +439,7 @@ export async function syncFromNode(
           commit: "no-changes",
           synced: false,
           viaChannel: true,
-          detail: `worker branch "${workerBranch}" carried no commits new to origin/${destBranch} — nothing pushed`,
+          detail: `worker branch "${workerBranch}" carried no commits new to origin/${branch} — nothing pushed`,
         };
       }
       return {
@@ -560,7 +601,24 @@ export async function syncFromNode(
         detail: "refusing to report success when the worker branch is absent from the bundle (fail-closed)",
       };
     }
-    const { stdout: preHead } = await execFileP("git", ["-C", cloneDir, "rev-parse", `origin/${branch}`], { timeout: 30_000 });
+    // Resolve the destination branch (issue #13, layer 3). Prefer an explicitly
+    // pinned destination when the caller provided one; otherwise publish the
+    // worker's own branch when it differs from the clone base, so feature-branch
+    // work stays reviewable rather than being forced onto `main`.
+    const destBranch = chooseDest(workerBranch, destBranchPinned);
+    // Record the destination's current head BEFORE pushing, so we can tell a
+    // real push from a no-op. A destination branch that does not exist yet is
+    // NOT an error — creating it remotely is the whole point of sync — so a
+    // missing ref resolves to an empty prior head rather than throwing.
+    const priorHead = await (async () => {
+      try {
+        const { stdout } = await execFileP("git", ["-C", cloneDir, "rev-parse", `refs/remotes/origin/${destBranch}`], { timeout: 30_000 });
+        return stdout.trim();
+      }
+      catch {
+        return "";
+      }
+    })();
     // Push the worker's commits to a destination branch that mirrors the work.
     // Pushing a feature branch straight onto `main` is both semantically wrong
     // (it bypasses review) and frequently NON-fast-forward, since origin/main
@@ -568,7 +626,6 @@ export async function syncFromNode(
     // explicit destination and the worker is on a feature branch, publish the
     // SAME branch name remotely (creating it if absent) so the work can be
     // reviewed/PR'd. Then report the real destination in the result.
-    const destBranch = workerBranch !== branch ? workerBranch : branch;
     let pushOutcome = "pushed";
     try {
       await execFileP("git", ["-C", cloneDir, "push", "origin", `${bundleRef}:refs/heads/${destBranch}`], { timeout: 120_000 });
@@ -594,14 +651,26 @@ export async function syncFromNode(
       }
       throw pushErr;
     }
-    const { stdout: postHead } = await execFileP("git", ["-C", cloneDir, "rev-parse", `origin/${destBranch}`], { timeout: 30_000 });
+    // Confirm the push actually published NEW work. Two checks, because a
+    // destination branch may or may not have pre-existed:
+    //   1. if it existed, the remote ref must have MOVED (priorHead differs);
+    //   2. if it did not exist (a freshly created branch), the worker's ref
+    //      must at least differ from the clone base tip — otherwise we just
+    //      created a branch identical to its base and there is nothing new.
+    // Without (2), a worker with zero new commits reports "pushed".
+    await execFileP("git", ["-C", cloneDir, "fetch", "origin", `refs/heads/${destBranch}:refs/remotes/origin/${destBranch}`], { timeout: 60_000 });
+    const { stdout: postHead } = await execFileP("git", ["-C", cloneDir, "rev-parse", `refs/remotes/origin/${destBranch}`], { timeout: 30_000 });
+    const { stdout: bundleTip } = await execFileP("git", ["-C", cloneDir, "rev-parse", bundleRef], { timeout: 30_000 });
+    const { stdout: baseTip } = await execFileP("git", ["-C", cloneDir, "rev-parse", `origin/${branch}`], { timeout: 30_000 });
+    const movedRemote = priorHead !== "" && priorHead !== postHead.trim();
+    const hasNewWork = bundleTip.trim() !== baseTip.trim();
 
     // Clean up the remote bundle.
     await execFileP("ssh", [...SSH_ARGS, nodeHost, `rm -f ${shq(remoteBundle)}`], {
       timeout: 30_000,
     });
 
-    if (preHead.trim() === postHead.trim()) {
+    if (!movedRemote && !hasNewWork) {
       return {
         ok: true,
         cwd,

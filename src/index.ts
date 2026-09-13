@@ -584,7 +584,7 @@ export default definePluginEntry({
           const detached = task.async !== false && transport === "http";
           let inv: unknown;
           if (detached) {
-            const launchParams = { ...task, prompt: "__RUN_START__" };
+            const launchParams = { ...task, prompt: "__RUN_START__", runId };
             inv = await api.runtime.nodes
               .invoke({
                 nodeId: node.nodeId,
@@ -1406,7 +1406,7 @@ export default definePluginEntry({
           node: { type: "string", description: "Node display name or id." },
           cwd: { type: "string", description: "Working directory on the node." },
           repo: { type: "string", description: "Git URL the manager can access." },
-          branch: { type: "string", description: "Branch to push to (default main)." },
+          branch: { type: "string", description: "Destination branch to publish the worker's work to. When omitted, the worker's own checked-out branch is published if it differs from `main` (so feature-branch work stays reviewable); otherwise `main`." },
         },
         required: ["node", "cwd", "repo"],
       },
@@ -1448,12 +1448,13 @@ export default definePluginEntry({
             mode: "from-base64",
             base64: parts.join(""),
             branch: p.branch ?? "main",
+            destBranch: p.branch,
           });
           return jsonResult({ ...r, viaChannel: true });
         }
 
         const { syncFromNode } = await import("./provision.js");
-        const r = await syncFromNode(host, p.cwd, p.repo, p.branch ?? "main");
+        const r = await syncFromNode(host, p.cwd, p.repo, p.branch ?? "main", undefined, p.branch);
         return jsonResult(r);
       },
     });
@@ -2132,7 +2133,10 @@ function detachedLaunchCommand(runId: string, scriptPath: string, statePath: str
     `printf 'pid=0\nstartedAt=%s\n' "$(date +%s)" > ${shq(statePath)}`,
     // setsid detaches from the node-host process group so relay cancellation
     // (node.invoke.cancel kills the process tree) cannot reach the child.
-    `setsid nohup /bin/bash ${shq(scriptPath)} > ${shq(join(tmpdir(), `fleet-run-${runId}.log`))} 2>&1 &`,
-    `echo "LAUNCHED_PID=$!"`,
-  ].join(" && ");
+    // NOTE: the background `&` must terminate the whole chain, not sit inside a
+    // `&&`-joined element — `... 2>&1 & && echo` is a bash syntax error. So we
+    // join the setup steps with `&&`, background that entire chain, then emit
+    // the LAUNCHED_PID line as a separate statement.
+    `setsid nohup /bin/bash ${shq(scriptPath)} > ${shq(join(tmpdir(), `fleet-run-${runId}.log`))} 2>&1`,
+  ].join(" && ") + ` &\necho "LAUNCHED_PID=$!"`;
 }
