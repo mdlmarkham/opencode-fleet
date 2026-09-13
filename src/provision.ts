@@ -216,6 +216,21 @@ export async function provisionToNode(
       }
     }
 
+    // Issue #14: the manager lands as the SSH principal (root by default),
+    // but the checkout is owned by the node's service user. Git then refuses
+    // every operation on the repo with "dubious ownership" (rc=128), which
+    // surfaced later as an opaque `git status failed` in fleet_sync. Establish
+    // the precondition HERE, at provision time, at --system scope so it covers
+    // whichever account the sync path uses and cannot recur for a different
+    // user. Must run as a principal that can write the system git config —
+    // root, i.e. the same principal the manager lands as.
+    const safeDirCmd = [
+      `git config --system --get-all safe.directory 2>/dev/null | grep -qxF ${shq(req.cwd)}`,
+      `|| git config --system --add safe.directory ${shq(req.cwd)}`,
+      `git config --system --get-all safe.directory 2>/dev/null | grep -qxF ${shq(req.cwd)}`,
+      `&& echo "---FLEET_SAFEDIR=ok"`,
+    ].join(" ");
+
     // Unpack on the worker (no credentials needed). Light GC only —
     // aggressive GC is too slow for large repos and belongs in fleet_cleanup.
     // Uses the node channel when the bundle arrived via channel (SSH-free
@@ -226,10 +241,11 @@ export async function provisionToNode(
       `git clone -q ${shq(remoteBundle)} ${shq(req.cwd)}`,
       req.commit ? `cd ${shq(req.cwd)} && git checkout -q ${shq(req.commit)}` : "",
       `cd ${shq(req.cwd)} && git gc --prune=now 2>/dev/null`,
+      // Issue #14: set safe.directory for the landing principal right after
+      // the clone, before any later operation can trip over dubious ownership.
+      safeDirCmd,
       `cd ${shq(req.cwd)} && git rev-parse HEAD`,
-    ]
-      .filter(Boolean)
-      .join(" && ");
+    ].filter(Boolean).join(" && ");
 
     let unpackOut = "";
     if (shippedViaChannel && channelInvoke) {
@@ -476,7 +492,18 @@ export async function syncFromNode(
       const m = stdout.match(/---FLEET_STATUS_RC=(-?\d+)/);
       const rc = m ? parseInt(m[1], 10) : NaN;
       if (!Number.isFinite(rc) || rc !== 0) {
-        dirtyErr = `git status failed on ${nodeHost} (rc=${Number.isFinite(rc) ? rc : "unknown"}) — cannot determine tree state`;
+        // Issue #14: make the reason legible. A bare rc=128 sent the operator
+        // hunting; git's dubious-ownership refusal is the common cause and is
+        // directly actionable, so name it (and the fix) when we see it.
+        const out = stdout.toLowerCase();
+        let reason = `git status failed on ${nodeHost} (rc=${Number.isFinite(rc) ? rc : "unknown"}) — cannot determine tree state`;
+        if (out.includes("dubious ownership") || out.includes("safe.directory")) {
+          reason = `git status refused on ${nodeHost} (rc=${Number.isFinite(rc) ? rc : "unknown"}) — dubious ownership of ${cwd}: the checkout is owned by a different principal than the one the manager lands as. Run fleet_provision to set safe.directory for the landing principal, or set it manually: git config --system --add safe.directory ${cwd}`;
+        } else {
+          const tail = stdout.split("---FLEET_STATUS_RC=")[0].trim().split("\n").slice(-3).join(" | ");
+          if (tail) reason += ` — git said: ${tail}`;
+        }
+        dirtyErr = reason;
       } else {
         const body = stdout.split("---FLEET_STATUS_RC=")[0];
         uncommitted = body.split("\n").filter((l) => l.trim().length > 0).length;

@@ -1545,10 +1545,23 @@ export default definePluginEntry({
           ? fleet.filter((n) => p.nodes!.includes(n.displayName ?? n.nodeId) || p.nodes!.includes(n.nodeId))
           : fleet;
         const hosts = targets.map((n) => n.remoteIp ?? n.displayName ?? n.nodeId);
+        // Issue #18: thread each node's service principal (and SSH login user)
+        // from membership config, so installs land in the right plugin root and
+        // verification checks the build the running process will actually load.
+        const nodeUsers: Record<string, string> = {};
+        const nodeLoginUsers: Record<string, string> = {};
+        for (const n of targets) {
+          const host = n.remoteIp ?? n.displayName ?? n.nodeId;
+          const svc = n.member?.serviceUser ?? n.member?.user;
+          if (svc) nodeUsers[host] = svc;
+          if (n.member?.user) nodeLoginUsers[host] = n.member.user;
+        }
         const pluginDir = p.pluginDir ?? join(api.rootDir ?? process.cwd(), "..");
         const r = await deployPlugin({
           pluginDir,
           nodes: hosts,
+          nodeUsers,
+          nodeLoginUsers,
           restartNodes: p.restartNodes ?? true,
         });
         return jsonResult(r);
