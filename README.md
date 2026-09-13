@@ -95,6 +95,8 @@ The plugin bundles a **skill** (`skills/opencode-fleet/SKILL.md`) that teaches a
 | `nodePrefixes` | `["dev"]` | Node display-name prefixes treated as fleet members |
 | `defaultTimeoutMs` | `300000` | Default timeout for OpenCode runs |
 | `apertureUrl` | `https://ai.tailf9480.ts.net/v1/models` | Aperture model catalog URL |
+| `nodes[].user` | _(unset)_ | SSH login user for a node (defaults to SSH config default, usually `root`) |
+| `nodes[].serviceUser` | _(unset)_ | Principal the node's OpenClaw service runs as, when it differs from the login user. Install/verify target this principal's plugin root. |
 
 ## Development
 
@@ -106,6 +108,29 @@ npm pack             # create tarball
 
 Or use the built-in deploy: `fleet_deploy` (or the `deployPlugin` module) does build → pack → install on gateway + nodes → restart node services, and reports `gatewayRestartRequired` for the final gateway restart.
 
+## Deploy prerequisites (fleet nodes)
+
+`fleet_deploy` installs the plugin into the **service user's** plugin root and verifies the
+installed `dist/index.js` sha256 matches the built artifact. Two node-state facts must hold:
+
+1. **Correct principal.** If the node's OpenClaw service runs as a non-root user (e.g.
+   `svcuser`), set `nodes[].serviceUser` so install/verify target that user's
+   `~/.openclaw/extensions/`. The live node process is a **system-scope** unit
+   (`openclaw-node.service`) — restart it via `sudo -n systemctl restart openclaw-node.service`,
+   not `systemctl --user`.
+
+2. **No stale root-owned install record.** A node that once installed the plugin *as root*
+   keeps a managed install record in the service user's state DB, in the
+   `config_machine_state` row `state_key='plugins.installedIndex'`, whose `installPath` points
+   at `/root/.openclaw/extensions/opencode-fleet`. On later non-root installs the CLI's retire
+   phase calls `realpathSync('/root/.openclaw')` → **EACCES** and exits `rc=1` — even though the
+   install itself succeeded. The node ends up with correct code but a failed report.
+
+   **Repair** (back up the state DB first): correct that record's `installPath` to the service
+   user's path (and ensure no field is JSON `null` where the schema wants an *absent* key,
+   e.g. `sourcePath`), or delete only that row and run `openclaw doctor --fix` to rebuild it.
+   Backups: `~/.openclaw/state/openclaw.sqlite.bak-installrecord-<ts>`.
+
 ## Key implementation notes
 
 - **Node invoke inactivity timeout**: long-running node commands that produce no output for ~11s get killed. The node host command's `handle` must emit progress chunks via `io.emitChunk()` to keep the invoke alive.
@@ -113,3 +138,6 @@ Or use the built-in deploy: `fleet_deploy` (or the `deployPlugin` module) does b
 - **Repo bundles must be full clones** (no `--depth 1`) or the worker can't traverse history.
 - **Use light `git gc`** — `--aggressive` is too slow for large repos and leaves stale locks.
 - **Gateway restart kills the session** running the deploy — `fleet_deploy` does everything except the final gateway restart and reports it.
+- **Use a non-login shell (`bash -c`) for node install/verify** — a login shell (`bash -lc`) sources the profile and can print MOTD/banner text to stdout, corrupting the parsed rc/hash. Parse the last well-formed 64-hex line as the hash.
+- **`[sqlite/transaction] slow SQLite transaction hold` is a transient warning**, not a failure — a clean re-run exits `rc=0`.
+- **Verify the running process, not just "service active"**: check process uptime (confirms restart) and the running code hash (confirms the new build is loaded).
