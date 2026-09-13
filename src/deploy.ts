@@ -16,6 +16,11 @@ import { promisify } from "node:util";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { SSH_ARGS } from "./ssh.js";
+import {
+  inspectRemoteInstallRecord,
+  repairRemoteInstallRecord,
+  needsRepair,
+} from "./install-record.js";
 
 const execFileP = promisify(execFile);
 
@@ -114,6 +119,51 @@ export async function deployPlugin(req: DeployRequest): Promise<DeployResult> {
       const sshHost = loginUser ? `${loginUser}@${host}` : host;
       const tarballName = tarball.split("/").pop() ?? "";
       try {
+        // Issue #20: defuse the stale-root-install-record footgun BEFORE
+        // installing. A node that once installed as root carries a record
+        // whose installPath is under /root, which makes the CLI's retire phase
+        // EACCES and exit rc=1 despite a successful install. Detect AS THE
+        // SERVICE PRINCIPAL (invisible as root), back up, and repair.
+        // Detection failure is surfaced, never guessed as "clean".
+        if (serviceUser) {
+          // Resolve the service principal's real HOME on the node rather than
+          // guessing /home/<user> (breaks for non-standard homes). `sudo -H`
+          // also sets HOME for the child, so echo it under the target user.
+          let serviceHome = "";
+          try {
+            const { stdout: homeOut } = await execFileP(
+              "ssh",
+              [...SSH_ARGS, sshHost, `sudo -n -u ${shq(serviceUser)} -H bash -c 'printf %s "$HOME"'`],
+              { timeout: 30_000 },
+            );
+            serviceHome = homeOut.trim().split("\n").map((l) => l.trim()).filter(Boolean).pop() ?? "";
+          } catch {
+            serviceHome = "";
+          }
+          if (!serviceHome || !serviceHome.startsWith("/")) {
+            add(`record-check-${host}`, false, `could not resolve ${serviceUser}'s HOME on the node`);
+          } else {
+            const finding = await inspectRemoteInstallRecord(SSH_ARGS, sshHost, serviceUser, serviceHome);
+            if (finding.error) {
+              add(`record-check-${host}`, false, finding.error);
+            } else if (needsRepair(finding)) {
+              const repaired = await repairRemoteInstallRecord(SSH_ARGS, sshHost, serviceUser, serviceHome);
+              if (repaired.repaired) {
+                const why = [
+                  finding.stale ? `stale installPath ${finding.installPath}` : "",
+                  finding.nullFields.length ? `null fields [${finding.nullFields.join(",")}]` : "",
+                ].filter(Boolean).join("; ");
+                add(`record-repair-${host}`, true, `repaired ${why} (backup ${repaired.backup})`);
+              } else {
+                anyNodeFailed = true;
+                add(`record-repair-${host}`, false, repaired.error ?? "repair failed");
+              }
+            } else {
+              add(`record-check-${host}`, true, finding.present ? "install record clean" : "no prior install record");
+            }
+          }
+        }
+
         await execFileP("scp", [...SSH_ARGS, tarball, `${sshHost}:/tmp/`], {
           timeout: 120_000,
         });
