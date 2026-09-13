@@ -219,17 +219,37 @@ export default definePluginEntry({
           if (!runId || !/^[-a-zA-Z0-9_]+$/.test(runId)) {
             return JSON.stringify({ ok: false, error: "runId required for detached run" });
           }
+          // Issue #22 bug 2: the sentinel is a TRANSPORT control value, not the
+          // task. The real prompt must arrive separately (`realPrompt`), since
+          // `task.prompt` here IS the sentinel. If it is missing we must NOT
+          // build a command with the placeholder as the message — that launches
+          // an empty session, exits 0, and reads as success.
+          const realPrompt = String(task.realPrompt ?? "");
+          if (realPrompt.trim().length === 0) {
+            return JSON.stringify({
+              ok: false,
+              error: "detached launch missing realPrompt — refusing to launch an empty session (the task prompt would be lost)",
+            });
+          }
           const statePath = runStatePath(runId);
           const logPath = join(tmpdir(), `fleet-run-${runId}.log`);
           const scriptPath = runScriptPath(runId);
           // The script re-echoes the launch command with its own timeout, then
           // writes the final output into the state file on exit.
-          const inner = buildOpenCodeCommand({ ...task, timeoutMs: task.maxDurationMs ?? task.timeoutMs ?? 600_000 });
+          const inner = buildOpenCodeCommand({
+            ...task,
+            prompt: realPrompt,
+            timeoutMs: task.maxDurationMs ?? task.timeoutMs ?? 600_000,
+          });
           // Completion is written to a SEPARATE file so the manager's JSON
           // state write (below) and the worker's completion write never race.
           const donePath = join(tmpdir(), `fleet-done-${runId}.json`);
           const script = [
             "#!/bin/bash",
+            // Issue #22 bug 4: no exit-code laundering. `set -o pipefail` is not
+            // enough on its own; we already fail closed at each step, and the
+            // final exit propagates the worker's real status.
+            "set -u",
             inner,
             `EC=$?`,
             `printf '{"done":1,"exitCode":%s,"finishedAt":"%s"}\\n' "$EC" "$(date -u +%FT%TZ)" > ${shq(donePath)}`,
@@ -584,7 +604,11 @@ export default definePluginEntry({
           const detached = task.async !== false && transport === "http";
           let inv: unknown;
           if (detached) {
-            const launchParams = { ...task, prompt: "__RUN_START__", runId };
+            // Issue #22 bug 2: `prompt` becomes the transport sentinel, so the
+            // real task text MUST ride in a separate field (`realPrompt`) or it
+            // is lost before the command is built — which is exactly how
+            // fleet_dispatch ran empty sessions and still reported success.
+            const launchParams = { ...task, prompt: "__RUN_START__", realPrompt: p.prompt, runId };
             inv = await api.runtime.nodes
               .invoke({
                 nodeId: node.nodeId,

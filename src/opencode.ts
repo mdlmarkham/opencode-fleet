@@ -60,6 +60,12 @@ export interface OpenCodeTask {
   abort?: boolean;
   /** Internal control flag: pull a diff for a session. */
   diff?: boolean;
+  /**
+   * Issue #22: the REAL task prompt for a detached launch. `prompt` carries the
+   * `__RUN_START__` transport sentinel on the wire, so the actual message must
+   * travel in a separate field or it is destroyed before the command is built.
+   */
+  realPrompt?: string;
 }
 
 export interface OpenCodeRunResult {
@@ -83,12 +89,31 @@ import { shq } from "./shell.js";
  * Build the shell command that runs OpenCode on the node for a given task.
  * Returns a single command string executed via the node's shell.
  * All interpolated values are shell-escaped (shq) to prevent injection.
+ *
+ * Issue #22:
+ *  - Bug 1: `cd` must fail closed. A worker that cannot enter the checkout
+ *    (e.g. a /root path the service principal cannot traverse) must abort with
+ *    a clear, greppable error instead of running `opencode` in the wrong place.
+ *  - Bug 2/3: the prompt is passed AFTER `--` so it is delivered as the
+ *    message, never absorbed as a flag value. An empty prompt fails closed.
+ *  - Bug 4: no exit-code laundering — the `cd` failure propagates.
  */
 export function buildOpenCodeCommand(task: OpenCodeTask): string {
   const cwd = task.cwd || ".";
   const timeout = task.timeoutMs ?? 300_000;
   const modelFlag = task.model ? ` --model ${shq(task.model)}` : "";
   const agentFlag = task.agent ? ` --agent ${shq(task.agent)}` : "";
+
+  // Issue #22 bug 2/3: a prompt that is empty, missing, or an unsubstituted
+  // control placeholder must never reach `opencode run` — that launches an
+  // empty session which exits 0 and reads as success.
+  const prompt = task.prompt;
+  if (typeof prompt !== "string" || prompt.trim().length === 0) {
+    throw new Error("opencode task has no prompt (empty or unsubstituted placeholder) — refusing to launch an empty session");
+  }
+  if (CONTROL_PLACEHOLDER_RE.test(prompt)) {
+    throw new Error(`opencode task prompt is an internal control placeholder (${prompt}) — the real prompt was not substituted`);
+  }
 
   // Per-dispatch environment: emitted as leading `export` lines so the worker
   // process (and anything it spawns) sees them. Keys/values are shell-escaped.
@@ -100,9 +125,15 @@ export function buildOpenCodeCommand(task: OpenCodeTask): string {
     .map(([k, v]) => `export ${k}=${shq(String(v))}`)
     .join("\n");
 
+  // Issue #22 bug 1/4: fail closed if we cannot enter the checkout. `cd X || {
+  // ...; exit 1; }` makes the failure fatal so `opencode` never runs from the
+  // wrong directory (and the exit code is not laundered).
+  const cdGuard =
+    `cd ${shq(cwd)} || { echo "FLEET_ERROR: cannot enter cwd ${cwd} as $(id -un) (uid $(id -u)): $?" >&2; exit 66; }`;
+
   if (task.transport === "acp") {
     return [
-      `cd ${shq(cwd)}`,
+      cdGuard,
       envExports,
       `timeout ${Math.floor(timeout / 1000)} opencode acp${modelFlag}${agentFlag} --print-logs 2>&1 <<'OPENCODE_EOF'`,
       task.prompt,
@@ -111,11 +142,14 @@ export function buildOpenCodeCommand(task: OpenCodeTask): string {
   }
 
   return [
-    `cd ${shq(cwd)}`,
+    cdGuard,
     envExports,
-    `timeout ${Math.floor(timeout / 1000)} opencode run${modelFlag}${agentFlag} ${shq(task.prompt)} --format json 2>&1`,
+    `timeout ${Math.floor(timeout / 1000)} opencode run${modelFlag}${agentFlag} --format json -- ${shq(task.prompt)} 2>&1`,
   ].filter(Boolean).join("\n");
 }
+
+/** Internal control sentinels that must never appear as a real prompt. */
+const CONTROL_PLACEHOLDER_RE = /^__RUN_(START|STATUS|RESULT|ABORT)__$/;
 
 /**
  * Parse the raw node command output into a structured result.
