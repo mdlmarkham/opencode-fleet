@@ -25,6 +25,19 @@ export interface FleetNodeConfig {
   roles?: string[];
   /** Whether SSH is available to this node from the manager. When false, provisioning/sync use the node channel. */
   ssh?: boolean;
+  /**
+   * SSH login user for this node. Defaults to the SSH config default
+   * (usually root) when omitted. Issue #18: the account the node's
+   * OpenClaw service runs as (e.g. "svcuser") must be named explicitly so
+   * installs land in THAT principal's plugin root, not the login user's.
+   */
+  user?: string;
+  /**
+   * Principal the node's OpenClaw service runs as, when it differs from the
+   * SSH login user. Used to scope installs/verification to the right plugin
+   * root. Defaults to `user` (or the SSH default) when omitted.
+   */
+  serviceUser?: string;
   /** Free-form platform hint (e.g. "windows", "linux"). Informational. */
   platform?: string;
   /** Arbitrary operator tags for future routing. */

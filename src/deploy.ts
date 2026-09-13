@@ -24,6 +24,15 @@ export interface DeployRequest {
   pluginDir: string;
   /** Node hosts to deploy to (SSH names). */
   nodes: string[];
+  /**
+   * Principal each node's OpenClaw service runs as, keyed by host. Issue #18:
+   * the install must land in THIS principal's plugin root, not the SSH login
+   * user's. When absent for a host, the install runs as the SSH default and
+   * the result is reported as an unverified assumption.
+   */
+  nodeUsers?: Record<string, string>;
+  /** SSH login user per host, when it differs from the SSH default. */
+  nodeLoginUsers?: Record<string, string>;
   /** Whether to restart node services after install. */
   restartNodes?: boolean;
 }
@@ -33,6 +42,17 @@ export interface DeployResult {
   steps: Array<{ step: string; ok: boolean; detail?: string }>;
   gatewayRestartRequired: boolean;
   error?: string;
+}
+
+/** Quote a string for safe use as a single POSIX shell argument. */
+function shq(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
+/** Hash the built dist/index.js so we can prove the installed copy matches. */
+async function builtIndexHash(pluginDir: string): Promise<string> {
+  const { stdout } = await execFileP("sha256sum", [join(pluginDir, "dist", "index.js")], { timeout: 30_000 });
+  return stdout.trim().split(/\s+/)[0];
 }
 
 /**
@@ -75,23 +95,106 @@ export async function deployPlugin(req: DeployRequest): Promise<DeployResult> {
       return { ok: false, steps, gatewayRestartRequired: false, error: "gateway install failed" };
     }
 
+    // Hash the build we just produced so we can prove the node-installed copy
+    // is the same artifact (issue #18, defect 3).
+    let builtHash = "";
+    try {
+      builtHash = await builtIndexHash(req.pluginDir);
+      add("hash-build", true, builtHash);
+    } catch (e) {
+      add("hash-build", false, (e as Error).message);
+      return { ok: false, steps, gatewayRestartRequired: false, error: "could not hash built artifact" };
+    }
+
     // 4. Copy + install on each node.
+    let anyNodeFailed = false;
     for (const host of req.nodes) {
+      const serviceUser = req.nodeUsers?.[host];
+      const loginUser = req.nodeLoginUsers?.[host];
+      const sshHost = loginUser ? `${loginUser}@${host}` : host;
+      const tarballName = tarball.split("/").pop() ?? "";
       try {
-        await execFileP("scp", [...SSH_ARGS, tarball, `${host}:/tmp/`], {
+        await execFileP("scp", [...SSH_ARGS, tarball, `${sshHost}:/tmp/`], {
           timeout: 120_000,
         });
-        await execFileP(
+
+        // Issue #18 defect 1: install as the SERVICE principal, not the SSH
+        // login user. When the caller names one, install into that user's
+        // environment; otherwise fall back to the login user's environment and
+        // mark the step unverified (no silent success).
+        // Issue #18 defect 2: the formatter pipe is removed. The install's own
+        // exit code must gate the step; we capture output and require an
+        // explicit success sentinel.
+        const installInner =
+          `cd /tmp && openclaw plugins install ${shq(tarballName)} --force --accept-capabilities 2>&1; ` +
+          `rc=$?; echo "FLEET_INSTALL_RC=$rc"; exit $rc`;
+        // Use a NON-login shell (`bash -c`): a login shell (`bash -lc`) sources
+        // the user's profile and can print MOTD/banner text on stdout, which
+        // would corrupt the rc/hash we parse back. `sudo -H` already sets HOME.
+        const installCmd = serviceUser
+          ? `sudo -n -u ${shq(serviceUser)} -H bash -c ${shq(installInner)}`
+          : installInner;
+        const { stdout: installOut } = await execFileP(
           "ssh",
-          [
-            ...SSH_ARGS,
-            host,
-            `cd /tmp && openclaw plugins install ${tarball.split("/").pop()} --force --accept-capabilities 2>&1 | tail -2`,
-          ],
+          [...SSH_ARGS, sshHost, installCmd],
           { timeout: 120_000 },
         );
-        add(`install-${host}`, true);
+        const rcMatch = installOut.match(/FLEET_INSTALL_RC=(-?\d+)/);
+        const irc = rcMatch ? parseInt(rcMatch[1], 10) : NaN;
+        if (!Number.isFinite(irc) || irc !== 0) {
+          throw new Error(
+            `install exited rc=${Number.isFinite(irc) ? irc : "unknown"} — output: ${installOut.trim().slice(-300)}`,
+          );
+        }
+        add(
+          `install-${host}`,
+          true,
+          serviceUser ? `installed as ${serviceUser}` : "installed as SSH login user (service principal unverified)",
+        );
+
+        // Issue #18 defect 3: verify the installed build matches what we made.
+        // Compare the sha256 of the *service user's* installed dist/index.js
+        // against the hash of the artifact we just built. Fail closed.
+        const verifyScript =
+          `ROOT="\${HOME}/.openclaw/extensions/opencode-fleet/dist/index.js"; ` +
+          `if [ -f "$ROOT" ]; then sha256sum "$ROOT" | awk '{print $1}'; else echo MISSING; fi`;
+        // Non-login shell again: banner text on stdout would be misparsed as
+        // the hash. `sudo -H` provides the service user's HOME.
+        const verifyCmd = serviceUser
+          ? `sudo -n -u ${shq(serviceUser)} -H bash -c ${shq(verifyScript)}`
+          : verifyScript;
+        const { stdout: verifyOut } = await execFileP(
+          "ssh",
+          [...SSH_ARGS, sshHost, verifyCmd],
+          { timeout: 60_000 },
+        );
+        // Take the last non-empty line, not the first token of the whole
+        // output: resilient even if a node prepends anything to stdout.
+        const hashCandidates = verifyOut
+          .split("\n")
+          .map((l) => l.trim())
+          .filter((l) => l.length > 0);
+        const lastLine = hashCandidates[hashCandidates.length - 1] ?? "";
+        const installedHash = /^[0-9a-f]{64}$/i.test(lastLine.split(/\s+/)[0])
+          ? lastLine.split(/\s+/)[0]
+          : lastLine.includes("MISSING")
+            ? "MISSING"
+            : "";
+        if (installedHash === "MISSING" || !installedHash) {
+          anyNodeFailed = true;
+          add(`verify-${host}`, false, "installed build not found in the target principal's plugin root");
+        } else if (installedHash !== builtHash) {
+          anyNodeFailed = true;
+          add(
+            `verify-${host}`,
+            false,
+            `installed build hash ${installedHash.slice(0, 12)} != built ${builtHash.slice(0, 12)} — node is running stale code`,
+          );
+        } else {
+          add(`verify-${host}`, true, `hash matches built artifact (${installedHash.slice(0, 12)})`);
+        }
       } catch (e) {
+        anyNodeFailed = true;
         add(`install-${host}`, false, (e as Error).message);
       }
     }
@@ -99,20 +202,50 @@ export async function deployPlugin(req: DeployRequest): Promise<DeployResult> {
     // 5. Restart node services.
     if (req.restartNodes) {
       for (const host of req.nodes) {
+        const loginUser = req.nodeLoginUsers?.[host];
+        const serviceUser = req.nodeUsers?.[host];
+        const sshHost = loginUser ? `${loginUser}@${host}` : host;
         try {
-          await execFileP(
-            "ssh",
-            [...SSH_ARGS, host, "systemctl --user restart openclaw-node.service"],
-            { timeout: 60_000 },
-          );
-          add(`restart-${host}`, true);
+          // The live node process is a SYSTEM-scope unit running as the
+          // service user (verified on dev2/dev3: `systemctl --user` lists no
+          // openclaw-node unit). Restart the system unit; the login principal
+          // (root) may need sudo. Do NOT use `systemctl --user` here — it
+          // targets a unit that does not exist and silently does nothing.
+          const restartCmd = `sudo -n systemctl restart openclaw-node.service`;
+          await execFileP("ssh", [...SSH_ARGS, sshHost, restartCmd], {
+            timeout: 60_000,
+          });
+          // Confirm the unit actually came back, rather than trusting the
+          // restart command's exit code (it can succeed while the service
+          // fails to start). Fail the step otherwise.
+          const checkCmd = `systemctl is-active openclaw-node.service`;
+          const { stdout: stateOut } = await execFileP("ssh", [...SSH_ARGS, sshHost, checkCmd], {
+            timeout: 30_000,
+          });
+          const state = stateOut.trim().split("\n").pop() ?? "";
+          if (state !== "active") {
+            anyNodeFailed = true;
+            add(`restart-${host}`, false, `unit not active after restart (state=${state || "unknown"})`);
+          } else {
+            add(`restart-${host}`, true, `openclaw-node.service active${serviceUser ? ` (runs as ${serviceUser})` : ""}`);
+          }
         } catch (e) {
+          anyNodeFailed = true;
           add(`restart-${host}`, false, (e as Error).message);
         }
       }
     }
 
-    return { ok: true, steps, gatewayRestartRequired: true };
+    // Issue #18 defect 4: aggregate. `ok` is false if ANY node failed. A
+    // partial deploy that reports success is worse than a failed one.
+    const gatewayOk = steps.filter((s) => s.step === "build" || s.step === "pack" || s.step === "install-gateway").every((s) => s.ok);
+    const ok = gatewayOk && !anyNodeFailed;
+    return {
+      ok,
+      steps,
+      gatewayRestartRequired: true,
+      ...(ok ? {} : { error: "one or more deploy steps failed — see steps" }),
+    };
   } catch (err) {
     return { ok: false, steps, gatewayRestartRequired: false, error: (err as Error).message };
   }

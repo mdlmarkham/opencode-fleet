@@ -53,6 +53,14 @@
               "items": {
                 "type": "string"
               }
+            },
+            "user": {
+              "type": "string",
+              "description": "SSH login user for this node (defaults to the SSH config default, usually root)."
+            },
+            "serviceUser": {
+              "type": "string",
+              "description": "Principal the node's OpenClaw service runs as, when it differs from the login user. Install/verify target this principal's plugin root."
             }
           }
         }
