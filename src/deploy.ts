@@ -128,8 +128,11 @@ export async function deployPlugin(req: DeployRequest): Promise<DeployResult> {
         const installInner =
           `cd /tmp && openclaw plugins install ${shq(tarballName)} --force --accept-capabilities 2>&1; ` +
           `rc=$?; echo "FLEET_INSTALL_RC=$rc"; exit $rc`;
+        // Use a NON-login shell (`bash -c`): a login shell (`bash -lc`) sources
+        // the user's profile and can print MOTD/banner text on stdout, which
+        // would corrupt the rc/hash we parse back. `sudo -H` already sets HOME.
         const installCmd = serviceUser
-          ? `sudo -n -u ${shq(serviceUser)} -H bash -lc ${shq(installInner)}`
+          ? `sudo -n -u ${shq(serviceUser)} -H bash -c ${shq(installInner)}`
           : installInner;
         const { stdout: installOut } = await execFileP(
           "ssh",
@@ -155,15 +158,28 @@ export async function deployPlugin(req: DeployRequest): Promise<DeployResult> {
         const verifyScript =
           `ROOT="\${HOME}/.openclaw/extensions/opencode-fleet/dist/index.js"; ` +
           `if [ -f "$ROOT" ]; then sha256sum "$ROOT" | awk '{print $1}'; else echo MISSING; fi`;
+        // Non-login shell again: banner text on stdout would be misparsed as
+        // the hash. `sudo -H` provides the service user's HOME.
         const verifyCmd = serviceUser
-          ? `sudo -n -u ${shq(serviceUser)} -H bash -lc ${shq(verifyScript)}`
+          ? `sudo -n -u ${shq(serviceUser)} -H bash -c ${shq(verifyScript)}`
           : verifyScript;
         const { stdout: verifyOut } = await execFileP(
           "ssh",
           [...SSH_ARGS, sshHost, verifyCmd],
           { timeout: 60_000 },
         );
-        const installedHash = verifyOut.trim().split(/\s+/)[0];
+        // Take the last non-empty line, not the first token of the whole
+        // output: resilient even if a node prepends anything to stdout.
+        const hashCandidates = verifyOut
+          .split("\n")
+          .map((l) => l.trim())
+          .filter((l) => l.length > 0);
+        const lastLine = hashCandidates[hashCandidates.length - 1] ?? "";
+        const installedHash = /^[0-9a-f]{64}$/i.test(lastLine.split(/\s+/)[0])
+          ? lastLine.split(/\s+/)[0]
+          : lastLine.includes("MISSING")
+            ? "MISSING"
+            : "";
         if (installedHash === "MISSING" || !installedHash) {
           anyNodeFailed = true;
           add(`verify-${host}`, false, "installed build not found in the target principal's plugin root");
@@ -190,15 +206,29 @@ export async function deployPlugin(req: DeployRequest): Promise<DeployResult> {
         const serviceUser = req.nodeUsers?.[host];
         const sshHost = loginUser ? `${loginUser}@${host}` : host;
         try {
-          // Restart the SERVICE user's unit (that is the process that loads
-          // the plugin). `systemctl --user` requires the right principal.
-          const restartCmd = serviceUser
-            ? `sudo -n -u ${shq(serviceUser)} -H bash -lc ${shq("systemctl --user restart openclaw-node.service")}`
-            : "systemctl --user restart openclaw-node.service";
+          // The live node process is a SYSTEM-scope unit running as the
+          // service user (verified on dev2/dev3: `systemctl --user` lists no
+          // openclaw-node unit). Restart the system unit; the login principal
+          // (root) may need sudo. Do NOT use `systemctl --user` here — it
+          // targets a unit that does not exist and silently does nothing.
+          const restartCmd = `sudo -n systemctl restart openclaw-node.service`;
           await execFileP("ssh", [...SSH_ARGS, sshHost, restartCmd], {
             timeout: 60_000,
           });
-          add(`restart-${host}`, true);
+          // Confirm the unit actually came back, rather than trusting the
+          // restart command's exit code (it can succeed while the service
+          // fails to start). Fail the step otherwise.
+          const checkCmd = `systemctl is-active openclaw-node.service`;
+          const { stdout: stateOut } = await execFileP("ssh", [...SSH_ARGS, sshHost, checkCmd], {
+            timeout: 30_000,
+          });
+          const state = stateOut.trim().split("\n").pop() ?? "";
+          if (state !== "active") {
+            anyNodeFailed = true;
+            add(`restart-${host}`, false, `unit not active after restart (state=${state || "unknown"})`);
+          } else {
+            add(`restart-${host}`, true, `openclaw-node.service active${serviceUser ? ` (runs as ${serviceUser})` : ""}`);
+          }
         } catch (e) {
           anyNodeFailed = true;
           add(`restart-${host}`, false, (e as Error).message);
