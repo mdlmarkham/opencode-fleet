@@ -162,6 +162,19 @@ export async function deployPlugin(req: DeployRequest): Promise<DeployResult> {
               add(`record-check-${host}`, true, finding.present ? "install record clean" : "no prior install record");
             }
           }
+        } else {
+          // No serviceUser: we cannot inspect the record as the service
+          // principal, and as root the EACCES is invisible — so we CANNOT
+          // claim the node is clean. Emitting nothing here would let a blind
+          // spot masquerade as a pass (the very false-negative-as-success
+          // shape this issue exists to kill). Report the blind spot as a
+          // FAILED step so it is visible in the deploy result.
+          anyNodeFailed = true;
+          add(
+            `record-check-${host}`,
+            false,
+            "no serviceUser configured — cannot inspect the install record as the service principal (blind as root); set nodes[].serviceUser to enable the stale-record check",
+          );
         }
 
         await execFileP("scp", [...SSH_ARGS, tarball, `${sshHost}:/tmp/`], {
