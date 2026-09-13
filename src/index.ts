@@ -1406,7 +1406,7 @@ export default definePluginEntry({
           node: { type: "string", description: "Node display name or id." },
           cwd: { type: "string", description: "Working directory on the node." },
           repo: { type: "string", description: "Git URL the manager can access." },
-          branch: { type: "string", description: "Branch to push to (default main)." },
+          branch: { type: "string", description: "Destination branch to publish the worker's work to. When omitted, the worker's own checked-out branch is published if it differs from `main` (so feature-branch work stays reviewable); otherwise `main`." },
         },
         required: ["node", "cwd", "repo"],
       },
@@ -1448,12 +1448,13 @@ export default definePluginEntry({
             mode: "from-base64",
             base64: parts.join(""),
             branch: p.branch ?? "main",
+            destBranch: p.branch,
           });
           return jsonResult({ ...r, viaChannel: true });
         }
 
         const { syncFromNode } = await import("./provision.js");
-        const r = await syncFromNode(host, p.cwd, p.repo, p.branch ?? "main");
+        const r = await syncFromNode(host, p.cwd, p.repo, p.branch ?? "main", undefined, p.branch);
         return jsonResult(r);
       },
     });
