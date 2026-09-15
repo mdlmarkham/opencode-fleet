@@ -227,8 +227,13 @@ export async function provisionToNode(
     const safeDirCmd = [
       `git config --system --get-all safe.directory 2>/dev/null | grep -qxF ${shq(req.cwd)}`,
       `|| git config --system --add safe.directory ${shq(req.cwd)}`,
+      `;`,
       `git config --system --get-all safe.directory 2>/dev/null | grep -qxF ${shq(req.cwd)}`,
-      `&& echo "---FLEET_SAFEDIR=ok"`,
+      `|| { echo "FLEET_ERROR: could not set safe.directory for ${shq(req.cwd)}" >&2; exit 67; }`,
+      `;`,
+      `echo "---FLEET_SAFEDIR=ok"`,
+      `;`,
+      `true`,
     ].join(" ");
 
     // Unpack on the worker (no credentials needed). Light GC only —
