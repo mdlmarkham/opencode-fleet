@@ -1557,10 +1557,15 @@ export default definePluginEntry({
             description: "Node SSH hosts to deploy to. Omit for all fleet nodes.",
           },
           restartNodes: { type: "boolean", description: "Restart node services after install (default true)." },
+          selfCheck: {
+            type: "boolean",
+            description:
+              "After install+restart, run a trivial dispatch on each node and require the token back; fail the deploy if it does not (default true). Hash-equality proves the file matches, not that the plugin works.",
+          },
         },
       },
       execute: async (toolCallId, params, signal) => {
-        const p = params as { pluginDir?: string; nodes?: string[]; restartNodes?: boolean };
+        const p = params as { pluginDir?: string; nodes?: string[]; restartNodes?: boolean; selfCheck?: boolean };
         const { deployPlugin } = await import("./deploy.js");
         const list = await api.runtime.nodes.list();
         const nodes = list.nodes ?? [];
@@ -1587,6 +1592,7 @@ export default definePluginEntry({
           nodeUsers,
           nodeLoginUsers,
           restartNodes: p.restartNodes ?? true,
+          selfCheck: p.selfCheck,
         });
         return jsonResult(r);
       },

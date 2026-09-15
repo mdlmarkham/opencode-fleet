@@ -21,6 +21,7 @@ import {
   repairRemoteInstallRecord,
   needsRepair,
 } from "./install-record.js";
+import { runSelfCheck } from "./selfcheck.js";
 
 const execFileP = promisify(execFile);
 
@@ -40,6 +41,12 @@ export interface DeployRequest {
   nodeLoginUsers?: Record<string, string>;
   /** Whether to restart node services after install. */
   restartNodes?: boolean;
+  /**
+   * Issue #24: after install+restart, run a known-trivial dispatch on each node
+   * and fail the deploy if the token does not come back. Default true — the
+   * whole point is that "hash matches" is not "works".
+   */
+  selfCheck?: boolean;
 }
 
 export interface DeployResult {
@@ -295,6 +302,41 @@ export async function deployPlugin(req: DeployRequest): Promise<DeployResult> {
         } catch (e) {
           anyNodeFailed = true;
           add(`restart-${host}`, false, (e as Error).message);
+        }
+      }
+    }
+
+    // 6. Post-install self-check (issue #24). "Hash matches" is not "works".
+    // Every false-success defect in this repo (#12, #13, #18, #22) would have
+    // been caught by this single assertion: a real, trivial dispatch that must
+    // echo a token. Run it AFTER restart so it exercises the code the node is
+    // actually serving now.
+    const selfCheckEnabled = req.selfCheck !== false;
+    if (selfCheckEnabled && req.restartNodes) {
+      for (const host of req.nodes) {
+        const loginUser = req.nodeLoginUsers?.[host];
+        const serviceUser = req.nodeUsers?.[host];
+        const sshHost = loginUser ? `${loginUser}@${host}` : host;
+        // Reuse the service HOME resolved earlier if we still have it; the
+        // self-check only needs it to prefer a traversable cwd.
+        let serviceHome: string | undefined;
+        try {
+          const { stdout } = await execFileP(
+            "ssh",
+            [...SSH_ARGS, sshHost, `sudo -n -u ${shq(serviceUser ?? "root")} -H bash -c 'printf %s "$HOME"'`],
+            { timeout: 30_000 },
+          );
+          const h = stdout.trim().split("\n").map((l) => l.trim()).filter(Boolean).pop() ?? "";
+          if (h.startsWith("/")) serviceHome = h;
+        } catch {
+          serviceHome = undefined;
+        }
+        const r = await runSelfCheck(SSH_ARGS, sshHost, serviceUser, serviceHome);
+        if (r.ok) {
+          add(`selfcheck-${host}`, true, `dispatch works: token echoed in ${r.cwd}`);
+        } else {
+          anyNodeFailed = true;
+          add(`selfcheck-${host}`, false, r.error ?? "self-check failed");
         }
       }
     }
