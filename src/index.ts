@@ -570,8 +570,49 @@ export default definePluginEntry({
         });
         const results: Record<string, unknown> = {};
         if (skippedNodes.length) results.skipped = skippedNodes;
+        // Issue #26: validate the cwd AS THE WORKER PRINCIPAL before dispatch.
+        // A /root path is unreachable by a non-root service user, so the run
+        // cannot start — refuse with an actionable error instead of sending it
+        // and discovering the failure later (or, pre-#22, reporting success).
+        const { cwdCheckCommand, evaluateCwdCheck, looksWorkerInaccessible, defaultFleetCwd } = await import("./cwd.js");
+        const { SSH_ARGS } = await import("./ssh.js");
+        const { execFile: execFileCb } = await import("node:child_process");
+        const { promisify: promisifyCb } = await import("node:util");
+        const execFileProbe = promisifyCb(execFileCb);
+        const sshProbe = async (hostArg: string, command: string, timeoutMs = 30_000): Promise<string> => {
+          try {
+            const { stdout } = await execFileProbe("ssh", [...SSH_ARGS, hostArg, command], { timeout: timeoutMs });
+            return stdout;
+          } catch (e) {
+            return (e as { stdout?: string }).stdout ?? "";
+          }
+        };
         for (const node of opencodeTargets) {
           const runId = newRunId();
+          // Issue #26: refuse an unusable cwd BEFORE recording a run or
+          // dispatching. Check as the worker principal; a fast path-only check
+          // catches the common /root case without an SSH round trip.
+          const nodeKey = node.displayName ?? node.nodeId;
+          const svcUser = (node as { member?: { serviceUser?: string; user?: string } }).member?.serviceUser
+            ?? (node as { member?: { user?: string } }).member?.user;
+          const loginUser = (node as { member?: { user?: string } }).member?.user;
+          const sshHost = loginUser ? `${loginUser}@${nodeKey}` : nodeKey;
+          if (looksWorkerInaccessible(p.cwd, svcUser)) {
+            results[nodeKey] = {
+              ok: false,
+              error:
+                `refusing to dispatch: cwd ${p.cwd} is unusable — it is not traversable by the worker principal` +
+                `${svcUser ? ` (${svcUser})` : ""} (a /root path is mode 0700 and cannot be entered by a non-root service user). ` +
+                `Provision/dispatch under a workspace both principals share, e.g. ${defaultFleetCwd("your-repo")}.`,
+            };
+            continue;
+          }
+          const cwdOut = await sshProbe(sshHost, cwdCheckCommand(p.cwd, svcUser));
+          const cwdCheck = evaluateCwdCheck(cwdOut, p.cwd, svcUser);
+          if (!cwdCheck.ok) {
+            results[nodeKey] = { ok: false, error: cwdCheck.error };
+            continue;
+          }
           const task: OpenCodeTask = {
             prompt: p.prompt,
             cwd: p.cwd,
@@ -1295,7 +1336,6 @@ export default definePluginEntry({
         additionalProperties: false,
         properties: {
           repo: { type: "string", description: "Git URL the manager can access (e.g. git@github.com:org/repo)." },
-          cwd: { type: "string", description: "Target directory on the node(s)." },
           nodes: {
             type: "array",
             items: { type: "string" },
@@ -1303,17 +1343,26 @@ export default definePluginEntry({
           },
           branch: { type: "string", description: "Branch to check out (default main)." },
           commit: { type: "string", description: "Optional commit SHA to check out." },
+          cwd: {
+            type: "string",
+            description:
+              "Target directory on the node(s). Issue #26: defaults to a workspace the worker principal can actually enter (<fleetRoot>/<repo>), instead of a /root path the service user cannot traverse.",
+          },
           setup: {
             type: "string",
             description:
               "Optional repo-declared setup command to run on each node after checkout (issue #19), e.g. \"scripts/setup.sh\" or \"python3 -m venv .venv && .venv/bin/pip install -r requirements.txt\". Lets a repo declare its own environment bootstrap so 'provisioned' means 'can run the tests'. Reported per node; never hardcoded.",
           },
         },
-        required: ["repo", "cwd"],
+        required: ["repo"],
       },
       execute: async (toolCallId, params, signal) => {
-        const p = params as { repo: string; cwd: string; nodes?: string[]; branch?: string; commit?: string; setup?: string };
+        const p = params as { repo: string; cwd?: string; nodes?: string[]; branch?: string; commit?: string; setup?: string };
         const { createRepoBundle, provisionToNode, cleanupBundle } = await import("./provision.js");
+        // Issue #26: default the landing path to a workspace the worker
+        // principal can actually enter, instead of a /root path it cannot.
+        const { defaultFleetCwd } = await import("./cwd.js");
+        const targetCwd = p.cwd ?? defaultFleetCwd(p.repo);
 
         // Resolve target nodes.
         const list = await api.runtime.nodes.list();
@@ -1327,7 +1376,7 @@ export default definePluginEntry({
         }
 
         // Create the bundle once (manager-side, with manager creds).
-        const bundle = await createRepoBundle({ repo: p.repo, cwd: p.cwd, branch: p.branch, commit: p.commit });
+        const bundle = await createRepoBundle({ repo: p.repo, cwd: targetCwd, branch: p.branch, commit: p.commit });
         if (bundle.error || !bundle.bundlePath) {
           return jsonResult({ ok: false, error: bundle.error ?? "bundle creation failed" });
         }
@@ -1351,7 +1400,7 @@ export default definePluginEntry({
             bundle.bundlePath,
             {
               repo: p.repo,
-              cwd: p.cwd,
+              cwd: targetCwd,
               branch: p.branch,
               commit: p.commit,
               setup: p.setup,
