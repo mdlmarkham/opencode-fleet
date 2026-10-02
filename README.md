@@ -95,8 +95,19 @@ The plugin bundles a **skill** (`skills/opencode-fleet/SKILL.md`) that teaches a
 | `nodePrefixes` | `["dev"]` | Node display-name prefixes treated as fleet members |
 | `defaultTimeoutMs` | `300000` | Default timeout for OpenCode runs |
 | `apertureUrl` | `https://ai.tailf9480.ts.net/v1/models` | Aperture model catalog URL |
+| `allowAutoApprove` | `true` | Whether `fleet_dispatch` may pass `autoApprove` (`opencode run --auto`, auto-approves every non-denied permission). Set `false` to forbid it fleet-wide. |
+| `allowSetupCommands` | `false` | Whether `fleet_provision`'s `setup` may be an arbitrary shell command. By default it must be a repo-relative script path with plain arguments (e.g. `scripts/setup.sh`). |
 | `nodes[].user` | _(unset)_ | SSH login user for a node (defaults to SSH config default, usually `root`) |
 | `nodes[].serviceUser` | _(unset)_ | Principal the node's OpenClaw service runs as, when it differs from the login user. Install/verify target this principal's plugin root. |
+
+## Trust boundaries for agent-supplied input
+
+Text an agent passes to `fleet_dispatch`/`fleet_provision` can originate from content the agent read, so these channels are restricted:
+
+- **`env`** — names that execute code or redirect configuration are refused (the dispatch fails and names them; they are never silently dropped): `BASH_ENV`, `ENV`, `NODE_OPTIONS`, `PYTHONSTARTUP`, `LD_*`, `GIT_SSH*`, `GIT_CONFIG*`, `XDG_CONFIG_HOME`, `OPENCODE_CONFIG*`, `OPENCODE_PERMISSION`, and similar. Ordinary variables (`CI`, API keys, proxies) pass.
+- **`setup`** — a repo-relative script path with plain arguments only, unless the operator sets `allowSetupCommands`.
+- **`autoApprove`** — opt-in per dispatch, and forbiddable with `allowAutoApprove: false`. It widens what a detached worker may do without asking; pair it with deny rules on the node.
+- **`cwd`** — confined to the node's allowed roots (`FLEET_ALLOWED_ROOTS`, default: the fleet workspace root and the service home).
 
 ## Development
 

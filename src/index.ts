@@ -13,6 +13,7 @@ import {
 import { SSH_ARGS } from "./ssh.js";
 import { guardCwd, taskUsesCwd, validateTaskIds } from "./guard.js";
 import { quoteUntrusted, sanitizeQuestion } from "./untrusted.js";
+import { checkSetup, partitionEnv } from "./policy.js";
 import { runPaths, xferPaths, ensureStateDir, writePrivate } from "./paths.js";
 
 /** OpenCode task plus the dispatch watchdog knobs (idle/duration guards). */
@@ -50,6 +51,10 @@ interface FleetConfig {
   nodePrefixes?: string[];
   defaultTimeoutMs?: number;
   apertureUrl?: string;
+  /** Operator switch: let agents pass `autoApprove` on dispatch (default true). */
+  allowAutoApprove?: boolean;
+  /** Operator switch: let fleet_provision `setup` be an arbitrary shell command, not just a repo script (default false). */
+  allowSetupCommands?: boolean;
 }
 
 export default definePluginEntry({
@@ -77,6 +82,16 @@ export default definePluginEntry({
         type: "number",
         default: 300000,
         description: "Default timeout for OpenCode runs, ms.",
+      },
+      allowAutoApprove: {
+        type: "boolean",
+        default: true,
+        description: "Allow fleet_dispatch autoApprove (opencode --auto). Set false to forbid it fleet-wide.",
+      },
+      allowSetupCommands: {
+        type: "boolean",
+        default: false,
+        description: "Allow fleet_provision setup to be an arbitrary shell command. Default: repo-relative script path only.",
       },
       apertureUrl: {
         type: "string",
@@ -643,6 +658,15 @@ export default definePluginEntry({
         }
 
         const transport = p.transport ?? cfg.defaultTransport ?? "http";
+        // Issue #34: refuse (never silently drop) env names that execute code or
+        // redirect config, and honor the operator's autoApprove ceiling.
+        const envPartition = partitionEnv(p.env);
+        if (envPartition.rejected.length) {
+          return jsonResult({ ok: false, error: `env not allowed: ${envPartition.rejected.join(", ")}` });
+        }
+        if (p.autoApprove === true && cfg.allowAutoApprove === false) {
+          return jsonResult({ ok: false, error: "autoApprove is disabled by the operator (allowAutoApprove=false)" });
+        }
         const { upsertRun, newRunId, probeRun, loadLedger } = await import("./ledger.js");
         const rootDir = api.rootDir ?? process.cwd();
 
@@ -1521,6 +1545,9 @@ export default definePluginEntry({
       execute: async (toolCallId, params, signal) => {
         const p = params as { repo: string; cwd?: string; nodes?: string[]; branch?: string; commit?: string; setup?: string };
         const { createRepoBundle, provisionToNode, cleanupBundle } = await import("./provision.js");
+        // Issue #34: refuse an arbitrary-shell `setup` unless the operator allows it.
+        const setupCheck = checkSetup(p.setup ?? "", cfg.allowSetupCommands === true);
+        if (!setupCheck.ok) return jsonResult({ ok: false, error: setupCheck.error });
         // Issue #26: default the landing path to a workspace the worker
         // principal can actually enter, instead of a /root path it cannot.
         const { defaultFleetCwd } = await import("./cwd.js");
@@ -1566,6 +1593,7 @@ export default definePluginEntry({
               branch: p.branch,
               commit: p.commit,
               setup: p.setup,
+              allowSetupCommands: cfg.allowSetupCommands === true,
             },
             channelInvoke,
           );
