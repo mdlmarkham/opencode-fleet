@@ -12,6 +12,7 @@ import {
   type AckRecoveryOutcome,
 } from "./recovery.js";
 import { SSH_ARGS } from "./ssh.js";
+import { guardCwd, taskUsesCwd, validateTaskIds } from "./guard.js";
 
 /** OpenCode task plus the dispatch watchdog knobs (idle/duration guards). */
 type FleetOpenCodeTask = OpenCodeTask & {
@@ -97,6 +98,16 @@ export default definePluginEntry({
         const task = paramsJSON ? (JSON.parse(paramsJSON) as OpenCodeTask) : null;
         if (!task || !task.prompt || !task.cwd) {
           return JSON.stringify({ ok: false, error: "opencode.run requires prompt and cwd." });
+        }
+
+        // Issue #31: the node must not trust what the gateway relays. Validate
+        // identifiers used in file paths, and confine cwd to the workspace
+        // roots before any destructive/clone operation can run.
+        const idErr = validateTaskIds(task);
+        if (idErr) return JSON.stringify({ ok: false, error: idErr });
+        if (taskUsesCwd(task.prompt)) {
+          const cwdCheck = await guardCwd(task.cwd);
+          if (!cwdCheck.ok) return JSON.stringify({ ok: false, error: `refused: ${cwdCheck.error}` });
         }
 
         // Special control messages (abort / diff / models) handled by the gateway tool.
