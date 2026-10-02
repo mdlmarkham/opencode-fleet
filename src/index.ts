@@ -12,6 +12,7 @@ import {
 } from "./recovery.js";
 import { SSH_ARGS } from "./ssh.js";
 import { guardCwd, taskUsesCwd, validateTaskIds } from "./guard.js";
+import { quoteUntrusted, sanitizeQuestion } from "./untrusted.js";
 import { runPaths, xferPaths, ensureStateDir, writePrivate } from "./paths.js";
 
 /** OpenCode task plus the dispatch watchdog knobs (idle/duration guards). */
@@ -380,7 +381,7 @@ export default definePluginEntry({
             if (typeof done.exitCode === "number") exitCode = done.exitCode;
           } catch { /* still running or no marker */ }
           const parsed =
-            harness === "pi" ? parsePiOutput(tail, { exitCode }) : parseOpenCodeOutput(tail);
+            harness === "pi" ? parsePiOutput(tail, { exitCode }) : parseOpenCodeOutput(tail, exitCode !== undefined ? { exitCode } : undefined);
           return JSON.stringify({ ok: true, runId, harness, result: parsed });
         }
         if (task.prompt === "__RUN_ABORT__") {
@@ -497,7 +498,7 @@ export default definePluginEntry({
         return JSON.stringify(
           task.harness === "pi"
             ? parsePiOutput(run.output, { exitCode: run.exitCode, timedOut: run.timedOut, stuck: run.stuck })
-            : parseOpenCodeOutput(run.output),
+            : parseOpenCodeOutput(run.output, { exitCode: run.exitCode, timedOut: run.timedOut, stuck: run.stuck }),
         );
       },
     },
@@ -1215,8 +1216,10 @@ export default definePluginEntry({
         const prompt = [
           p.priorContext,
           "",
+          // Issue #35: the question came from a worker (model output), so it is
+          // quoted as data and bounded; only `answer` is the caller's own voice.
           "A clarifying question was raised and answered:",
-          `Q: ${p.question}`,
+          `Q: ${sanitizeQuestion(p.question)}`,
           `A: ${p.answer}`,
           "Continue the task with this answer. Do not re-ask the same question.",
         ].join("\n");
@@ -1327,7 +1330,11 @@ export default definePluginEntry({
           }
 
           // Success check.
-          const looksFailed = parsed.ok === false || /error|failed|timed out|stuck/i.test(parsed.summary ?? "");
+          // Issue #35: trust the exit-status-derived `ok`; only fall back to the
+          // output regex for a node that predates it (ok undefined).
+          const looksFailed = parsed.ok === undefined
+            ? /error|failed|timed out|stuck/i.test(parsed.summary ?? "")
+            : parsed.ok === false;
           const success = p.successMarker ? (parsed.summary ?? "").includes(p.successMarker) : !looksFailed;
           if (success) {
             return jsonResult({ iterations, done: true, success: true, finalSummary: parsed.summary });
@@ -1351,8 +1358,8 @@ export default definePluginEntry({
             p.prompt,
             "",
             `Iteration ${i} did not succeed. The worker reported:`,
-            parsed.summary ? `Output: ${parsed.summary.slice(0, 2000)}` : "",
-            parsed.error ? `Error: ${parsed.error.slice(0, 2000)}` : "",
+            parsed.summary ? quoteUntrusted("output", parsed.summary) : "",
+            parsed.error ? quoteUntrusted("error", parsed.error) : "",
             "",
             "Fix the issues above and try again. Do not repeat the same approach.",
           ].join("\n");
