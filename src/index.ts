@@ -4,6 +4,12 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { shq } from "./shell.js";
 import { buildOpenCodeCommand, parseOpenCodeOutput, parsePiOutput, type OpenCodeTask } from "./opencode.js";
+import {
+  probeAckRecovery,
+  ACK_ABSENT_NOTE,
+  ACK_PROBE_TIMEOUT_MS,
+  type AckRecoveryOutcome,
+} from "./recovery.js";
 import { SSH_ARGS } from "./ssh.js";
 
 /** OpenCode task plus the dispatch watchdog knobs (idle/duration guards). */
@@ -94,13 +100,24 @@ export default definePluginEntry({
 
         // Special control messages (abort / diff / models) handled by the gateway tool.
         if (task.prompt === "__ABORT__") {
-          // Kill running OpenCode processes on the node (real abort).
+          // Issue #30 finding H: cancellation was engine-blind — `pkill -f
+          // "opencode (run|acp|serve)"` never matched a Pi worker. Terminate by
+          // the RECORDED run's pid (engine-independent) when a runId is given,
+          // and only report success after confirming termination. The pattern
+          // fallback now also matches Pi.
+          const runId = String(task.runId ?? "");
+          if (runId) {
+            const r = await abortRunById(runId);
+            return JSON.stringify({ ...r, sessionId: task.sessionId });
+          }
           const killed = await runShell(
-            `pkill -f "opencode (run|acp|serve)" 2>/dev/null; echo "aborted"`,
+            `pkill -f "opencode (run|acp|serve)" 2>/dev/null; pkill -f "[p]i -p " 2>/dev/null; sleep 1; ` +
+              `if pgrep -f "opencode (run|acp|serve)" >/dev/null 2>&1 || pgrep -f "[p]i -p " >/dev/null 2>&1; then echo "REMAINING"; else echo "CLEARED"; fi`,
             15_000,
             context?.signal,
           );
-          return JSON.stringify({ ok: true, aborted: true, sessionId: task.sessionId, detail: killed.trim() });
+          const cleared = killed.includes("CLEARED");
+          return JSON.stringify({ ok: cleared, aborted: cleared, sessionId: task.sessionId, detail: killed.trim() });
         }
         if (task.prompt === "__DIFF__") {
           // Show the working-tree diff in the checkout (real diff).
@@ -273,9 +290,17 @@ export default definePluginEntry({
           }
           await (await import("node:fs/promises")).writeFile(
             statePath,
-            JSON.stringify({ runId, pid: Number(pidMatch[1]), startedAt: new Date().toISOString(), state: "running" }),
+            // Issue #30 finding F: persist the harness so __RUN_RESULT__ can
+            // select the correct parser later (Pi is NOT opencode NDJSON).
+            JSON.stringify({
+              runId,
+              pid: Number(pidMatch[1]),
+              startedAt: new Date().toISOString(),
+              state: "running",
+              harness: task.harness ?? "opencode",
+            }),
           );
-          return JSON.stringify({ ok: true, detached: true, runId, pid: Number(pidMatch[1]), statePath, logPath });
+          return JSON.stringify({ ok: true, detached: true, runId, pid: Number(pidMatch[1]), statePath, logPath, harness: task.harness ?? "opencode" });
         }
         if (task.prompt === "__RUN_STATUS__") {
           // Read the run-state file + liveness; never blocks on the run.
@@ -323,11 +348,28 @@ export default definePluginEntry({
         }
         if (task.prompt === "__RUN_RESULT__") {
           // Final output of a detached run: tail of the log + state.
+          // Issue #30 finding F: parse with the engine that ACTUALLY ran —
+          // read the persisted harness from the run state, and the exit code
+          // from the done marker so failure is not read as success. The
+          // default (opencode) path is unchanged.
           const runId = String(task.runId ?? "");
           const logPath = join(tmpdir(), `fleet-run-${runId}.log`);
           const tail = await runShell(`tail -c 64000 ${shq(logPath)} 2>/dev/null || true`, 15_000, context?.signal);
-          const parsed = parseOpenCodeOutput(tail);
-          return JSON.stringify({ ok: true, runId, result: parsed });
+          let harness = "opencode";
+          let exitCode: number | undefined;
+          try {
+            const raw = await (await import("node:fs/promises")).readFile(runStatePath(runId), "utf8");
+            const st = JSON.parse(raw) as { harness?: string };
+            if (st.harness) harness = st.harness;
+          } catch { /* no state file */ }
+          try {
+            const doneRaw = await (await import("node:fs/promises")).readFile(join(tmpdir(), `fleet-done-${runId}.json`), "utf8");
+            const done = JSON.parse(doneRaw) as { exitCode?: number };
+            if (typeof done.exitCode === "number") exitCode = done.exitCode;
+          } catch { /* still running or no marker */ }
+          const parsed =
+            harness === "pi" ? parsePiOutput(tail, { exitCode }) : parseOpenCodeOutput(tail);
+          return JSON.stringify({ ok: true, runId, harness, result: parsed });
         }
         if (task.prompt === "__RUN_ABORT__") {
           const runId = String(task.runId ?? "");
@@ -396,6 +438,16 @@ export default definePluginEntry({
           }
         };
 
+        // Issue #30 finding G: harness=pi + transport=acp silently routed to the
+        // opencode ACP client, ignoring Pi and piModel. Pi has no ACP transport;
+        // reject the combination explicitly rather than run something else.
+        if (task.transport === "acp" && task.harness === "pi") {
+          return JSON.stringify({
+            ok: false,
+            harness: "pi",
+            error: "harness=pi requires transport=http (opencode acp has no Pi transport; Pi would be silently ignored)",
+          });
+        }
         if (task.transport === "acp") {
           const { runAcpPrompt } = await import("./acp-client.js");
           const acpResult = await runAcpPrompt({
@@ -409,7 +461,10 @@ export default definePluginEntry({
           return JSON.stringify(acpResult);
         }
 
-        const result = await runShell(
+        // Issue #30 finding A: thread the shell exit code (and watchdog flags)
+        // through so a non-zero exit / timeout / FLEET_ERROR is not read as
+        // success by the Pi parser.
+        const run = await runShellDetailed(
           command,
           task.timeoutMs ?? 300_000,
           context?.signal,
@@ -417,7 +472,11 @@ export default definePluginEntry({
           task.maxIdleMs,
           task.maxDurationMs,
         );
-        return JSON.stringify(task.harness === "pi" ? parsePiOutput(result) : parseOpenCodeOutput(result));
+        return JSON.stringify(
+          task.harness === "pi"
+            ? parsePiOutput(run.output, { exitCode: run.exitCode, timedOut: run.timedOut, stuck: run.stuck })
+            : parseOpenCodeOutput(run.output),
+        );
       },
     },
   ],
@@ -477,6 +536,7 @@ export default definePluginEntry({
           piModel: { type: "string", description: "Pi model override (harness=pi); `provider/id` ref, e.g. aperture/glm-5.3-flash:cloud." },
           model: { type: "string", description: "Optional model override (must exist on node)." },
           agent: { type: "string", description: "Optional OpenCode agent (build/plan)." },
+          autoApprove: { type: "boolean", description: "Opt-in: append --auto to `opencode run` to auto-approve all non-denied permissions for this run. Default false — this widens the trust posture." },
           timeoutMs: { type: "number", description: "Per-node timeout, ms." },
           maxIdleMs: { type: "number", description: "Kill the run if no output for this long, ms (stuck-loop guard). Default 120000." },
           maxDurationMs: { type: "number", description: "Kill the run if total runtime exceeds this, ms (stuck-loop guard). Default 600000." },
@@ -509,6 +569,7 @@ export default definePluginEntry({
           piModel?: string;
           model?: string;
           agent?: string;
+          autoApprove?: boolean;
           timeoutMs?: number;
           maxIdleMs?: number;
           maxDurationMs?: number;
@@ -625,6 +686,7 @@ export default definePluginEntry({
             piModel: p.piModel,
             model: p.model,
             agent: p.agent,
+            autoApprove: p.autoApprove === true,
             timeoutMs: p.timeoutMs ?? cfg.defaultTimeoutMs,
             maxIdleMs: p.maxIdleMs,
             maxDurationMs: p.maxDurationMs,
@@ -717,52 +779,40 @@ export default definePluginEntry({
               // failure here makes an unattended caller re-dispatch and
               // duplicate work — the exact babysitter failure mode. PROBE the
               // node for evidence the run exists before deciding.
-              let recovered: { confirmed: boolean; state?: string; pid?: number } = { confirmed: false };
-              if (!nodeRejected) {
-                try {
-                  const stInv = await api.runtime.nodes.invoke({
-                    nodeId: node.nodeId,
-                    command: "opencode.run",
-                    params: { prompt: "__RUN_STATUS__", cwd: "/", transport: "http", runId },
-                    timeoutMs: 20_000,
-                    signal,
-                  });
-                  const probe = payloadOf(stInv) as {
-                    ok?: boolean;
-                    state?: string;
-                    pid?: number;
-                    status?: string;
-                    alive?: boolean;
-                  };
-                  // Any positive evidence the run exists: a live/recorded pid,
-                  // a state file (running/finished/aborted), or the script/log
-                  // artifacts the launcher writes before opencode starts
-                  // (reported as status "cleaned").
-                  if (
-                    probe.pid ||
-                    probe.state ||
-                    probe.alive === true ||
-                    probe.status === "cleaned"
-                  ) {
-                    recovered = {
-                      confirmed: true,
-                      state: probe.state ?? probe.status,
-                      pid: probe.pid,
-                    };
-                  }
-                } catch {
-                  recovered = { confirmed: false };
-                }
-              }
-              if (recovered.confirmed) {
+              // Issue #30 finding E: probe with a FRESH timeout-only signal and
+              // an allow-list decision (recovery.ts). A probe that THREW or
+              // TIMED OUT is INCONCLUSIVE — never "safe to re-dispatch". A node
+              // that explicitly rejected the launch is a definitive negative, so
+              // no probe is attempted and it IS safe to re-dispatch.
+              const recovery: AckRecoveryOutcome = nodeRejected
+                ? { kind: "absent", verdict: "absent", probed: false, note: ACK_ABSENT_NOTE }
+                : await probeAckRecovery((probeSignal) =>
+                    api.runtime.nodes.invoke({
+                      nodeId: node.nodeId,
+                      command: "opencode.run",
+                      params: { prompt: "__RUN_STATUS__", cwd: "/", transport: "http", runId },
+                      timeoutMs: ACK_PROBE_TIMEOUT_MS,
+                      signal: probeSignal,
+                    }),
+                  );
+              if (recovery.kind === "confirmed") {
+                // Persist the discovered pid so later liveness/cancel checks are
+                // engine-independent (issue #30 findings H/I).
+                await upsertRun(rootDir, {
+                  ...ledgerEntry,
+                  pid: recovery.pid,
+                  updatedAt: new Date().toISOString(),
+                  state: "running",
+                });
                 results[node.displayName ?? node.nodeId] = {
                   runId,
                   detached: true,
-                  pid: recovered.pid,
+                  pid: recovery.pid,
                   ok: true,
                   ackPending: false,
                   recoveredFromTimeout: true,
-                  note: "Launch ack timed out, but the run IS on the node (probe confirmed). Poll with fleet_run_status/fleet_watch; do NOT re-dispatch.",
+                  probe: recovery.verdict,
+                  note: recovery.note,
                 };
                 continue;
               }
@@ -772,15 +822,23 @@ export default definePluginEntry({
                 ok: false,
                 ackPending: !ackOk,
                 ...(invokeTimedOut ? { invokeTimedOut: true } : {}),
+                probe: recovery.verdict,
                 error: nodeRejected ? `launch failed: ${errMsg}` : `launch ack not received: ${errMsg}`,
-                note:
-                  "Launch was NOT confirmed AND no run was found on the node. Safe to re-dispatch.",
+                note: recovery.note,
               };
               continue;
             }
 
             // Positive ack: the node wrote the pid into the run-state file.
             if (ackOk) {
+              // Persist the pid (issue #30 findings H/I) so liveness probes and
+              // cancellation are engine-independent (works for Pi too).
+              await upsertRun(rootDir, {
+                ...ledgerEntry,
+                pid: launchPayload.pid,
+                updatedAt: new Date().toISOString(),
+                state: "running",
+              });
               results[node.displayName ?? node.nodeId] = {
                 runId,
                 detached: true,
@@ -888,6 +946,8 @@ export default definePluginEntry({
             prompt: p.prompt,
             model: p.model,
             transport,
+            harness: p.harness,
+            piModel: p.piModel,
             startedAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),
             state: timedOut ? "timed-out" : parsedResult.ok === false ? "failed" : "completed",
@@ -941,7 +1001,7 @@ export default definePluginEntry({
         const findings: Array<Record<string, unknown>> = [];
         for (const run of incomplete) {
           const host = hostFor(run.node);
-          const probe = await probeRun(host, run.cwd);
+          const probe = await probeRun(host, run.cwd, { harness: run.harness, pid: run.pid });
           let status: string;
           if (probe.procRunning) status = "live";
           else if ((probe.uncommitted ?? -1) > 0) status = "finished-uncommitted";
@@ -969,18 +1029,27 @@ export default definePluginEntry({
           });
 
           if (p.discard) {
+            // Issue #30 finding H: terminate by the RECORDED run (engine-
+            // independent) and only mark it discarded once termination is
+            // confirmed. A Pi worker is not killed by the old opencode pkill.
+            let abortResult: Record<string, unknown> = { ok: false, error: "abort not attempted" };
             try {
-              await api.runtime.nodes.invoke({
-                nodeId: (nodes.find((n) => (n.displayName ?? n.nodeId) === run.node)?.nodeId) ?? run.node,
-                command: "opencode.run",
-                params: { prompt: "__ABORT__", cwd: run.cwd, transport: "http" },
-                timeoutMs: 20000,
-                signal,
-              });
-            } catch {
-              // best-effort abort
+              abortResult = payloadOf(
+                await api.runtime.nodes.invoke({
+                  nodeId: (nodes.find((n) => (n.displayName ?? n.nodeId) === run.node)?.nodeId) ?? run.node,
+                  command: "opencode.run",
+                  params: { prompt: "__ABORT__", cwd: run.cwd, transport: "http", runId: run.runId },
+                  timeoutMs: 20000,
+                  signal,
+                }),
+              );
+            } catch (e) {
+              abortResult = { ok: false, error: (e as Error).message };
             }
-            await upsertRun(rootDir, { ...run, state: "discarded", updatedAt: new Date().toISOString() });
+            findings[findings.length - 1].abort = abortResult;
+            if (abortResult.ok === true) {
+              await upsertRun(rootDir, { ...run, state: "discarded", updatedAt: new Date().toISOString() });
+            }
           }
         }
 
@@ -2019,18 +2088,19 @@ export default definePluginEntry({
         properties: {
           node: { type: "string", description: "Node display name or id." },
           sessionId: { type: "string", description: "Optional session id to abort." },
+          runId: { type: "string", description: "Optional runId (from fleet_dispatch). When given, terminates the recorded run engine-independently (works for Pi and opencode) and reports confirmed termination." },
         },
         required: ["node"],
       },
       execute: async (toolCallId, params, signal) => {
-        const p = params as { node: string; sessionId?: string };
+        const p = params as { node: string; sessionId?: string; runId?: string };
         const list = await api.runtime.nodes.list();
         const node = (list.nodes ?? []).find((n) => n.displayName === p.node || n.nodeId === p.node);
         if (!node) return jsonResult(`Node "${p.node}" not found.`);
         const inv = await api.runtime.nodes.invoke({
           nodeId: node.nodeId,
           command: "opencode.run",
-          params: { prompt: "__ABORT__", cwd: "/", transport: "http", sessionId: p.sessionId },
+          params: { prompt: "__ABORT__", cwd: "/", transport: "http", sessionId: p.sessionId, runId: p.runId },
           timeoutMs: 15000,
           signal,
         });
@@ -2181,6 +2251,14 @@ function nodeShellCommand(): { file: string; argsPrefix: string[] } {
   return { file: "/bin/bash", argsPrefix: ["-c"] };
 }
 
+/** Result of a node shell run, including the real exit code (issue #30 A). */
+export interface ShellRunResult {
+  output: string;
+  exitCode: number | null;
+  timedOut: boolean;
+  stuck: boolean;
+}
+
 async function runShell(
   command: string,
   timeoutMs: number,
@@ -2189,25 +2267,45 @@ async function runShell(
   maxIdleMs?: number,
   maxDurationMs?: number,
 ): Promise<string> {
+  return (await runShellDetailed(command, timeoutMs, signal, onChunk, maxIdleMs, maxDurationMs)).output;
+}
+
+/**
+ * Run a shell command on the node host, returning the output PLUS the real
+ * exit code and whether the watchdog killed it. Issue #30 finding A: the Pi
+ * parser needs the actual execution status, not just the transcript.
+ */
+async function runShellDetailed(
+  command: string,
+  timeoutMs: number,
+  signal?: AbortSignal,
+  onChunk?: (chunk: string) => Promise<void>,
+  maxIdleMs?: number,
+  maxDurationMs?: number,
+): Promise<ShellRunResult> {
   const { spawn } = await import("node:child_process");
   const shell = nodeShellCommand();
-  return new Promise<string>((resolve) => {
+  return new Promise<ShellRunResult>((resolve) => {
     const child = spawn(shell.file, [...shell.argsPrefix, command], { stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     let settled = false;
     let lastChunkAt = Date.now();
     const startedAt = Date.now();
+    let exitCode: number | null = null;
+    let timedOut = false;
+    let stuck = false;
 
     const finish = (extra: string) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       clearInterval(idleTimer);
-      resolve(stdout + (stderr ? `\n${stderr}` : "") + extra);
+      resolve({ output: stdout + (stderr ? `\n${stderr}` : "") + extra, exitCode, timedOut, stuck });
     };
 
     const timer = setTimeout(() => {
+      timedOut = true;
       child.kill("SIGKILL");
       finish("\n[timeout]");
     }, timeoutMs);
@@ -2216,10 +2314,12 @@ async function runShell(
     const idleTimer = setInterval(() => {
       if (settled) return;
       if (maxIdleMs && Date.now() - lastChunkAt > maxIdleMs) {
+        stuck = true;
         child.kill("SIGKILL");
         finish(`\n[stuck: no output for ${Math.round((Date.now() - lastChunkAt) / 1000)}s]`);
       }
       if (maxDurationMs && Date.now() - startedAt > maxDurationMs) {
+        stuck = true;
         child.kill("SIGKILL");
         finish(`\n[stuck: exceeded max duration ${Math.round(maxDurationMs / 1000)}s]`);
       }
@@ -2238,6 +2338,7 @@ async function runShell(
       finish(`\nERROR: ${err.message}`);
     });
     child.on("close", (code) => {
+      if (typeof code === "number") exitCode = code;
       finish("");
     });
 
@@ -2246,6 +2347,38 @@ async function runShell(
       else signal.addEventListener("abort", () => child.kill(), { once: true });
     }
   });
+}
+
+/**
+ * Engine-independent termination of a recorded run (issue #30 findings H).
+ * Reads the recorded pid and kills its process group (covers Pi AND opencode),
+ * waiting until the group is actually gone before reporting success.
+ */
+async function abortRunById(
+  runId: string,
+): Promise<{ ok: boolean; aborted: boolean; pid?: number; confirmed?: boolean; error?: string }> {
+  const statePath = runStatePath(runId);
+  let pid: number | undefined;
+  try {
+    const raw = await (await import("node:fs/promises")).readFile(statePath, "utf8");
+    pid = (JSON.parse(raw) as { pid?: number }).pid;
+  } catch {
+    // no state file
+  }
+  if (!pid) {
+    return { ok: false, aborted: false, error: "no recorded run state/pid — cannot terminate engine-independently" };
+  }
+  const out = await runShell(
+    `kill -TERM -- -${pid} 2>/dev/null; sleep 1; ` +
+      `if kill -0 -- -${pid} 2>/dev/null; then kill -9 -- -${pid} 2>/dev/null; sleep 1; fi; ` +
+      `if kill -0 -- -${pid} 2>/dev/null; then echo ALIVE; else echo DEAD; fi`,
+    15_000,
+  );
+  const confirmed = out.includes("DEAD");
+  await (await import("node:fs/promises"))
+    .writeFile(statePath, JSON.stringify({ runId, pid, state: "aborted", finishedAt: new Date().toISOString() }))
+    .catch(() => {});
+  return { ok: confirmed, aborted: confirmed, pid, confirmed };
 }
 
 /** Extract the parsed payload object from a node invoke result. */
