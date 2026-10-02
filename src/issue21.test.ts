@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { ACK_ABSENT_NOTE, ACK_INCONCLUSIVE_NOTE } from "./recovery.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const src = readFileSync(join(here, "index.ts"), "utf8");
@@ -27,7 +28,17 @@ describe("issue #21: fleet_dispatch launch-failure reporting", () => {
     expect(src).toContain("if (nodeRejected || (invokeTimedOut && !ackOk))");
     // The failure handle must be explicit about not being a valid run.
     expect(src).toContain("ok: false,");
-    expect(src).toContain("Launch was NOT confirmed.");
+    // Issue #29 (ack recovery): an unconfirmed launch where the node probe
+    // found NO run reports an explicit re-dispatch-safe message, rather than
+    // the older blanket "Do not rely on this handle". The ok:false contract
+    // (not a valid handle) is unchanged.
+    //
+    // Issue #30 (finding E): that wording now lives in recovery.ts and is
+    // paired with a DISTINCT inconclusive outcome (probe threw/timed out),
+    // which must NOT be reported as safe to re-dispatch.
+    expect(ACK_ABSENT_NOTE).toContain("Launch was NOT confirmed AND no run was found on the node. Safe to re-dispatch.");
+    expect(ACK_INCONCLUSIVE_NOTE).toContain("probe inconclusive — verify with fleet_run_status before re-dispatching");
+    expect(src).toContain("probeAckRecovery");
   });
 
   it("never asserts a failed handle is valid", () => {

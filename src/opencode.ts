@@ -15,6 +15,9 @@
 
 export type OpenCodeTransport = "http" | "acp";
 
+/** Worker engine harness: the opencode CLI (default) or the Pi coding agent. */
+export type FleetHarness = "opencode" | "pi";
+
 export interface OpenCodeTask {
   /** Task prompt / goal for OpenCode. */
   prompt: string;
@@ -22,10 +25,23 @@ export interface OpenCodeTask {
   cwd: string;
   /** Transport to use. */
   transport: OpenCodeTransport;
+  /** Worker engine harness (default "opencode"). "pi" runs the Pi coding agent. */
+  harness?: FleetHarness;
+  /**
+   * Pi model override (harness="pi"). Pi refs are `provider/id`
+   * (e.g. aperture/glm-5.3-flash:cloud), NOT opencode's `aperture-anthropic/...`.
+   */
+  piModel?: string;
   /** Optional model override (must exist on the node's provider). */
   model?: string;
   /** Optional agent (build/plan). */
   agent?: string;
+  /**
+   * Opt-in: append `--auto` to `opencode run` so non-denied permissions are
+   * auto-approved for an unattended detached run. Default FALSE — this is a
+   * trust-posture change and must be requested explicitly (issue #30 finding D).
+   */
+  autoApprove?: boolean;
   /** Max iterations for the completion loop (http transport). */
   maxIterations?: number;
   /** Completion marker string (http transport). */
@@ -71,6 +87,8 @@ export interface OpenCodeTask {
 export interface OpenCodeRunResult {
   ok: boolean;
   transport: OpenCodeTransport;
+  /** Worker engine that produced this result (issue #30 finding A). */
+  harness?: FleetHarness;
   sessionId?: string;
   summary?: string;
   diffSummary?: string;
@@ -84,6 +102,28 @@ export interface OpenCodeRunResult {
 }
 
 import { shq } from "./shell.js";
+
+/**
+ * Validate an engine/transport combination BEFORE any command is built or the
+ * node is invoked (issue #30 finding G). Pi is driven over the shell (http
+ * path) only; `opencode acp` has no Pi transport, so `harness="pi"` with
+ * `transport="acp"` would silently run the opencode ACP client and drop Pi
+ * (and piModel). Extracted as a pure function so it is unit-testable.
+ */
+export function validateHarnessTransport(task: {
+  harness?: string;
+  transport?: string;
+}): { ok: true } | { ok: false; harness?: string; error: string } {
+  if (task.transport === "acp" && task.harness === "pi") {
+    return {
+      ok: false,
+      harness: "pi",
+      error:
+        "harness=pi requires transport=http (opencode acp has no Pi transport; Pi would be silently ignored)",
+    };
+  }
+  return { ok: true };
+}
 
 /**
  * Build the shell command that runs OpenCode on the node for a given task.
@@ -103,6 +143,10 @@ export function buildOpenCodeCommand(task: OpenCodeTask): string {
   const timeout = task.timeoutMs ?? 300_000;
   const modelFlag = task.model ? ` --model ${shq(task.model)}` : "";
   const agentFlag = task.agent ? ` --agent ${shq(task.agent)}` : "";
+  // Issue #30 finding D: `--auto` auto-approves every non-denied permission.
+  // That is a real trust-posture change, so it is OPT-IN per dispatch/default
+  // FALSE; it is only appended when the caller explicitly asks for it.
+  const autoFlag = task.autoApprove === true ? " --auto" : "";
 
   // Issue #22 bug 2/3: a prompt that is empty, missing, or an unsubstituted
   // control placeholder must never reach `opencode run` — that launches an
@@ -131,7 +175,38 @@ export function buildOpenCodeCommand(task: OpenCodeTask): string {
   const cdGuard =
     `cd ${shq(cwd)} || { echo "FLEET_ERROR: cannot enter cwd ${cwd} as $(id -un) (uid $(id -u)): $?" >&2; exit 66; }`;
 
+  // Pi harness: same cd guard and env block, but drive the `pi` coding agent
+  // in one-shot prompt mode. Pi model refs are `provider/id`
+  // (e.g. aperture/glm-5.3-flash:cloud) — NOT opencode's `aperture-anthropic/...`
+  // — so a plain `model` value cannot be forwarded safely; fall back to a known
+  // default when `piModel` is absent.
+  if (task.harness === "pi") {
+    // Issue #30 finding B: Pi model refs are `provider/id`
+    // (e.g. aperture/glm-5.3-flash:cloud) — NOT opencode's
+    // `aperture-anthropic/...` — so the opencode `model` value must NEVER be
+    // forwarded. Fall back to a known Pi default when `piModel` is absent.
+    const piModel = task.piModel ?? "aperture/glm-5.3-flash:cloud";
+    // Issue #30 finding C (VALIDATED LIVE on dev2, pi 0.73.1 as svcuser):
+    // pi does NOT support `--` (`Error: Unknown option: --`), and a positional
+    // prompt beginning with `-`/`--` is parsed as a FLAG (`pi -p -- --version`
+    // prints 0.73.1; `--model x` injects a model flag). So the old
+    // `pi -p --model M -- <prompt>` form failed outright AND voided the guard.
+    //
+    // FIX: feed the prompt via STDIN — no `--`, no positional prompt. Live
+    // proof: a normal prompt arrives as message content; a hostile `--evil ...`
+    // prompt is delivered as MESSAGE CONTENT (no parser error) — injection-proof.
+    return [
+      cdGuard,
+      envExports,
+      `printf '%s' ${shq(task.prompt)} | timeout ${Math.floor(timeout / 1000)} pi -p --model ${shq(piModel)} 2>&1`,
+    ].filter(Boolean).join("\n");
+  }
+
   if (task.transport === "acp") {
+    // Issue #30 finding D(1): `opencode acp` has NO `--auto` flag (verified
+    // against `opencode acp --help`; the live dev2 node runs 1.18.26 — the
+    // `--auto` absence still holds there). It was inert here because acp
+    // routes to runAcpPrompt, but leaving it would break if that changed.
     return [
       cdGuard,
       envExports,
@@ -144,7 +219,14 @@ export function buildOpenCodeCommand(task: OpenCodeTask): string {
   return [
     cdGuard,
     envExports,
-    `timeout ${Math.floor(timeout / 1000)} opencode run${modelFlag}${agentFlag} --format json -- ${shq(task.prompt)} 2>&1`,
+    // `--auto` (opt-in via task.autoApprove) auto-approves any permission that
+    // is not explicitly denied. In a DETACHED, unattended run there is no human
+    // to answer a prompt, and the default "ask" permissions (notably
+    // external_directory) auto-REJECT — which kills the whole session with exit
+    // 0 and reads as a silent no-op. Explicit "deny" rules still apply. It is
+    // NOT sent by default because it widens the trust posture. (Fleet lesson:
+    // this class cost us #48/#52.)
+    `timeout ${Math.floor(timeout / 1000)} opencode run${autoFlag}${modelFlag}${agentFlag} --format json -- ${shq(task.prompt)} 2>&1`,
   ].filter(Boolean).join("\n");
 }
 
@@ -194,5 +276,60 @@ export function parseOpenCodeOutput(raw: string): OpenCodeRunResult {
     iterations: 1,
     diffSummary: undefined,
     error: ok ? undefined : raw.slice(0, 500),
+  };
+}
+
+/** Execution status threaded from the node shell run (issue #30 finding A). */
+export interface PiExecStatus {
+  /** Shell exit code of the wrapped `timeout N pi ...` process (null if killed). */
+  exitCode?: number | null;
+  /** True when the node-side watchdog killed the run on timeout. */
+  timedOut?: boolean;
+  /** True when the node-side watchdog killed the run for idling/exceeding max duration. */
+  stuck?: boolean;
+}
+
+/**
+ * Parse raw `pi -p` output into a structured result.
+ * Pi prints a plain (non-NDJSON) transcript, so the tail is kept as the summary.
+ * HAND_RAISE detection mirrors `parseOpenCodeOutput`.
+ *
+ * Issue #30 finding A: `ok` is derived from the ACTUAL execution status — a
+ * non-zero exit, exit 124 (`timeout`), a node watchdog kill, or a
+ * `FLEET_ERROR:` (cd guard) marker all yield `ok:false` with diagnostics.
+ */
+export function parsePiOutput(raw: string, exec?: PiExecStatus): OpenCodeRunResult {
+  const summary = raw.trim().slice(-4000);
+  const handRaiseMatch = summary.match(/HAND_RAISE\s*[:\-]?\s*([\s\S]{1,500})/i);
+  const handRaised = Boolean(handRaiseMatch);
+  const question = handRaiseMatch ? handRaiseMatch[1].trim() : undefined;
+
+  const cdError = /FLEET_ERROR:/.test(raw);
+  const timedOut = exec?.timedOut === true || /(^|\n)\[timeout\]/.test(raw) || exec?.exitCode === 124;
+  const stuck = exec?.stuck === true || /(^|\n)\[stuck:/.test(raw);
+  const nonzeroExit = typeof exec?.exitCode === "number" && exec.exitCode !== 0;
+  const failed = cdError || timedOut || stuck || nonzeroExit;
+
+  let error: string | undefined;
+  if (failed) {
+    if (cdError) {
+      error = raw.match(/FLEET_ERROR:[^\n]*/)?.[0] ?? "worker could not enter cwd";
+    } else if (timedOut) {
+      error = `pi run timed out${exec?.exitCode != null ? ` (exit ${exec.exitCode})` : ""}`;
+    } else if (stuck) {
+      error = `pi run killed by watchdog: ${raw.match(/\[stuck:[^\]]*\]/)?.[0] ?? "stuck"}`;
+    } else {
+      error = `pi run exited non-zero (exit ${exec?.exitCode})`;
+    }
+  }
+
+  return {
+    ok: !failed,
+    harness: "pi",
+    transport: "http",
+    summary: handRaised ? summary.replace(/HAND_RAISE\s*[:\-]?\s*/i, "").trim() : summary,
+    handRaised,
+    question,
+    ...(error ? { error } : {}),
   };
 }

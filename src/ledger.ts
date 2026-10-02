@@ -13,6 +13,7 @@
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { shq } from "./shell.js";
+import { interpretLiveness } from "./recovery.js";
 import { SSH_ARGS } from "./ssh.js";
 
 export type RunState = "running" | "completed" | "failed" | "timed-out" | "discarded";
@@ -24,6 +25,12 @@ export interface LedgerEntry {
   prompt: string;
   model?: string;
   transport?: "http" | "acp";
+  /** Worker engine harness (issue #30): opencode (default) or pi. */
+  harness?: string;
+  /** Pi model ref (harness=pi). */
+  piModel?: string;
+  /** Recorded worker pid, when the node ack carried one — enables engine-independent liveness/cancel (issue #30). */
+  pid?: number;
   startedAt: string;
   updatedAt: string;
   state: RunState;
@@ -73,28 +80,41 @@ export function newRunId(): string {
 }
 
 /**
- * Probe a node for the live state of a recorded run: is an opencode process
+ * Probe a node for the live state of a recorded run: is the worker process
  * active, and does the checkout have uncommitted changes?
+ *
+ * Issue #30 finding I: the old probe only matched `opencode` processes, so a
+ * live Pi worker was classified dead. Now it is engine-independent: it checks
+ * the recorded pid directly (opts.pid) and, as a fallback, greps for BOTH
+ * opencode and pi processes.
  */
 export async function probeRun(
   nodeHost: string,
   cwd: string,
+  opts: { harness?: string; pid?: number } = {},
 ): Promise<{ procRunning: boolean; procs?: string[]; uncommitted?: number; error?: string }> {
   const { execFile } = await import("node:child_process");
   const { promisify } = await import("node:util");
   const execFileP = promisify(execFile);
   try {
+    const pidCheck = opts.pid
+      ? `kill -0 ${opts.pid} 2>/dev/null && echo "PIDALIVE ${opts.pid}" || true`
+      : "true";
     const cmd = [
-      `ps -eo pid,etime,command | grep -iE "[o]pencode" | grep -vE "grep|opencode-fleet|node-activity" | head -5 || true`,
+      pidCheck,
+      `ps -eo pid,etime,command | grep -iE "[o]pencode|[p]i -p " | grep -vE "grep|opencode-fleet|node-activity" | head -5 || true`,
       `echo "---UNCOMMITTED---"`,
       `cd ${shq(cwd)} 2>/dev/null && git status --porcelain 2>/dev/null | wc -l || echo "-1"`,
     ].join(";");
     const { stdout } = await execFileP("ssh", [...SSH_ARGS, nodeHost, cmd], { timeout: 30_000 });
-    const [procPart, uncommittedPart] = stdout.split("---UNCOMMITTED---\n");
-    const procs = procLines(procPart);
+    const [procPartRaw, uncommittedPart] = stdout.split("---UNCOMMITTED---\n");
+    const procPart = procPartRaw ?? "";
+    // Issue #30 finding I: engine-independent liveness (recorded pid OR any
+    // matching opencode/pi process line), extracted as a pure helper.
+    const { alive, procs } = interpretLiveness(procPart, opts.pid);
     const uncommitted = parseInt((uncommittedPart ?? "").trim(), 10);
     return {
-      procRunning: procs.length > 0,
+      procRunning: alive,
       procs,
       uncommitted: Number.isFinite(uncommitted) ? uncommitted : -1,
     };
