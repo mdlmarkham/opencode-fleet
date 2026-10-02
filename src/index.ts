@@ -909,14 +909,10 @@ export default definePluginEntry({
             // Reconcile the ledger: a dead run with no completion record is
             // marked failed, not left as timed-out/running (issue #11).
             if (dead) {
+              // Keep the original entry (startedAt, engine, pid): this is a state
+              // change of the same run, not a new one.
               await upsertRun(rootDir, {
-                runId,
-                node: node.displayName ?? node.nodeId,
-                cwd: p.cwd,
-                prompt: p.prompt,
-                model: p.model,
-                transport,
-                startedAt: new Date().toISOString(),
+                ...ledgerEntry,
                 updatedAt: new Date().toISOString(),
                 state: "failed",
                 summary: "run died without completion record (silent death)",

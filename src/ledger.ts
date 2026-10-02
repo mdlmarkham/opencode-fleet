@@ -35,6 +35,8 @@ export interface LedgerEntry {
   startedAt: string;
   updatedAt: string;
   state: RunState;
+  /** Process exit status of the worker, when known (issue #37). */
+  exitCode?: number;
   summary?: string;
   sessionId?: string;
   handRaised?: boolean;
@@ -70,14 +72,44 @@ export async function saveLedger(rootDir: string, runs: LedgerEntry[]): Promise<
   await rename(tmp, p);
 }
 
-export async function upsertRun(rootDir: string, entry: LedgerEntry): Promise<void> {
-  const runs = await loadLedger(rootDir);
-  const i = runs.findIndex((r) => r.runId === entry.runId);
-  if (i >= 0) runs[i] = entry;
-  else runs.push(entry);
-  // Cap the ledger at 200 most recent runs.
-  const capped = runs.sort((a, b) => (a.startedAt < b.startedAt ? 1 : -1)).slice(0, 200);
-  await saveLedger(rootDir, capped);
+/** Terminal states: only these are subject to the retention cap. */
+const TERMINAL: ReadonlySet<RunState> = new Set(["completed", "failed", "timed-out", "discarded"]);
+
+/** How many terminal runs to keep. In-flight (`running`) entries are never evicted. */
+export const LEDGER_TERMINAL_CAP = 200;
+
+/** Apply the retention policy: keep every non-terminal run plus the most recent terminal ones. */
+export function capLedger(runs: LedgerEntry[], cap = LEDGER_TERMINAL_CAP): LedgerEntry[] {
+  const newestFirst = [...runs].sort((a, b) => (a.startedAt < b.startedAt ? 1 : -1));
+  let terminalSeen = 0;
+  return newestFirst.filter((r) => {
+    if (!TERMINAL.has(r.state)) return true;
+    return ++terminalSeen <= cap;
+  });
+}
+
+// Writers to the same ledger file are serialized in-process: fan-out dispatch
+// upserts concurrently, and an unserialized read-modify-write loses updates
+// (and raced on a shared temp file name).
+const locks = new Map<string, Promise<unknown>>();
+
+function withLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
+  const prev = locks.get(path) ?? Promise.resolve();
+  const next = prev.catch(() => undefined).then(fn);
+  locks.set(path, next);
+  const clear = () => { if (locks.get(path) === next) locks.delete(path); };
+  next.then(clear, clear);
+  return next;
+}
+
+export function upsertRun(rootDir: string, entry: LedgerEntry): Promise<void> {
+  return withLock(ledgerPath(rootDir), async () => {
+    const runs = await loadLedger(rootDir);
+    const i = runs.findIndex((r) => r.runId === entry.runId);
+    if (i >= 0) runs[i] = entry;
+    else runs.push(entry);
+    await saveLedger(rootDir, capLedger(runs));
+  });
 }
 
 export function newRunId(): string {
