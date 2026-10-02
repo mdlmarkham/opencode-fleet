@@ -102,6 +102,7 @@ export interface OpenCodeRunResult {
 }
 
 import { shq } from "./shell.js";
+import { redactSecrets, sanitizeQuestion } from "./untrusted.js";
 
 /**
  * Validate an engine/transport combination BEFORE any command is built or the
@@ -236,35 +237,70 @@ const CONTROL_PLACEHOLDER_RE = /^__RUN_(START|STATUS|RESULT|ABORT)__$/;
 /**
  * Parse the raw node command output into a structured result.
  * Handles NDJSON streaming output from `opencode run --format json`.
+ *
+ * Issue #35: when the execution status is known (`exec`), `ok` is derived from
+ * it — a non-zero exit, exit 124 (`timeout`), a watchdog kill, a `FLEET_ERROR:`
+ * line, an `error` event in the stream, or a stream with no events at all (an
+ * empty session exits 0) all yield `ok:false`. Without `exec` (legacy callers)
+ * it falls back to the old output heuristic.
  */
-export function parseOpenCodeOutput(raw: string): OpenCodeRunResult {
+export function parseOpenCodeOutput(raw: string, exec?: ExecStatus): OpenCodeRunResult {
   // Collect text from NDJSON `text` events.
   const texts: string[] = [];
+  const errorEvents: string[] = [];
   let sessionId: string | undefined;
-  let cost: number | undefined;
+  let sawEvents = false;
   for (const line of raw.split("\n")) {
     if (!line.trim()) continue;
     try {
       const evt = JSON.parse(line);
+      if (evt && typeof evt.type === "string") sawEvents = true;
       if (evt.type === "text" && typeof evt.part?.text === "string") {
         texts.push(evt.part.text);
       }
       if (evt.type === "step_start" && evt.sessionID) sessionId = evt.sessionID;
-      if (evt.type === "step_finish" && evt.part?.tokens) {
-        cost = evt.part.tokens.total;
+      if (evt.type === "error") {
+        const msg = evt.error?.data?.message ?? evt.error?.message ?? evt.message ?? evt.error?.name;
+        errorEvents.push(typeof msg === "string" ? msg : "opencode reported an error event");
       }
     } catch {
       // Not JSON — ignore (could be a plain error line).
     }
   }
 
-  const summary = texts.join("\n").trim();
-  const ok = !/error|failed|timed out/i.test(raw) || summary.length > 0;
+  const summary = redactSecrets(texts.join("\n").trim());
+
+  let ok: boolean;
+  let error: string | undefined;
+  if (exec) {
+    const cdError = /(^|\n)FLEET_ERROR:/.test(raw);
+    const timedOut = exec.timedOut === true || exec.exitCode === 124 || /(^|\n)\[timeout\]/.test(raw);
+    const stuck = exec.stuck === true || /(^|\n)\[stuck:/.test(raw);
+    const nonzeroExit = typeof exec.exitCode === "number" && exec.exitCode !== 0;
+    const emptySession = !sawEvents && summary.length === 0;
+    ok = !(cdError || timedOut || stuck || nonzeroExit || errorEvents.length > 0 || emptySession);
+    if (!ok) {
+      error = cdError
+        ? (raw.match(/(?:^|\n)(FLEET_ERROR:[^\n]*)/)?.[1] ?? "worker could not enter cwd")
+        : timedOut
+          ? `opencode run timed out${exec.exitCode != null ? ` (exit ${exec.exitCode})` : ""}`
+          : stuck
+            ? `opencode run killed by watchdog: ${raw.match(/\[stuck:[^\]]*\]/)?.[0] ?? "stuck"}`
+            : nonzeroExit
+              ? `opencode run exited non-zero (exit ${exec.exitCode})`
+              : errorEvents.length > 0
+                ? `opencode error: ${errorEvents[0]}`
+                : "opencode produced no events (empty session)";
+    }
+  } else {
+    ok = !/error|failed|timed out/i.test(raw) || summary.length > 0;
+    if (!ok) error = raw.slice(0, 500);
+  }
 
   // Detect a hand-raise: the worker stopped to ask a clarifying question.
   const handRaiseMatch = summary.match(/HAND_RAISE\s*[:\-]?\s*([\s\S]{1,500})/i);
   const handRaised = Boolean(handRaiseMatch);
-  const question = handRaiseMatch ? handRaiseMatch[1].trim() : undefined;
+  const question = handRaiseMatch ? sanitizeQuestion(handRaiseMatch[1]) : undefined;
 
   return {
     ok,
@@ -275,12 +311,12 @@ export function parseOpenCodeOutput(raw: string): OpenCodeRunResult {
     question,
     iterations: 1,
     diffSummary: undefined,
-    error: ok ? undefined : raw.slice(0, 500),
+    error: error ? redactSecrets(error) : undefined,
   };
 }
 
-/** Execution status threaded from the node shell run (issue #30 finding A). */
-export interface PiExecStatus {
+/** Execution status threaded from the node shell run (issues #30, #35). */
+export interface ExecStatus {
   /** Shell exit code of the wrapped `timeout N pi ...` process (null if killed). */
   exitCode?: number | null;
   /** True when the node-side watchdog killed the run on timeout. */
@@ -288,6 +324,9 @@ export interface PiExecStatus {
   /** True when the node-side watchdog killed the run for idling/exceeding max duration. */
   stuck?: boolean;
 }
+
+/** @deprecated use ExecStatus */
+export type PiExecStatus = ExecStatus;
 
 /**
  * Parse raw `pi -p` output into a structured result.
@@ -298,11 +337,11 @@ export interface PiExecStatus {
  * non-zero exit, exit 124 (`timeout`), a node watchdog kill, or a
  * `FLEET_ERROR:` (cd guard) marker all yield `ok:false` with diagnostics.
  */
-export function parsePiOutput(raw: string, exec?: PiExecStatus): OpenCodeRunResult {
-  const summary = raw.trim().slice(-4000);
+export function parsePiOutput(raw: string, exec?: ExecStatus): OpenCodeRunResult {
+  const summary = redactSecrets(raw.trim().slice(-4000));
   const handRaiseMatch = summary.match(/HAND_RAISE\s*[:\-]?\s*([\s\S]{1,500})/i);
   const handRaised = Boolean(handRaiseMatch);
-  const question = handRaiseMatch ? handRaiseMatch[1].trim() : undefined;
+  const question = handRaiseMatch ? sanitizeQuestion(handRaiseMatch[1]) : undefined;
 
   const cdError = /FLEET_ERROR:/.test(raw);
   const timedOut = exec?.timedOut === true || /(^|\n)\[timeout\]/.test(raw) || exec?.exitCode === 124;

@@ -10,7 +10,8 @@
  * on each worker so worker-side state is visible even if the manager died.
  */
 
-import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { readFile, writeFile, rename, mkdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { shq } from "./shell.js";
 import { interpretLiveness } from "./recovery.js";
@@ -62,7 +63,11 @@ export async function loadLedger(rootDir: string): Promise<LedgerEntry[]> {
 export async function saveLedger(rootDir: string, runs: LedgerEntry[]): Promise<void> {
   const p = ledgerPath(rootDir);
   await mkdir(dirname(p), { recursive: true });
-  await writeFile(p, JSON.stringify({ runs }, null, 2), "utf8");
+  // The ledger holds full prompts: keep it private, and write atomically so a
+  // crash mid-write cannot leave a truncated file.
+  const tmp = `${p}.${process.pid}.tmp`;
+  await writeFile(tmp, JSON.stringify({ runs }, null, 2), { encoding: "utf8", mode: 0o600 });
+  await rename(tmp, p);
 }
 
 export async function upsertRun(rootDir: string, entry: LedgerEntry): Promise<void> {
@@ -76,7 +81,8 @@ export async function upsertRun(rootDir: string, entry: LedgerEntry): Promise<vo
 }
 
 export function newRunId(): string {
-  return `run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  // Unguessable (issue #32): the id becomes part of node-side file paths.
+  return `run-${randomUUID()}`;
 }
 
 /**
