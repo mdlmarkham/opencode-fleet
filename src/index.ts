@@ -1,7 +1,6 @@
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { buildJsonPluginConfigSchema, jsonResult } from "openclaw/plugin-sdk/core";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { shq } from "./shell.js";
 import { buildOpenCodeCommand, parseOpenCodeOutput, parsePiOutput, type OpenCodeTask } from "./opencode.js";
 import {
@@ -12,6 +11,9 @@ import {
   type AckRecoveryOutcome,
 } from "./recovery.js";
 import { SSH_ARGS } from "./ssh.js";
+import { guardCwd, taskUsesCwd, validateTaskIds } from "./guard.js";
+import { quoteUntrusted, sanitizeQuestion } from "./untrusted.js";
+import { runPaths, xferPaths, ensureStateDir, writePrivate } from "./paths.js";
 
 /** OpenCode task plus the dispatch watchdog knobs (idle/duration guards). */
 type FleetOpenCodeTask = OpenCodeTask & {
@@ -99,6 +101,16 @@ export default definePluginEntry({
           return JSON.stringify({ ok: false, error: "opencode.run requires prompt and cwd." });
         }
 
+        // Issue #31: the node must not trust what the gateway relays. Validate
+        // identifiers used in file paths, and confine cwd to the workspace
+        // roots before any destructive/clone operation can run.
+        const idErr = validateTaskIds(task);
+        if (idErr) return JSON.stringify({ ok: false, error: idErr });
+        if (taskUsesCwd(task.prompt)) {
+          const cwdCheck = await guardCwd(task.cwd);
+          if (!cwdCheck.ok) return JSON.stringify({ ok: false, error: `refused: ${cwdCheck.error}` });
+        }
+
         // Special control messages (abort / diff / models) handled by the gateway tool.
         if (task.prompt === "__ABORT__") {
           // Issue #30 finding H: cancellation was engine-blind — `pkill -f
@@ -153,7 +165,7 @@ export default definePluginEntry({
           // temp file across multiple invokes. Used when SSH is unavailable
           // (e.g. Windows nodes). task.chunks: { index, data }[]
           const transferId = String(task.transferId ?? "t");
-          const accDir = join(tmpdir(), `fleet-xfer-${transferId}`);
+          const accDir = xferPaths(transferId).dir;
           await (await import("node:fs/promises")).mkdir(accDir, { recursive: true });
           const target = join(accDir, "bundle.b64");
           const expected = parseInt(String(task.chunkIndex ?? ""), 10);
@@ -169,7 +181,7 @@ export default definePluginEntry({
         if (task.prompt === "__UNPACK__") {
           // Decode accumulated base64 and clone into cwd (SSH-free path).
           const transferId = String(task.transferId ?? "t");
-          const accDir = join(tmpdir(), `fleet-xfer-${transferId}`);
+          const accDir = xferPaths(transferId).dir;
           const accFile = join(accDir, "bundle.b64");
           try {
             const b64 = await (await import("node:fs/promises")).readFile(accFile, "utf8");
@@ -194,14 +206,14 @@ export default definePluginEntry({
         if (task.prompt === "__RECEIVE_CLEAN__") {
           const transferId = String(task.transferId ?? "t");
           await (await import("node:fs/promises")).rm(remoteBundlePath(transferId), { force: true }).catch(() => {});
-          await (await import("node:fs/promises")).rm(join(tmpdir(), `fleet-xfer-${transferId}`), { recursive: true, force: true }).catch(() => {});
+          await (await import("node:fs/promises")).rm(xferPaths(transferId).dir, { recursive: true, force: true }).catch(() => {});
           return JSON.stringify({ ok: true });
         }
         if (task.prompt === "__BUNDLE__") {
           // SSH-free sync, worker side: bundle current state (auto-committing
           // uncommitted changes first, same as the SSH path) and stage as base64.
           const transferId = String(task.transferId ?? "t");
-          const accDir = join(tmpdir(), `fleet-xfer-${transferId}`);
+          const accDir = xferPaths(transferId).dir;
           await (await import("node:fs/promises")).mkdir(accDir, { recursive: true });
           const bundlePath = join(accDir, "sync.bundle");
           // Fail-closed worker bundle (issue #18): the old form masked every
@@ -250,7 +262,7 @@ export default definePluginEntry({
             });
           }
           const statePath = runStatePath(runId);
-          const logPath = join(tmpdir(), `fleet-run-${runId}.log`);
+          const logPath = runPaths(runId).log;
           const scriptPath = runScriptPath(runId);
           // The script re-echoes the launch command with its own timeout, then
           // writes the final output into the state file on exit.
@@ -261,7 +273,7 @@ export default definePluginEntry({
           });
           // Completion is written to a SEPARATE file so the manager's JSON
           // state write (below) and the worker's completion write never race.
-          const donePath = join(tmpdir(), `fleet-done-${runId}.json`);
+          const donePath = runPaths(runId).done;
           const script = [
             "#!/bin/bash",
             // Issue #22 bug 4: no exit-code laundering. `set -o pipefail` is not
@@ -273,7 +285,7 @@ export default definePluginEntry({
             `printf '{"done":1,"exitCode":%s,"finishedAt":"%s"}\\n' "$EC" "$(date -u +%FT%TZ)" > ${shq(donePath)}`,
             `exit $EC`,
           ].join("\n");
-          await (await import("node:fs/promises")).writeFile(scriptPath, script, { mode: 0o755 });
+          await writePrivate(scriptPath, script, 0o700);
           // Issue #21: a slow node host was the likely trigger for the launch
           // ack timing out. Give the local spawn a more generous window than the
           // old 15s — setsid/nohup return immediately, so this only matters when
@@ -289,7 +301,7 @@ export default definePluginEntry({
               error: `launch failed (no LAUNCHED_PID): ${launchOut.trim().slice(0, 200) || "empty launcher output"}`,
             });
           }
-          await (await import("node:fs/promises")).writeFile(
+          await writePrivate(
             statePath,
             // Issue #30 finding F: persist the harness so __RUN_RESULT__ can
             // select the correct parser later (Pi is NOT opencode NDJSON).
@@ -312,7 +324,7 @@ export default definePluginEntry({
             const st = JSON.parse(raw) as { pid?: number; state?: string; startedAt?: string; finishedAt?: string; exitCode?: number };
             // Merge worker completion record when present (issue #6).
             try {
-              const doneRaw = await (await import("node:fs/promises")).readFile(join(tmpdir(), `fleet-done-${runId}.json`), "utf8");
+              const doneRaw = await (await import("node:fs/promises")).readFile(runPaths(runId).done, "utf8");
               const done = JSON.parse(doneRaw) as { exitCode?: number; finishedAt?: string };
               st.state = "finished";
               st.exitCode = done.exitCode;
@@ -335,7 +347,7 @@ export default definePluginEntry({
               .then(() => true)
               .catch(() => false);
             const logExists = await (await import("node:fs/promises"))
-              .stat(join(tmpdir(), `fleet-run-${runId}.log`))
+              .stat(runPaths(runId).log)
               .then(() => true)
               .catch(() => false);
             return JSON.stringify({
@@ -354,7 +366,7 @@ export default definePluginEntry({
           // from the done marker so failure is not read as success. The
           // default (opencode) path is unchanged.
           const runId = String(task.runId ?? "");
-          const logPath = join(tmpdir(), `fleet-run-${runId}.log`);
+          const logPath = runPaths(runId).log;
           const tail = await runShell(`tail -c 64000 ${shq(logPath)} 2>/dev/null || true`, 15_000, context?.signal);
           let harness = "opencode";
           let exitCode: number | undefined;
@@ -364,12 +376,12 @@ export default definePluginEntry({
             if (st.harness) harness = st.harness;
           } catch { /* no state file */ }
           try {
-            const doneRaw = await (await import("node:fs/promises")).readFile(join(tmpdir(), `fleet-done-${runId}.json`), "utf8");
+            const doneRaw = await (await import("node:fs/promises")).readFile(runPaths(runId).done, "utf8");
             const done = JSON.parse(doneRaw) as { exitCode?: number };
             if (typeof done.exitCode === "number") exitCode = done.exitCode;
           } catch { /* still running or no marker */ }
           const parsed =
-            harness === "pi" ? parsePiOutput(tail, { exitCode }) : parseOpenCodeOutput(tail);
+            harness === "pi" ? parsePiOutput(tail, { exitCode }) : parseOpenCodeOutput(tail, exitCode !== undefined ? { exitCode } : undefined);
           return JSON.stringify({ ok: true, runId, harness, result: parsed });
         }
         if (task.prompt === "__RUN_ABORT__") {
@@ -391,7 +403,7 @@ export default definePluginEntry({
             // Issue #30 finding H: mark aborted ONLY on confirmed termination;
             // preserve existing state fields so later reads still parse.
             const next = abortStateWrite(st, confirmed, new Date().toISOString());
-            if (next) await (await import("node:fs/promises")).writeFile(runStatePath(runId), JSON.stringify(next));
+            if (next) await writePrivate(runStatePath(runId), JSON.stringify(next));
             return JSON.stringify({ ok: confirmed, aborted: confirmed, pid: st.pid, confirmed });
           } catch {
             return JSON.stringify({ ok: false, error: "no run state" });
@@ -400,7 +412,7 @@ export default definePluginEntry({
         if (task.prompt === "__SEND_CHUNK__") {
           // Manager pulls staged base64 back in ~64KB pieces.
           const transferId = String(task.transferId ?? "t");
-          const accFile = join(tmpdir(), `fleet-xfer-${transferId}`, "bundle.b64");
+          const accFile = join(xferPaths(transferId).dir, "bundle.b64");
           try {
             const b64 = await (await import("node:fs/promises")).readFile(accFile, "utf8");
             const per = 64 * 1024;
@@ -486,7 +498,7 @@ export default definePluginEntry({
         return JSON.stringify(
           task.harness === "pi"
             ? parsePiOutput(run.output, { exitCode: run.exitCode, timedOut: run.timedOut, stuck: run.stuck })
-            : parseOpenCodeOutput(run.output),
+            : parseOpenCodeOutput(run.output, { exitCode: run.exitCode, timedOut: run.timedOut, stuck: run.stuck }),
         );
       },
     },
@@ -1204,8 +1216,10 @@ export default definePluginEntry({
         const prompt = [
           p.priorContext,
           "",
+          // Issue #35: the question came from a worker (model output), so it is
+          // quoted as data and bounded; only `answer` is the caller's own voice.
           "A clarifying question was raised and answered:",
-          `Q: ${p.question}`,
+          `Q: ${sanitizeQuestion(p.question)}`,
           `A: ${p.answer}`,
           "Continue the task with this answer. Do not re-ask the same question.",
         ].join("\n");
@@ -1316,7 +1330,11 @@ export default definePluginEntry({
           }
 
           // Success check.
-          const looksFailed = parsed.ok === false || /error|failed|timed out|stuck/i.test(parsed.summary ?? "");
+          // Issue #35: trust the exit-status-derived `ok`; only fall back to the
+          // output regex for a node that predates it (ok undefined).
+          const looksFailed = parsed.ok === undefined
+            ? /error|failed|timed out|stuck/i.test(parsed.summary ?? "")
+            : parsed.ok === false;
           const success = p.successMarker ? (parsed.summary ?? "").includes(p.successMarker) : !looksFailed;
           if (success) {
             return jsonResult({ iterations, done: true, success: true, finalSummary: parsed.summary });
@@ -1340,8 +1358,8 @@ export default definePluginEntry({
             p.prompt,
             "",
             `Iteration ${i} did not succeed. The worker reported:`,
-            parsed.summary ? `Output: ${parsed.summary.slice(0, 2000)}` : "",
-            parsed.error ? `Error: ${parsed.error.slice(0, 2000)}` : "",
+            parsed.summary ? quoteUntrusted("output", parsed.summary) : "",
+            parsed.error ? quoteUntrusted("error", parsed.error) : "",
             "",
             "Fix the issues above and try again. Do not repeat the same approach.",
           ].join("\n");
@@ -2153,7 +2171,7 @@ export default definePluginEntry({
 /** ps command listing running OpenCode processes on a node. */
 function remoteBundlePath(transferId: string): string {
   // Windows-safe temp path (no /tmp assumption).
-  return join(tmpdir(), `fleet-${transferId}.bundle`);
+  return xferPaths(transferId).bundle;
 }
 
 const OPCODE_PS_COMMAND =
@@ -2396,7 +2414,7 @@ async function abortRunById(
   } catch { /* keep {} */ }
   const next = abortStateWrite(existing, confirmed, new Date().toISOString());
   if (next) {
-    await (await import("node:fs/promises")).writeFile(statePath, JSON.stringify(next)).catch(() => {});
+    await writePrivate(statePath, JSON.stringify(next)).catch(() => {});
   }
   return { ok: confirmed, aborted: confirmed, pid, confirmed };
 }
@@ -2424,11 +2442,11 @@ function payloadOf(inv: unknown): Record<string, unknown> {
  */
 
 function runStatePath(runId: string): string {
-  return join(tmpdir(), `fleet-run-${runId.replace(/[^a-zA-Z0-9_-]/g, "")}.json`);
+  return runPaths(runId).state;
 }
 
 function runScriptPath(runId: string): string {
-  return join(tmpdir(), `fleet-run-${runId.replace(/[^a-z0-9_-]/gi, "")}.sh`);
+  return runPaths(runId).script;
 }
 
 /** Build the detached launcher command for a run (unix; git-bash handles it on Windows). */
@@ -2446,6 +2464,6 @@ function detachedLaunchCommand(runId: string, scriptPath: string, statePath: str
     // `&&`-joined element — `... 2>&1 & && echo` is a bash syntax error. So we
     // join the setup steps with `&&`, background that entire chain, then emit
     // the LAUNCHED_PID line as a separate statement.
-    `setsid nohup /bin/bash ${shq(scriptPath)} > ${shq(join(tmpdir(), `fleet-run-${runId}.log`))} 2>&1`,
+    `setsid nohup /bin/bash ${shq(scriptPath)} > ${shq(runPaths(runId).log)} 2>&1`,
   ].join(" && ") + ` &\necho "LAUNCHED_PID=$!"`;
 }
