@@ -27,7 +27,11 @@ describe("issue #21: fleet_dispatch launch-failure reporting", () => {
     expect(src).toContain("if (nodeRejected || (invokeTimedOut && !ackOk))");
     // The failure handle must be explicit about not being a valid run.
     expect(src).toContain("ok: false,");
-    expect(src).toContain("Launch was NOT confirmed.");
+    // Issue #29 (ack recovery): an unconfirmed launch where the node probe
+    // found NO run now reports an explicit re-dispatch-safe message, rather
+    // than the older blanket "Do not rely on this handle". The ok:false
+    // contract (not a valid handle) is unchanged.
+    expect(src).toContain("Launch was NOT confirmed AND no run was found on the node. Safe to re-dispatch.");
   });
 
   it("never asserts a failed handle is valid", () => {

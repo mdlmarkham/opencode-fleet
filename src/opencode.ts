@@ -15,6 +15,9 @@
 
 export type OpenCodeTransport = "http" | "acp";
 
+/** Worker engine harness: the opencode CLI (default) or the Pi coding agent. */
+export type FleetHarness = "opencode" | "pi";
+
 export interface OpenCodeTask {
   /** Task prompt / goal for OpenCode. */
   prompt: string;
@@ -22,6 +25,13 @@ export interface OpenCodeTask {
   cwd: string;
   /** Transport to use. */
   transport: OpenCodeTransport;
+  /** Worker engine harness (default "opencode"). "pi" runs the Pi coding agent. */
+  harness?: FleetHarness;
+  /**
+   * Pi model override (harness="pi"). Pi refs are `provider/id`
+   * (e.g. aperture/glm-5.3-flash:cloud), NOT opencode's `aperture-anthropic/...`.
+   */
+  piModel?: string;
   /** Optional model override (must exist on the node's provider). */
   model?: string;
   /** Optional agent (build/plan). */
@@ -131,11 +141,25 @@ export function buildOpenCodeCommand(task: OpenCodeTask): string {
   const cdGuard =
     `cd ${shq(cwd)} || { echo "FLEET_ERROR: cannot enter cwd ${cwd} as $(id -un) (uid $(id -u)): $?" >&2; exit 66; }`;
 
+  // Pi harness: same cd guard and env block, but drive the `pi` coding agent
+  // in one-shot prompt mode. Pi model refs are `provider/id`
+  // (e.g. aperture/glm-5.3-flash:cloud) — NOT opencode's `aperture-anthropic/...`
+  // — so a plain `model` value cannot be forwarded safely; fall back to a known
+  // default when `piModel` is absent.
+  if (task.harness === "pi") {
+    const piModel = task.piModel ?? task.model ?? "aperture/glm-5.3-flash:cloud";
+    return [
+      cdGuard,
+      envExports,
+      `timeout ${Math.floor(timeout / 1000)} pi -p ${shq(task.prompt)} --model ${shq(piModel)} 2>&1`,
+    ].filter(Boolean).join("\n");
+  }
+
   if (task.transport === "acp") {
     return [
       cdGuard,
       envExports,
-      `timeout ${Math.floor(timeout / 1000)} opencode acp${modelFlag}${agentFlag} --print-logs 2>&1 <<'OPENCODE_EOF'`,
+      `timeout ${Math.floor(timeout / 1000)} opencode acp --auto${modelFlag}${agentFlag} --print-logs 2>&1 <<'OPENCODE_EOF'`,
       task.prompt,
       "OPENCODE_EOF",
     ].filter(Boolean).join("\n");
@@ -144,7 +168,12 @@ export function buildOpenCodeCommand(task: OpenCodeTask): string {
   return [
     cdGuard,
     envExports,
-    `timeout ${Math.floor(timeout / 1000)} opencode run${modelFlag}${agentFlag} --format json -- ${shq(task.prompt)} 2>&1`,
+    // `--auto` auto-approves any permission that is not explicitly denied. In a
+    // DETACHED, unattended run there is no human to answer a prompt, and the
+    // default "ask" permissions (notably external_directory) auto-REJECT — which
+    // kills the whole session with exit 0 and reads as a silent no-op. Explicit
+    // "deny" rules still apply. (Fleet lesson: this class cost us #48/#52.)
+    `timeout ${Math.floor(timeout / 1000)} opencode run --auto${modelFlag}${agentFlag} --format json -- ${shq(task.prompt)} 2>&1`,
   ].filter(Boolean).join("\n");
 }
 
@@ -194,5 +223,25 @@ export function parseOpenCodeOutput(raw: string): OpenCodeRunResult {
     iterations: 1,
     diffSummary: undefined,
     error: ok ? undefined : raw.slice(0, 500),
+  };
+}
+
+/**
+ * Parse raw `pi -p` output into a structured result.
+ * Pi prints a plain (non-NDJSON) transcript, so the tail is kept as the summary.
+ * HAND_RAISE detection mirrors `parseOpenCodeOutput`.
+ */
+export function parsePiOutput(raw: string): OpenCodeRunResult {
+  const summary = raw.trim().slice(-4000);
+  const handRaiseMatch = summary.match(/HAND_RAISE\s*[:\-]?\s*([\s\S]{1,500})/i);
+  const handRaised = Boolean(handRaiseMatch);
+  const question = handRaiseMatch ? handRaiseMatch[1].trim() : undefined;
+
+  return {
+    ok: true,
+    transport: "http",
+    summary: handRaised ? summary.replace(/HAND_RAISE\s*[:\-]?\s*/i, "").trim() : summary,
+    handRaised,
+    question,
   };
 }

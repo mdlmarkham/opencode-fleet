@@ -3,7 +3,7 @@ import { buildJsonPluginConfigSchema, jsonResult } from "openclaw/plugin-sdk/cor
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { shq } from "./shell.js";
-import { buildOpenCodeCommand, parseOpenCodeOutput, type OpenCodeTask } from "./opencode.js";
+import { buildOpenCodeCommand, parseOpenCodeOutput, parsePiOutput, type OpenCodeTask } from "./opencode.js";
 import { SSH_ARGS } from "./ssh.js";
 
 /** OpenCode task plus the dispatch watchdog knobs (idle/duration guards). */
@@ -417,7 +417,7 @@ export default definePluginEntry({
           task.maxIdleMs,
           task.maxDurationMs,
         );
-        return JSON.stringify(parseOpenCodeOutput(result));
+        return JSON.stringify(task.harness === "pi" ? parsePiOutput(result) : parseOpenCodeOutput(result));
       },
     },
   ],
@@ -473,6 +473,8 @@ export default definePluginEntry({
           },
           node: { type: "string", description: "Singular alias for nodes: [node]. Convenience for single-node dispatch." },
           transport: { type: "string", enum: ["http", "acp"], description: "OpenCode transport." },
+          harness: { type: "string", enum: ["opencode", "pi"], description: "Worker engine harness." },
+          piModel: { type: "string", description: "Pi model override (harness=pi); `provider/id` ref, e.g. aperture/glm-5.3-flash:cloud." },
           model: { type: "string", description: "Optional model override (must exist on node)." },
           agent: { type: "string", description: "Optional OpenCode agent (build/plan)." },
           timeoutMs: { type: "number", description: "Per-node timeout, ms." },
@@ -503,6 +505,8 @@ export default definePluginEntry({
           nodes?: string[];
           node?: string;
           transport?: "http" | "acp";
+          harness?: "opencode" | "pi";
+          piModel?: string;
           model?: string;
           agent?: string;
           timeoutMs?: number;
@@ -617,6 +621,8 @@ export default definePluginEntry({
             prompt: p.prompt,
             cwd: p.cwd,
             transport,
+            harness: p.harness,
+            piModel: p.piModel,
             model: p.model,
             agent: p.agent,
             timeoutMs: p.timeoutMs ?? cfg.defaultTimeoutMs,
@@ -628,17 +634,20 @@ export default definePluginEntry({
           };
           // Ledger: record BEFORE the invoke so an agent/worker crash mid-run
           // still leaves a discoverable record (interruption handling).
-          await upsertRun(rootDir, {
+          const ledgerEntry = {
             runId,
             node: node.displayName ?? node.nodeId,
             cwd: p.cwd,
             prompt: p.prompt,
             model: p.model,
             transport,
+            harness: p.harness,
+            piModel: p.piModel,
             startedAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),
-            state: "running",
-          });
+            state: "running" as const,
+          };
+          await upsertRun(rootDir, ledgerEntry);
           // Issue #6: default to DETACHED execution. The node returns a run
           // handle immediately; the child survives relay timeouts/cancels and
           // records its own completion. fleet_watch/fleet_run_status poll it.
@@ -702,6 +711,61 @@ export default definePluginEntry({
               const errMsg = launchPayload.error
                 ?? (inv as { message?: string }).message
                 ?? "detached launch not acknowledged";
+              // Issue #29: an invoke-timeout does NOT prove the launch failed.
+              // The node can spawn the detached child and write its state file
+              // AFTER the relay gave up (seen repeatedly on dev2). Declaring
+              // failure here makes an unattended caller re-dispatch and
+              // duplicate work — the exact babysitter failure mode. PROBE the
+              // node for evidence the run exists before deciding.
+              let recovered: { confirmed: boolean; state?: string; pid?: number } = { confirmed: false };
+              if (!nodeRejected) {
+                try {
+                  const stInv = await api.runtime.nodes.invoke({
+                    nodeId: node.nodeId,
+                    command: "opencode.run",
+                    params: { prompt: "__RUN_STATUS__", cwd: "/", transport: "http", runId },
+                    timeoutMs: 20_000,
+                    signal,
+                  });
+                  const probe = payloadOf(stInv) as {
+                    ok?: boolean;
+                    state?: string;
+                    pid?: number;
+                    status?: string;
+                    alive?: boolean;
+                  };
+                  // Any positive evidence the run exists: a live/recorded pid,
+                  // a state file (running/finished/aborted), or the script/log
+                  // artifacts the launcher writes before opencode starts
+                  // (reported as status "cleaned").
+                  if (
+                    probe.pid ||
+                    probe.state ||
+                    probe.alive === true ||
+                    probe.status === "cleaned"
+                  ) {
+                    recovered = {
+                      confirmed: true,
+                      state: probe.state ?? probe.status,
+                      pid: probe.pid,
+                    };
+                  }
+                } catch {
+                  recovered = { confirmed: false };
+                }
+              }
+              if (recovered.confirmed) {
+                results[node.displayName ?? node.nodeId] = {
+                  runId,
+                  detached: true,
+                  pid: recovered.pid,
+                  ok: true,
+                  ackPending: false,
+                  recoveredFromTimeout: true,
+                  note: "Launch ack timed out, but the run IS on the node (probe confirmed). Poll with fleet_run_status/fleet_watch; do NOT re-dispatch.",
+                };
+                continue;
+              }
               results[node.displayName ?? node.nodeId] = {
                 runId,
                 detached: true,
@@ -710,7 +774,7 @@ export default definePluginEntry({
                 ...(invokeTimedOut ? { invokeTimedOut: true } : {}),
                 error: nodeRejected ? `launch failed: ${errMsg}` : `launch ack not received: ${errMsg}`,
                 note:
-                  "Launch was NOT confirmed. No run state was written; fleet_run_status will report never-started. Do not rely on this handle.",
+                  "Launch was NOT confirmed AND no run was found on the node. Safe to re-dispatch.",
               };
               continue;
             }
