@@ -11,6 +11,8 @@ import {
   type AckRecoveryOutcome,
 } from "./recovery.js";
 import { SSH_ARGS } from "./ssh.js";
+import { createHash } from "node:crypto";
+import { B64_MARKER, MAX_TRANSFER_B64, nextChunkAction, parseBundleOutput, parseStatusOutput, statusCommand } from "./outputs.js";
 import { guardCwd, taskUsesCwd, validateTaskIds } from "./guard.js";
 import { quoteUntrusted, sanitizeQuestion } from "./untrusted.js";
 import { runPaths, xferPaths, ensureStateDir, writePrivate } from "./paths.js";
@@ -152,13 +154,9 @@ export default definePluginEntry({
         }
         if (task.prompt === "__STATUS__") {
           // Working-tree state of the checkout (issue #4: manager visibility).
-          const st = await runShell(
-            `cd ${shq(task.cwd)} && git status --porcelain 2>/dev/null | head -50; echo "---COUNT---"; git status --porcelain 2>/dev/null | wc -l`,
-            20_000,
-            context?.signal,
-          );
-          const [files, count] = st.split("---COUNT\\n");
-          return JSON.stringify({ ok: true, cwd: task.cwd, uncommittedCount: parseInt((count ?? "0").trim(), 10) || 0, files: files.trim() });
+          const st = await runShell(statusCommand(shq(task.cwd)), 20_000, context?.signal);
+          const status = parseStatusOutput(st);
+          return JSON.stringify({ ok: true, cwd: task.cwd, uncommittedCount: status.uncommittedCount, files: status.files });
         }
         if (task.prompt === "__RECEIVE__") {
           // Node-channel bundle transfer: accumulate base64 chunks into a
@@ -168,15 +166,28 @@ export default definePluginEntry({
           const accDir = xferPaths(transferId).dir;
           await (await import("node:fs/promises")).mkdir(accDir, { recursive: true });
           const target = join(accDir, "bundle.b64");
-          const expected = parseInt(String(task.chunkIndex ?? ""), 10);
-          const chunks = (task.chunks ?? []).slice();
-          for (const c of chunks) {
-            if (Number.isFinite(expected) && c.index !== expected) {
-              return JSON.stringify({ ok: false, error: `chunk out of order: expected ${expected}, got ${c.index}` });
+          const metaPath = join(accDir, "received.json");
+          const fsp = await import("node:fs/promises");
+          let received = 0;
+          try {
+            received = (JSON.parse(await fsp.readFile(metaPath, "utf8")) as { received?: number }).received ?? 0;
+          } catch { /* first chunk */ }
+          let size = 0;
+          try { size = (await fsp.stat(target)).size; } catch { /* none yet */ }
+          for (const c of (task.chunks ?? [])) {
+            const act = nextChunkAction(received, c.index);
+            if (act.action === "error") return JSON.stringify({ ok: false, error: act.error, received });
+            if (act.action === "skip") continue;
+            if (typeof c.data !== "string" || !/^[A-Za-z0-9+/=\r\n]*$/.test(c.data)) {
+              return JSON.stringify({ ok: false, error: "chunk is not base64", received });
             }
-            await (await import("node:fs/promises")).appendFile(target, c.data);
+            size += c.data.length;
+            if (size > MAX_TRANSFER_B64) return JSON.stringify({ ok: false, error: "transfer exceeds size limit", received });
+            await fsp.appendFile(target, c.data);
+            received++;
+            await fsp.writeFile(metaPath, JSON.stringify({ received }));
           }
-          return JSON.stringify({ ok: true, transferId, appended: chunks.length });
+          return JSON.stringify({ ok: true, transferId, received });
         }
         if (task.prompt === "__UNPACK__") {
           // Decode accumulated base64 and clone into cwd (SSH-free path).
@@ -186,7 +197,14 @@ export default definePluginEntry({
           try {
             const b64 = await (await import("node:fs/promises")).readFile(accFile, "utf8");
             const bundlePath = remoteBundlePath(transferId);
-            await (await import("node:fs/promises")).writeFile(bundlePath, Buffer.from(b64, "base64"));
+            const decoded = Buffer.from(b64, "base64");
+            if (task.sha256) {
+              const got = createHash("sha256").update(decoded).digest("hex");
+              if (got !== task.sha256) {
+                return JSON.stringify({ ok: false, error: `bundle checksum mismatch (expected ${task.sha256.slice(0, 12)}…, got ${got.slice(0, 12)}…); refusing to unpack a corrupted transfer` });
+              }
+            }
+            await (await import("node:fs/promises")).writeFile(bundlePath, decoded);
             const unpackCmd = [
               `rm -rf ${shq(task.cwd)}`,
               `mkdir -p ${shq(task.cwd)}`,
@@ -228,18 +246,21 @@ export default definePluginEntry({
               `DIRTY=$(git status --porcelain --untracked-files=all)`,
               `if [ -n "$DIRTY" ]; then git add -A && git -c user.email=fleet-worker@node -c user.name="fleet-worker" commit -q -m "fleet_sync: auto-commit worker working-tree changes before sync"; fi`,
               `git bundle create ${shq(join(accDir, "sync.bundle"))} --all`,
-              `echo "---B64---"`,
+              `git rev-parse HEAD`,
+              `echo "${B64_MARKER}"`,
               `base64 ${shq(join(accDir, "sync.bundle"))}`,
             ].filter(Boolean).join(" && "),
             120_000,
             context?.signal,
           );
-          const [meta, ...b64Lines] = commitOut.split("---B64---\\n");
-          if (!b64Lines.length || !b64Lines.join("").trim()) {
-            return JSON.stringify({ ok: false, error: `bundle failed: ${meta.slice(0, 300)}` });
-          }
-          await (await import("node:fs/promises")).writeFile(join(accDir, "bundle.b64"), b64Lines.join(""));
-          return JSON.stringify({ ok: true, transferId, staged: true, head: meta.trim().slice(-40) });
+          const bundled = parseBundleOutput(commitOut);
+          if (!bundled.ok) return JSON.stringify({ ok: false, error: bundled.error });
+          await (await import("node:fs/promises")).writeFile(join(accDir, "bundle.b64"), bundled.base64);
+          const bundleBytes = await (await import("node:fs/promises")).readFile(join(accDir, "sync.bundle"));
+          return JSON.stringify({
+            ok: true, transferId, staged: true, head: bundled.head,
+            sha256: createHash("sha256").update(bundleBytes).digest("hex"), bytes: bundleBytes.length,
+          });
         }
         if (task.prompt === "__RUN_START__") {
           // Issue #6: detached execution. The child survives relay timeouts
@@ -1678,10 +1699,17 @@ export default definePluginEntry({
             if (!c.ok || typeof c.data !== "string") return jsonResult({ ok: false, error: c.error ?? "chunk read failed" });
             parts.push(c.data);
           }
+          const assembled = parts.join("");
+          if (typeof bundlePl.sha256 === "string") {
+            const got = createHash("sha256").update(Buffer.from(assembled, "base64")).digest("hex");
+            if (got !== bundlePl.sha256) {
+              return jsonResult({ ok: false, error: "worker bundle checksum mismatch after transfer; refusing to push a corrupted bundle" });
+            }
+          }
           const { syncFromNode } = await import("./provision.js");
           const r = await syncFromNode("local", p.cwd, p.repo, p.branch ?? "main", {
             mode: "from-base64",
-            base64: parts.join(""),
+            base64: assembled,
             branch: p.branch ?? "main",
             destBranch: p.branch,
           });
