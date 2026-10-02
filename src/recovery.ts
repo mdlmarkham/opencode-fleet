@@ -58,8 +58,15 @@ function payloadOf(inv: unknown): Record<string, unknown> {
  * ALLOW-LIST of positive states — ONLY `running`/`finished`/`aborted` (or a
  * truthy non-zero `pid`, or `alive === true`) count as CONFIRMED.
  * `never-started`, `unknown`, absent, or `status:"cleaned"` with no pid/state
- * MUST NOT count as confirmed. `probe.ok === false` is handled as
- * absent/inconclusive (an explicit negative answer, not a confirmation).
+ * MUST NOT count as confirmed.
+ *
+ * `probe.ok === false`: ONLY an EXPLICIT absence signal counts as `absent`.
+ * The node handler emits `status:"never-started"` solely when no run state AND
+ * no launcher artifacts exist — the run definitively never started. Anything
+ * else negative (`status:"cleaned"`, or a missing/unknown status on a generic
+ * relay/command error) is NOT proof of absence and MUST be `inconclusive`
+ * (issue #30 finding E: a generic `{ok:false}` was being read as proof the run
+ * never started, so an ambiguous error said "Safe to re-dispatch.").
  */
 export function interpretProbe(probe: unknown): ProbeVerdict {
   if (!probe || typeof probe !== "object") return "inconclusive";
@@ -70,14 +77,13 @@ export function interpretProbe(probe: unknown): ProbeVerdict {
   const alive = p.alive === true;
 
   if (p.ok === false) {
-    // Explicit negative answer from the node: it answered and has no run state.
+    // ONLY an explicit "never-started" is a definitive absence. The node emits
+    // it when no run state and no launcher artifacts exist (truly missing run).
     if (status === "never-started") return "absent";
     // "cleaned" means launcher artifacts (script/log) exist — the run DID start,
-    // so it is NOT a definitive absence, but with no pid/state it is also not
-    // confirmation. Inconclusive.
-    if (status === "cleaned") return "inconclusive";
-    // missing-state / generic error: nothing was ever recorded.
-    return "absent";
+    // so it is NOT a definitive absence. A missing/unknown status is a generic
+    // relay/command error, not a never-started claim. Both are inconclusive.
+    return "inconclusive";
   }
 
   // Positive allow-list ONLY.
@@ -129,4 +135,38 @@ export async function probeAckRecovery(
     return { kind: "absent", verdict, probed: true, note: ACK_ABSENT_NOTE };
   }
   return { kind: "inconclusive", verdict, probed: true, note: ACK_INCONCLUSIVE_NOTE };
+}
+
+/**
+ * Issue #30 finding H: a run may only be recorded `aborted` when its
+ * termination is CONFIRMED. Returns the state object to write, or null to
+ * leave the existing file untouched (never claim aborted for a possibly-live
+ * run). Existing fields (harness/piModel/pid/startedAt) are PRESERVED so later
+ * __RUN_STATUS__/__RUN_RESULT__ reads still parse correctly.
+ */
+export function abortStateWrite(
+  existing: Record<string, unknown>,
+  confirmed: boolean,
+  finishedAt: string,
+): Record<string, unknown> | null {
+  if (!confirmed) return null;
+  return { ...existing, state: "aborted", finishedAt };
+}
+
+/**
+ * Issue #30 finding I: interpret the engine-independent liveness probe output.
+ * The recorded pid (when given) is confirmed by its PIDALIVE marker; otherwise
+ * ANY matching opencode/pi process line means the run is alive.
+ */
+export function interpretLiveness(
+  procPart: string,
+  pid?: number,
+): { alive: boolean; procs: string[] } {
+  const pidAlive =
+    pid !== undefined && new RegExp(`PIDALIVE\\s+${pid}\\b`).test(procPart);
+  const procs = procPart
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith("PIDALIVE"));
+  return { alive: pidAlive || procs.length > 0, procs };
 }

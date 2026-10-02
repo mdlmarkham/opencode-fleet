@@ -13,6 +13,7 @@
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { shq } from "./shell.js";
+import { interpretLiveness } from "./recovery.js";
 import { SSH_ARGS } from "./ssh.js";
 
 export type RunState = "running" | "completed" | "failed" | "timed-out" | "discarded";
@@ -108,11 +109,12 @@ export async function probeRun(
     const { stdout } = await execFileP("ssh", [...SSH_ARGS, nodeHost, cmd], { timeout: 30_000 });
     const [procPartRaw, uncommittedPart] = stdout.split("---UNCOMMITTED---\n");
     const procPart = procPartRaw ?? "";
-    const pidAlive = /PIDALIVE\b/.test(procPart);
-    const procs = procLines(procPart).filter((l) => !l.startsWith("PIDALIVE"));
+    // Issue #30 finding I: engine-independent liveness (recorded pid OR any
+    // matching opencode/pi process line), extracted as a pure helper.
+    const { alive, procs } = interpretLiveness(procPart, opts.pid);
     const uncommitted = parseInt((uncommittedPart ?? "").trim(), 10);
     return {
-      procRunning: pidAlive || procs.length > 0,
+      procRunning: alive,
       procs,
       uncommitted: Number.isFinite(uncommitted) ? uncommitted : -1,
     };

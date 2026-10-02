@@ -6,6 +6,7 @@ import { shq } from "./shell.js";
 import { buildOpenCodeCommand, parseOpenCodeOutput, parsePiOutput, type OpenCodeTask } from "./opencode.js";
 import {
   probeAckRecovery,
+  abortStateWrite,
   ACK_ABSENT_NOTE,
   ACK_PROBE_TIMEOUT_MS,
   type AckRecoveryOutcome,
@@ -375,13 +376,23 @@ export default definePluginEntry({
           const runId = String(task.runId ?? "");
           try {
             const raw = await (await import("node:fs/promises")).readFile(runStatePath(runId), "utf8");
-            const st = JSON.parse(raw) as { pid?: number };
-            if (st.pid) await runShell(`kill -TERM -- -${st.pid} 2>/dev/null; kill -9 ${st.pid} 2>/dev/null; echo ABORTED`, 10_000, context?.signal);
-            await (await import("node:fs/promises")).writeFile(
-              runStatePath(runId),
-              JSON.stringify({ runId, pid: st.pid, state: "aborted", finishedAt: new Date().toISOString() }),
-            );
-            return JSON.stringify({ ok: true, aborted: true, pid: st.pid });
+            const st = JSON.parse(raw) as Record<string, unknown> & { pid?: number };
+            let confirmed = false;
+            if (st.pid) {
+              const out = await runShell(
+                `kill -TERM -- -${st.pid} 2>/dev/null; sleep 1; ` +
+                  `if kill -0 -- -${st.pid} 2>/dev/null; then kill -9 -- -${st.pid} 2>/dev/null; sleep 1; fi; ` +
+                  `if kill -0 -- -${st.pid} 2>/dev/null; then echo ALIVE; else echo DEAD; fi`,
+                15_000,
+                context?.signal,
+              );
+              confirmed = out.includes("DEAD");
+            }
+            // Issue #30 finding H: mark aborted ONLY on confirmed termination;
+            // preserve existing state fields so later reads still parse.
+            const next = abortStateWrite(st, confirmed, new Date().toISOString());
+            if (next) await (await import("node:fs/promises")).writeFile(runStatePath(runId), JSON.stringify(next));
+            return JSON.stringify({ ok: confirmed, aborted: confirmed, pid: st.pid, confirmed });
           } catch {
             return JSON.stringify({ ok: false, error: "no run state" });
           }
@@ -2375,9 +2386,18 @@ async function abortRunById(
     15_000,
   );
   const confirmed = out.includes("DEAD");
-  await (await import("node:fs/promises"))
-    .writeFile(statePath, JSON.stringify({ runId, pid, state: "aborted", finishedAt: new Date().toISOString() }))
-    .catch(() => {});
+  // Issue #30 finding H: only record `aborted` when termination is CONFIRMED.
+  // Otherwise leave the state file untouched — never claim aborted for a
+  // possibly-live run. Preserve existing fields (harness/piModel/pid/startedAt)
+  // so later __RUN_STATUS__/__RUN_RESULT__ reads still parse correctly.
+  let existing: Record<string, unknown> = {};
+  try {
+    existing = JSON.parse(await (await import("node:fs/promises")).readFile(statePath, "utf8"));
+  } catch { /* keep {} */ }
+  const next = abortStateWrite(existing, confirmed, new Date().toISOString());
+  if (next) {
+    await (await import("node:fs/promises")).writeFile(statePath, JSON.stringify(next)).catch(() => {});
+  }
   return { ok: confirmed, aborted: confirmed, pid, confirmed };
 }
 

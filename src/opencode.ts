@@ -104,6 +104,28 @@ export interface OpenCodeRunResult {
 import { shq } from "./shell.js";
 
 /**
+ * Validate an engine/transport combination BEFORE any command is built or the
+ * node is invoked (issue #30 finding G). Pi is driven over the shell (http
+ * path) only; `opencode acp` has no Pi transport, so `harness="pi"` with
+ * `transport="acp"` would silently run the opencode ACP client and drop Pi
+ * (and piModel). Extracted as a pure function so it is unit-testable.
+ */
+export function validateHarnessTransport(task: {
+  harness?: string;
+  transport?: string;
+}): { ok: true } | { ok: false; harness?: string; error: string } {
+  if (task.transport === "acp" && task.harness === "pi") {
+    return {
+      ok: false,
+      harness: "pi",
+      error:
+        "harness=pi requires transport=http (opencode acp has no Pi transport; Pi would be silently ignored)",
+    };
+  }
+  return { ok: true };
+}
+
+/**
  * Build the shell command that runs OpenCode on the node for a given task.
  * Returns a single command string executed via the node's shell.
  * All interpolated values are shell-escaped (shq) to prevent injection.
@@ -164,26 +186,26 @@ export function buildOpenCodeCommand(task: OpenCodeTask): string {
     // `aperture-anthropic/...` — so the opencode `model` value must NEVER be
     // forwarded. Fall back to a known Pi default when `piModel` is absent.
     const piModel = task.piModel ?? "aperture/glm-5.3-flash:cloud";
-    // Issue #30 finding C: flag-injection guard. The prompt is passed as a
-    // POSITIONAL argument AFTER an explicit `--` separator, and every flag
-    // (including `--model`) precedes the separator. A prompt beginning with
-    // `-` can therefore never be parsed as a flag.
+    // Issue #30 finding C (VALIDATED LIVE on dev2, pi 0.73.1 as svcuser):
+    // pi does NOT support `--` (`Error: Unknown option: --`), and a positional
+    // prompt beginning with `-`/`--` is parsed as a FLAG (`pi -p -- --version`
+    // prints 0.73.1; `--model x` injects a model flag). So the old
+    // `pi -p --model M -- <prompt>` form failed outright AND voided the guard.
     //
-    // NOTE: `pi` is NOT installed on the host used to author this change, so
-    // this could not be verified against `pi --help`. Assumption: pi-mono's
-    // `-p/--print` is a BOOLEAN print-mode flag and the prompt is positional;
-    // `--` terminates option parsing. If a future pi takes `-p <prompt>`, the
-    // equivalent injection-safe form is `-p=${shq(task.prompt)}`.
+    // FIX: feed the prompt via STDIN — no `--`, no positional prompt. Live
+    // proof: a normal prompt arrives as message content; a hostile `--evil ...`
+    // prompt is delivered as MESSAGE CONTENT (no parser error) — injection-proof.
     return [
       cdGuard,
       envExports,
-      `timeout ${Math.floor(timeout / 1000)} pi -p --model ${shq(piModel)} -- ${shq(task.prompt)} 2>&1`,
+      `printf '%s' ${shq(task.prompt)} | timeout ${Math.floor(timeout / 1000)} pi -p --model ${shq(piModel)} 2>&1`,
     ].filter(Boolean).join("\n");
   }
 
   if (task.transport === "acp") {
     // Issue #30 finding D(1): `opencode acp` has NO `--auto` flag (verified
-    // against `opencode acp --help`, v1.18.30). It was inert here because acp
+    // against `opencode acp --help`; the live dev2 node runs 1.18.26 — the
+    // `--auto` absence still holds there). It was inert here because acp
     // routes to runAcpPrompt, but leaving it would break if that changed.
     return [
       cdGuard,
