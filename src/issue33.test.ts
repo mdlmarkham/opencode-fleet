@@ -1,0 +1,152 @@
+import { describe, expect, it } from "vitest";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { syncFromNode } from "./provision.js";
+import {
+  countSecretLines, evaluateChange, isSafeBranchName, resolveDestination, resolvePolicy, sensitivePaths,
+} from "./syncpolicy.js";
+
+const git = (cwd: string, ...args: string[]) =>
+  execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "init.defaultBranch=main", ...args], { cwd, encoding: "utf8" }).trim();
+
+describe("issue #33: pure policy", () => {
+  const pol = resolvePolicy();
+  it("redirects protected destinations to fleet/<worker branch or label>", () => {
+    expect(resolveDestination("main", "feature/x", "sync-1", pol)).toEqual({ branch: "fleet/feature/x", redirectedFrom: "main" });
+    expect(resolveDestination("main", "main", "sync-9", pol)).toEqual({ branch: "fleet/sync-9", redirectedFrom: "main" });
+    expect(resolveDestination("master", "master", "sync-9", pol).branch).toBe("fleet/sync-9");
+  });
+  it("leaves unprotected destinations and explicitly allowed ones alone", () => {
+    expect(resolveDestination("feature/x", "feature/x", "l", pol)).toEqual({ branch: "feature/x" });
+    expect(resolveDestination("main", "main", "l", resolvePolicy({ allowDirectPush: ["main"] }))).toEqual({ branch: "main" });
+  });
+  it("custom protected list is honored (and main is then unprotected)", () => {
+    const p = resolvePolicy({ protectedBranches: ["release"] });
+    expect(resolveDestination("release", "release", "l", p).redirectedFrom).toBe("release");
+    expect(resolveDestination("main", "main", "l", p).redirectedFrom).toBeUndefined();
+  });
+  it("redirected names are always safe branch names", () => {
+    for (const w of ["a b", "x..y", "-rf", "feat/.hidden", "weird\u0001name", "a.lock"]) {
+      expect(isSafeBranchName(resolveDestination("main", w, "sync-1", pol).branch), w).toBe(true);
+    }
+  });
+  it("rejects option-looking and malformed branch names", () => {
+    for (const b of ["-x", "--upload-pack=evil", "a..b", "a//b", "a/", "x.lock", ".hid", "a b", "", "a@{1}"]) {
+      expect(isSafeBranchName(b), b).toBe(false);
+    }
+    for (const b of ["main", "feature/x-1", "fleet/sync-123", "v1.2.3"]) expect(isSafeBranchName(b), b).toBe(true);
+  });
+  it("flags CI/CODEOWNERS paths", () => {
+    expect(sensitivePaths([".github/workflows/ci.yml", "src/a.ts", "CODEOWNERS", ".circleci/config.yml", "docs/workflows/x"])).toEqual([
+      ".github/workflows/ci.yml", "CODEOWNERS", ".circleci/config.yml",
+    ]);
+  });
+  it("secret scan looks at added lines only and never echoes the secret", () => {
+    const diff = ["--- a/f", "+++ b/f", "-token=ghp_abcdefghijklmnopqrstuvwxyz0123456789", "+const ok = 1;"].join("\n");
+    expect(countSecretLines(diff)).toBe(0);
+    expect(countSecretLines(diff + "\n+key = ghp_abcdefghijklmnopqrstuvwxyz0123456789")).toBe(1);
+    const r = evaluateChange(["f"], "+x = ghp_abcdefghijklmnopqrstuvwxyz0123456789", pol);
+    expect(r.ok).toBe(false);
+    expect(JSON.stringify(r)).not.toContain("ghp_abcdef");
+  });
+  it("allowSensitivePaths opens CI paths only", () => {
+    expect(evaluateChange([".github/workflows/a.yml"], "", resolvePolicy({ allowSensitivePaths: true })).ok).toBe(true);
+    expect(evaluateChange([".github/workflows/a.yml"], "", pol).ok).toBe(false);
+  });
+});
+
+/** Real-git harness: bare origin, a worker clone with commits, and a base64 bundle. */
+function harness(opts: { workerBranch?: string; files: Record<string, string> }) {
+  const base = mkdtempSync(join(tmpdir(), "fleet33-"));
+  const origin = join(base, "origin.git");
+  const seed = join(base, "seed");
+  const worker = join(base, "worker");
+  git(base, "init", "-q", "--bare", origin);
+  git(base, "clone", "-q", origin, seed);
+  writeFileSync(join(seed, "README.md"), "hi\n");
+  git(seed, "add", "-A");
+  git(seed, "commit", "-q", "-m", "init");
+  git(seed, "push", "-q", "origin", "HEAD:refs/heads/main");
+  git(base, "clone", "-q", "--branch", "main", origin, worker);
+  if (opts.workerBranch) git(worker, "checkout", "-q", "-b", opts.workerBranch);
+  for (const [f, c] of Object.entries(opts.files)) {
+    mkdirSync(join(worker, f, ".."), { recursive: true });
+    writeFileSync(join(worker, f), c);
+  }
+  git(worker, "add", "-A");
+  git(worker, "commit", "-q", "-m", "work");
+  const bundle = join(base, "w.bundle");
+  git(worker, "bundle", "create", bundle, "--all");
+  const b64 = readFileSync(bundle).toString("base64");
+  const originRef = (b: string) => { try { return git(origin, "rev-parse", "--verify", "--quiet", `refs/heads/${b}`); } catch { return ""; } };
+  const run = (policy?: Parameters<typeof syncFromNode>[6], pinned?: string) =>
+    syncFromNode("local", worker, origin, "main", { mode: "from-base64", base64: b64, branch: "main", workerBranch: opts.workerBranch ?? "main", destBranch: pinned }, pinned, policy);
+  return { base, origin, originRef, run, cleanup: () => rmSync(base, { recursive: true, force: true }) };
+}
+
+describe("issue #33: end-to-end against real git repos", () => {
+  it("work on main is redirected to fleet/<label>; origin/main is untouched", async () => {
+    const h = harness({ files: { "a.txt": "x\n" } });
+    try {
+      const before = h.originRef("main");
+      const r = await h.run();
+      expect(r.ok).toBe(true);
+      expect(r.synced).toBe(true);
+      expect(r.redirectedFrom).toBe("main");
+      expect(r.branch).toMatch(/^fleet\/sync-/);
+      expect(h.originRef("main")).toBe(before);
+      expect(h.originRef(r.branch!)).not.toBe("");
+    } finally { h.cleanup(); }
+  });
+  it("allowDirectPush lets main advance", async () => {
+    const h = harness({ files: { "a.txt": "x\n" } });
+    try {
+      const before = h.originRef("main");
+      const r = await h.run({ allowDirectPush: ["main"] });
+      expect(r.ok && r.synced).toBe(true);
+      expect(r.redirectedFrom).toBeUndefined();
+      expect(h.originRef("main")).not.toBe(before);
+    } finally { h.cleanup(); }
+  });
+  it("a feature branch is published as itself, no redirect", async () => {
+    const h = harness({ workerBranch: "feature/x", files: { "a.txt": "x\n" } });
+    try {
+      const r = await h.run();
+      expect(r.synced).toBe(true);
+      expect(r.branch).toBe("feature/x");
+      expect(r.redirectedFrom).toBeUndefined();
+      expect(h.originRef("feature/x")).not.toBe("");
+    } finally { h.cleanup(); }
+  });
+  it("workflow changes are refused and nothing is pushed", async () => {
+    const h = harness({ workerBranch: "feature/ci", files: { ".github/workflows/ci.yml": "on: push\n" } });
+    try {
+      const r = await h.run();
+      expect(r.ok).toBe(false);
+      expect(r.commit).toBe("policy-refused");
+      expect(h.originRef("feature/ci")).toBe("");
+      const allowed = await h.run({ allowSensitivePaths: true });
+      expect(allowed.synced).toBe(true);
+    } finally { h.cleanup(); }
+  });
+  it("credential-shaped additions are refused", async () => {
+    const h = harness({ workerBranch: "feature/s", files: { "cfg.env": "TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789\n" } });
+    try {
+      const r = await h.run();
+      expect(r.ok).toBe(false);
+      expect(r.commit).toBe("policy-refused");
+      expect(JSON.stringify(r)).not.toContain("ghp_abcdef");
+      expect(h.originRef("feature/s")).toBe("");
+    } finally { h.cleanup(); }
+  });
+  it("an unsafe destination name is refused before any git runs", async () => {
+    const h = harness({ files: { "a.txt": "x\n" } });
+    try {
+      const r = await h.run(undefined, "--upload-pack=evil");
+      expect(r.ok).toBe(false);
+      expect(r.error).toMatch(/unsafe/);
+    } finally { h.cleanup(); }
+  });
+});

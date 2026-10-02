@@ -74,6 +74,35 @@
         "type": "boolean",
         "default": false,
         "description": "Allow fleet_provision setup to be an arbitrary shell command. Default: repo-relative script path only."
+      },
+      "sync": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "fleet_sync publish policy: protected branches are never pushed directly (work is redirected to fleet/<name>) unless listed in allowDirectPush.",
+        "properties": {
+          "protectedBranches": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [
+              "main",
+              "master"
+            ]
+          },
+          "allowDirectPush": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": []
+          },
+          "allowSensitivePaths": {
+            "type": "boolean",
+            "default": false,
+            "description": "Allow worker changes to CI/CODEOWNERS paths."
+          }
+        }
       }
     }
   },

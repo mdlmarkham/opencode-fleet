@@ -97,6 +97,7 @@ The plugin bundles a **skill** (`skills/opencode-fleet/SKILL.md`) that teaches a
 | `apertureUrl` | `https://ai.tailf9480.ts.net/v1/models` | Aperture model catalog URL |
 | `allowAutoApprove` | `true` | Whether `fleet_dispatch` may pass `autoApprove` (`opencode run --auto`, auto-approves every non-denied permission). Set `false` to forbid it fleet-wide. |
 | `allowSetupCommands` | `false` | Whether `fleet_provision`'s `setup` may be an arbitrary shell command. By default it must be a repo-relative script path with plain arguments (e.g. `scripts/setup.sh`). |
+| `sync` | see below | `fleet_sync` publish policy: `protectedBranches` (default `["main","master"]`), `allowDirectPush` (default `[]`), `allowSensitivePaths` (default `false`). |
 | `nodes[].user` | _(unset)_ | SSH login user for a node (defaults to SSH config default, usually `root`) |
 | `nodes[].serviceUser` | _(unset)_ | Principal the node's OpenClaw service runs as, when it differs from the login user. Install/verify target this principal's plugin root. |
 
@@ -108,6 +109,15 @@ Text an agent passes to `fleet_dispatch`/`fleet_provision` can originate from co
 - **`setup`** — a repo-relative script path with plain arguments only, unless the operator sets `allowSetupCommands`.
 - **`autoApprove`** — opt-in per dispatch, and forbiddable with `allowAutoApprove: false`. It widens what a detached worker may do without asking; pair it with deny rules on the node.
 - **`cwd`** — confined to the node's allowed roots (`FLEET_ALLOWED_ROOTS`, default: the fleet workspace root and the service home).
+
+## Publishing worker changes (`fleet_sync`)
+
+Worker work is pushed with the manager's credentials, so `fleet_sync` applies a policy before pushing:
+
+- **Protected branches** (default `main`, `master`) are never pushed directly. The work goes to `fleet/<worker-branch or sync-id>` and the result reports `redirectedFrom`; open a PR from it. List a branch in `sync.allowDirectPush` to allow direct pushes to it.
+- **CI/CODEOWNERS paths** (`.github/workflows/**`, `.github/actions/**`, `CODEOWNERS`, `.gitlab-ci.yml`, `.circleci/**`, `Jenkinsfile`, …) in the worker's changes are refused unless `sync.allowSensitivePaths` is set.
+- **Credential-shaped text** in added lines (tokens, keys, private keys, password assignments) is refused; nothing is pushed and the secret is never echoed.
+- Branch names that could be read as git options (leading `-`, `..`, …) are refused, and the repo argument is passed after `--`.
 
 ## Development
 

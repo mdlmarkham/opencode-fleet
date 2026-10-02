@@ -55,6 +55,8 @@ interface FleetConfig {
   allowAutoApprove?: boolean;
   /** Operator switch: let fleet_provision `setup` be an arbitrary shell command, not just a repo script (default false). */
   allowSetupCommands?: boolean;
+  /** fleet_sync publish policy (issue #33). */
+  sync?: { protectedBranches?: string[]; allowDirectPush?: string[]; allowSensitivePaths?: boolean };
 }
 
 export default definePluginEntry({
@@ -87,6 +89,16 @@ export default definePluginEntry({
         type: "boolean",
         default: true,
         description: "Allow fleet_dispatch autoApprove (opencode --auto). Set false to forbid it fleet-wide.",
+      },
+      sync: {
+        type: "object",
+        additionalProperties: false,
+        description: "fleet_sync publish policy: protected branches are never pushed directly (work is redirected to fleet/<name>) unless listed in allowDirectPush.",
+        properties: {
+          protectedBranches: { type: "array", items: { type: "string" }, default: ["main", "master"] },
+          allowDirectPush: { type: "array", items: { type: "string" }, default: [] },
+          allowSensitivePaths: { type: "boolean", default: false, description: "Allow worker changes to CI/CODEOWNERS paths." },
+        },
       },
       allowSetupCommands: {
         type: "boolean",
@@ -1669,7 +1681,7 @@ export default definePluginEntry({
           node: { type: "string", description: "Node display name or id." },
           cwd: { type: "string", description: "Working directory on the node." },
           repo: { type: "string", description: "Git URL the manager can access." },
-          branch: { type: "string", description: "Destination branch to publish the worker's work to. When omitted, the worker's own checked-out branch is published if it differs from `main` (so feature-branch work stays reviewable); otherwise `main`." },
+          branch: { type: "string", description: "Destination branch to publish the worker's work to. When omitted, the worker's own checked-out branch is published if it differs from `main`. A protected destination (default main/master) is not pushed directly: the work goes to `fleet/<name>` and the result reports `redirectedFrom`, unless the operator lists the branch in sync.allowDirectPush." },
         },
         required: ["node", "cwd", "repo"],
       },
@@ -1712,12 +1724,12 @@ export default definePluginEntry({
             base64: parts.join(""),
             branch: p.branch ?? "main",
             destBranch: p.branch,
-          });
+          }, undefined, cfg.sync);
           return jsonResult({ ...r, viaChannel: true });
         }
 
         const { syncFromNode } = await import("./provision.js");
-        const r = await syncFromNode(host, p.cwd, p.repo, p.branch ?? "main", undefined, p.branch);
+        const r = await syncFromNode(host, p.cwd, p.repo, p.branch ?? "main", undefined, p.branch, cfg.sync);
         return jsonResult(r);
       },
     });
