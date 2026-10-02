@@ -115,10 +115,20 @@ export function taskUsesCwd(prompt: string): boolean {
   return !CWD_FREE_OPS.has(prompt);
 }
 
-/** Validate runId/transferId when present; returns an error string or undefined. */
-export function validateTaskIds(task: { runId?: unknown; transferId?: unknown }): string | undefined {
+/** Control messages that address a run and therefore require a valid runId. */
+const RUN_OPS = new Set(["__RUN_START__", "__RUN_STATUS__", "__RUN_RESULT__", "__RUN_ABORT__"]);
+
+/**
+ * Validate runId/transferId; returns an error string or undefined. Absent
+ * (undefined/null) ids are allowed except runId on run-addressed messages;
+ * an empty string is never valid.
+ */
+export function validateTaskIds(task: { prompt?: string; runId?: unknown; transferId?: unknown }): string | undefined {
+  if (task.prompt && RUN_OPS.has(task.prompt) && (task.runId === undefined || task.runId === null)) {
+    return "runId required";
+  }
   for (const [kind, v] of [["runId", task.runId], ["transferId", task.transferId]] as const) {
-    if (v === undefined || v === null || v === "") continue;
+    if (v === undefined || v === null) continue;
     const c = validateId(kind, v);
     if (!c.ok) return c.error;
   }
