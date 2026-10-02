@@ -35,6 +35,10 @@ describe("issue #31: cwd confinement", () => {
       expect(checkCwd(c, roots).ok).toBe(false);
     }
     expect(checkCwd("/home/svcuser/fleet", ["/home/svcuser/fleet"]).ok).toBe(false);
+    // Nested roots: the workspace root is a descendant of home, so a plain
+    // strict-descendant test would ADMIT it as a child of home. It must be refused.
+    expect(checkCwd("/home/svcuser/fleet", ["/home/svcuser/fleet", "/home/svcuser"]).ok).toBe(false);
+    expect(checkCwd("/home/svcuser/fleet/claw-rss", ["/home/svcuser/fleet", "/home/svcuser"]).ok).toBe(true);
   });
   it("refuses relative, empty and NUL-containing paths", () => {
     for (const c of ["", ".", "fleet/x", "/a\0b"]) expect(checkCwd(c, roots).ok).toBe(false);
@@ -75,8 +79,11 @@ describe("issue #31: which messages are cwd-checked", () => {
     }
   });
   it("checks destructive ops and ordinary prompts", () => {
-    for (const p of ["__UNPACK__", "__BUNDLE__", "__DIFF__", "__STATUS__", "__RUN_START__", "fix the bug"]) {
+    for (const p of ["__UNPACK__", "__BUNDLE__", "__STATUS__", "__RUN_START__", "fix the bug"]) {
       expect(taskUsesCwd(p)).toBe(true);
     }
+  });
+  it("exempts read-only __DIFF__ (not destructive; carries a real cwd)", () => {
+    expect(taskUsesCwd("__DIFF__")).toBe(false);
   });
 });

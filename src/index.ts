@@ -2123,18 +2123,19 @@ export default definePluginEntry({
         properties: {
           node: { type: "string", description: "Node display name or id." },
           sessionId: { type: "string", description: "Session id to pull the diff for." },
+          cwd: { type: "string", description: "Absolute repo path on the node (required to run git diff; read-only)." },
         },
-        required: ["node", "sessionId"],
+        required: ["node", "sessionId", "cwd"],
       },
       execute: async (toolCallId, params, signal) => {
-        const p = params as { node: string; sessionId: string };
+        const p = params as { node: string; sessionId: string; cwd: string };
         const list = await api.runtime.nodes.list();
         const node = (list.nodes ?? []).find((n) => n.displayName === p.node || n.nodeId === p.node);
         if (!node) return jsonResult(`Node "${p.node}" not found.`);
         const inv = await api.runtime.nodes.invoke({
           nodeId: node.nodeId,
           command: "opencode.run",
-          params: { prompt: "__DIFF__", cwd: "/", transport: "http", sessionId: p.sessionId },
+          params: { prompt: "__DIFF__", cwd: p.cwd, transport: "http", sessionId: p.sessionId },
           timeoutMs: 30000,
           signal,
         });
