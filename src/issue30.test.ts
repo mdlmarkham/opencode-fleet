@@ -264,7 +264,8 @@ describe("issue #30I: engine-independent liveness", () => {
 });
 
 describe("issue #48: validateHarnessTransport is the single production guard", () => {
-  const index = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.ts"), "utf8");
+  const dir = dirname(fileURLToPath(import.meta.url));
+  const index = ["index.ts", "node/handler.ts"].map((f) => readFileSync(join(dir, f), "utf8")).join("\n");
   it("is called from both the gateway dispatch and the node handler", () => {
     expect((index.match(/validateHarnessTransport\(/g) ?? []).length).toBe(2);
   });
