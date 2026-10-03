@@ -123,8 +123,13 @@ export function taskUsesCwd(prompt: string): boolean {
   return !CWD_FREE_OPS.has(prompt);
 }
 
-/** Control messages that address a run and therefore require a valid runId. */
-const RUN_OPS = new Set(["__RUN_START__", "__RUN_STATUS__", "__RUN_RESULT__"]);
+/**
+ * Control messages that address a run and therefore require a valid runId.
+ * __ABORT__ is run-addressed too (issue #63): an abort without a runId used
+ * to fall back to a node-wide pkill of every opencode/pi process, so must be
+ * refused before any op runs.
+ */
+const RUN_OPS = new Set(["__RUN_START__", "__RUN_STATUS__", "__RUN_RESULT__", "__ABORT__"]);
 
 /**
  * Validate runId/transferId; returns an error string or undefined. Absent

@@ -67,24 +67,25 @@ const OPS: Partial<Record<Op, OpFn>> = {};
 
 OPS["abort"] = async ({ task, io, context }: OpCtx) => {
   void io; void context;
-      // Issue #30 finding H: cancellation was engine-blind — `pkill -f
-      // "opencode (run|acp|serve)"` never matched a Pi worker. Terminate by
-      // the RECORDED run's pid (engine-independent) when a runId is given,
-      // and only report success after confirming termination. The pattern
-      // fallback now also matches Pi.
+      // Issue #63: aborts are run-addressed — runId is REQUIRED. The old
+      // no-runId fallback pattern-matched and killed every opencode/pi process
+      // on the node (other users' runs included). That fallback is gone: an
+      // abort with no runId is refused with a clear error instead of killing
+      // anything. With a runId, terminate by the RECORDED run's pid (issue
+      // #30 finding H, engine-independent, covers Pi AND opencode), only
+      // reporting success after confirming termination.
       const runId = String(task.runId ?? "");
-      if (runId) {
-        const r = await abortRunById(runId);
-        return JSON.stringify({ ...r, sessionId: task.sessionId });
+      if (!runId) {
+        return JSON.stringify({
+          ok: false,
+          aborted: false,
+          sessionId: task.sessionId,
+          error:
+            "refused: an abort requires runId (runId required — take it from fleet_dispatch); without one this op would have killed every opencode/pi process on the node",
+        });
       }
-      const killed = await runShell(
-        `pkill -f "opencode (run|acp|serve)" 2>/dev/null; pkill -f "[p]i -p " 2>/dev/null; sleep 1; ` +
-          `if pgrep -f "opencode (run|acp|serve)" >/dev/null 2>&1 || pgrep -f "[p]i -p " >/dev/null 2>&1; then echo "REMAINING"; else echo "CLEARED"; fi`,
-        15_000,
-        context?.signal,
-      );
-      const cleared = killed.includes("CLEARED");
-      return JSON.stringify({ ok: cleared, aborted: cleared, sessionId: task.sessionId, detail: killed.trim() });
+      const r = await abortRunById(runId);
+      return JSON.stringify({ ...r, sessionId: task.sessionId });
 };
 
 OPS["diff"] = async ({ task, io, context }: OpCtx) => {

@@ -67,6 +67,27 @@ export function xferPaths(transferId: string, dir: string = ensureStateDir()): {
   return { dir: join(dir, `xfer-${id}`), bundle: join(dir, `xfer-${id}.bundle`) };
 }
 
+/** Issue #63: dir-name prefix of a per-run private bundle-stage directory. */
+export const BUNDLE_STAGE_PREFIX = "bundle-";
+
+/**
+ * Issue #63: layout of a per-run PRIVATE bundle-stage directory for the
+ * manager's SSH path.
+ *
+ * Git bundles shipped to/from a node over scp used to sit at public
+ * `/tmp/fleet-<id>.bundle` / `/tmp/fleet-sync-<ts>.bundle`, and the cleanup
+ * glob `rm -f /tmp/fleet-*.bundle` deleted other users' files in the
+ * world-writable tmp. Bundles now stage as `stage.bundle` inside
+ * `bundle-<id>/` under the node's private state dir (its `FLEET_STATE_DIR`,
+ * default `~/.openclaw/fleet/state`), created 0700 by the requesting run and
+ * removed by exactly that run. See stageBundleDirCommand /
+ * cleanBundleStageCommand in provision.ts for the node-side shell half.
+ */
+export function bundleStageLayout(id: string): { dirName: string; fileName: string } {
+  const safe = seg("transferId", id);
+  return { dirName: `${BUNDLE_STAGE_PREFIX}${safe}`, fileName: "stage.bundle" };
+}
+
 /** Write a file privately and atomically (temp + rename within the private dir). */
 export async function writePrivate(path: string, data: string | Buffer, mode = 0o600): Promise<void> {
   const tmp = `${path}.${process.pid}.tmp`;

@@ -1982,19 +1982,29 @@ export default definePluginEntry({
     api.registerTool({
       name: "fleet_abort",
       label: "Fleet Abort",
-      description: "Abort a running OpenCode session on a fleet node.",
+      description: "Abort a detached OpenCode/Pi run on a fleet node by its runId: terminates the recorded run engine-independently (works for Pi and opencode) and reports confirmed termination.",
       parameters: {
         type: "object",
         additionalProperties: false,
         properties: {
           node: { type: "string", description: "Node display name or id." },
-          sessionId: { type: "string", description: "Optional session id to abort." },
-          runId: { type: "string", description: "Optional runId (from fleet_dispatch). When given, terminates the recorded run engine-independently (works for Pi and opencode) and reports confirmed termination." },
+          sessionId: { type: "string", description: "Optional session id, recorded on the node result only — aborts are no longer addressable by sessionId alone." },
+          runId: { type: "string", description: "REQUIRED runId (from fleet_dispatch). Terminates the recorded run engine-independently (works for Pi and opencode) and reports confirmed termination." },
         },
-        required: ["node"],
+        required: ["node", "runId"],
       },
       execute: async (toolCallId, params, signal) => {
         const p = params as { node: string; sessionId?: string; runId?: string };
+        // Issue #63: aborts are run-addressed. A sessionId-only abort used to
+        // trigger a node-wide pkill of every opencode/pi process on the node;
+        // the node refuses that now, so fail fast here with a clear tool
+        // error instead of ever degrading to a silent pkill.
+        if (!p.runId) {
+          return jsonResult({
+            ok: false,
+            error: "runId required: fleet_abort terminates a specific recorded run (take the runId from an async fleet_dispatch). Abort-by-sessionId is refused — it used to pkill every opencode/pi process on the node.",
+          });
+        }
         const list = await api.runtime.nodes.list();
         const node = (list.nodes ?? []).find((n) => n.displayName === p.node || n.nodeId === p.node);
         if (!node) return jsonResult(`Node "${p.node}" not found.`);

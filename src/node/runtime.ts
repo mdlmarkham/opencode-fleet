@@ -212,9 +212,60 @@ export async function runShellDetailed(
 
 
 /**
+ * Issue #63: identity check for a recorded run pid before any signal is sent.
+ *
+ * The detached launcher (detachedLaunchCommand) records the pid of the
+ * `setsid nohup /bin/bash <run script>` chain, so the live process's cmdline
+ * always carries the run's script file name. Matching that marker:
+ *   - live + matched  → verified (`live`);
+ *   - nothing running at that pid (exited and NOT recycled — a recycled pid
+ *     would be visible again) or an unreaped zombie (empty cmdline) → `gone`:
+ *     nothing at that pid is signalable, and the process-group check in
+ *     abortRunById still covers orphaned children of the run;
+ *   - anything else (live with a foreign cmdline = a REUSED pid, an unreadable
+ *     /proc entry, a platform without /proc) → refused: never kill.
+ */
+export type PidIdentity =
+  | { ok: true; kind: "live" | "gone" }
+  | { ok: false; error: string };
+
+export async function verifyRunPidIdentity(pid: number, scriptPath: string): Promise<PidIdentity> {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return { ok: false, error: `invalid recorded pid ${String(pid)} — refusing to kill an unverifiable target` };
+  }
+  const marker = scriptPath.split(/[\\/]/).filter(Boolean).pop() || scriptPath;
+  let cmdline = "";
+  try {
+    cmdline = (await (await import("node:fs/promises")).readFile(join("/proc", String(pid), "cmdline"), "utf8"))
+      .replace(/\0/g, " ");
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (process.platform !== "win32" && (code === "ENOENT" || code === "ESRCH")) {
+      return { ok: true, kind: "gone" };
+    }
+    return {
+      ok: false,
+      error: `cannot verify pid ${pid} belongs to this run (identity unreadable: ${(e as Error).message}) — refusing to kill`,
+    };
+  }
+  // An empty cmdline means the process is a zombie (already dead, awaiting
+  // reaping) or a kernel thread: nothing of it is signalable at that pid.
+  if (!cmdline.trim()) return { ok: true, kind: "gone" };
+  if (cmdline.includes(marker)) return { ok: true, kind: "live" };
+  return {
+    ok: false,
+    error: `recorded pid ${pid} is alive but is NOT this run's process (its cmdline does not mention ${marker}) — refusing to kill a possibly recycled pid`,
+  };
+}
+
+/**
  * Engine-independent termination of a recorded run (issue #30 findings H).
  * Reads the recorded pid and kills its process group (covers Pi AND opencode),
  * waiting until the group is actually gone before reporting success.
+ *
+ * Issue #63: the pid is verified to STILL be this run's process (cmdline
+ * marker, see verifyRunPidIdentity) before any signal is sent, so a killed
+ * run's recycled pid can never take an innocent process group with it.
  */
 export async function abortRunById(
   runId: string,
@@ -229,6 +280,13 @@ export async function abortRunById(
   }
   if (!pid) {
     return { ok: false, aborted: false, error: "no recorded run state/pid — cannot terminate engine-independently" };
+  }
+  // Issue #63: never `kill -- -<pid>` an unverified target. If the run's
+  // process exited and the pid was recycled, the old code killed whatever
+  // unrelated process (and process group) had inherited the number.
+  const identity = await verifyRunPidIdentity(pid, runScriptPath(runId));
+  if (!identity.ok) {
+    return { ok: false, aborted: false, pid, error: identity.error };
   }
   const out = await runShell(
     `kill -TERM -- -${pid} 2>/dev/null; sleep 1; ` +

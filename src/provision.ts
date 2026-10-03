@@ -23,6 +23,7 @@ import { join } from "node:path";
 import { shq } from "./shell.js";
 import { SSH_ARGS, scpPrefix, scpRemote, sshPrefix } from "./ssh.js";
 import { checkSetup } from "./policy.js";
+import { bundleStageLayout, BUNDLE_STAGE_PREFIX } from "./paths.js";
 import { evaluateChange, isSafeBranchName, resolveDestination, resolvePolicy, type SyncPolicy } from "./syncpolicy.js";
 
 const execFileP = promisify(execFile);
@@ -146,14 +147,89 @@ export async function cleanupBundle(bundlePath: string): Promise<void> {
 }
 
 /**
- * Manager-side: run git GC on a node checkout and remove stale bundles to
- * keep the worker tidy and avoid bloat.
+ * Issue #63 — per-run PRIVATE bundle staging over SSH.
+ *
+ * Bundles used to ship at a public path in the world-writable tmp (under
+ * `fleet-<id>.bundle` / `fleet-sync-<ts>.bundle` names) and were cleaned with
+ * a `rm -f <tmp>/fleet-*.bundle` glob — which deleted OTHER users' staging
+ * files in the shared tmp. They now stage inside one 0700 per-run directory
+ * under the node's private state dir and every cleanup removes exactly that
+ * dir.
+ */
+
+/**
+ * SSH command that creates THIS run's private stage dir (0700) under the
+ * node's private state dir and prints the resolved absolute path. The
+ * resolution happens ON THE NODE (it honors the node's FLEET_STATE_DIR,
+ * falling back to the same per-user default paths.ts uses), because scp
+ * cannot expand remote env vars itself — the manager pins the concrete path
+ * it prints and reuses it for the scp transfer, unpack and cleanup.
+ */
+export function stageBundleDirCommand(bundleId: string): string {
+  const { dirName } = bundleStageLayout(bundleId);
+  return [
+    `STATE="\${FLEET_STATE_DIR:-}"`,
+    `[ -z "$STATE" ] && STATE="$HOME/.openclaw/fleet/state"`,
+    `umask 077`,
+    `d="$STATE/${dirName}"`,
+    `mkdir -p "$d" && chmod 700 "$d" && printf '%s\\n' "$d"`,
+  ].join("; ");
+}
+
+/**
+ * Extract the node's resolved stage dir from the mkdir command's stdout and
+ * refuse anything that is not exactly this run's expected dir name — the
+ * cleanup must only ever target the dir this run created (issue #63).
+ */
+export function resolveStageDir(bundleId: string, stdout: string): string {
+  const dir = stdout.trim().split("\n").filter(Boolean).pop() ?? "";
+  const expected = bundleStageLayout(bundleId).dirName;
+  if (!dir.startsWith("/") || dir.split("/").filter(Boolean).pop() !== expected) {
+    throw new Error(`node returned an unexpected bundle stage dir: ${JSON.stringify(dir)} (expected .../${expected})`);
+  }
+  return dir;
+}
+
+/**
+ * SSH command that removes ONLY this run's stage dir (issue #63). The path is
+ * cross-checked against the expected per-run dir name, so a garbled or
+ * malicious resolution prints a refusal instead of widening the deletion.
+ */
+export function cleanBundleStageCommand(bundleId: string, resolvedDir: string): string {
+  const expected = bundleStageLayout(bundleId).dirName;
+  const base = resolvedDir.split("/").filter(Boolean).pop() ?? "";
+  if (!resolvedDir.startsWith("/") || base !== expected) {
+    return `printf 'fleet: refusing to clean an unexpected stage dir: %s\\n' ${shq(resolvedDir)}`;
+  }
+  return `rm -rf ${shq(resolvedDir)}`;
+}
+
+/**
+ * Stale-fragment GC for fleet_cleanup (issue #63): only per-run stage dirs
+ * inside the node's PRIVATE state dir (per-user, 0700 — never /tmp, never
+ * other users' files), and only dirs idle for a day+ so an in-flight run is
+ * never pulled out from under itself.
+ */
+export function bundleStageSweepCommand(maxAgeDays = 1): string {
+  const glob = `${BUNDLE_STAGE_PREFIX}*`;
+  return [
+    `STATE="\${FLEET_STATE_DIR:-}"`,
+    `[ -z "$STATE" ] && STATE="$HOME/.openclaw/fleet/state"`,
+    `find "$STATE" -maxdepth 1 -type d -name ${shq(glob)} -mtime +${maxAgeDays} -exec rm -rf -- {} + 2>/dev/null || true`,
+  ].join("; ");
+}
+
+/**
+ * Manager-side: run git GC on a node checkout and remove the fleet's stale
+ * private staging dirs to keep the worker tidy and avoid bloat.
  */
 export async function cleanupNode(nodeHost: string, cwd?: string): Promise<{ ok: boolean; detail?: string; error?: string }> {
   try {
     const cmds = [
-      // Remove any leftover fleet bundles.
-      `rm -f /tmp/fleet-*.bundle`,
+      // Issue #63: GC stale per-run PRIVATE stage dirs. Bundles no longer
+      // live in the world-writable tmp at all — the old fleet-*.bundle glob
+      // cleanup also deleted other users' files.
+      bundleStageSweepCommand(),
       // GC the checkout if provided (light GC; aggressive is too slow).
       cwd ? `cd ${shq(cwd)} && git gc --prune=now 2>/dev/null` : "",
       // Report disk usage of the checkout.
@@ -191,9 +267,15 @@ export async function provisionToNode(
   opts?: { sshAvailable?: boolean },
 ): Promise<ProvisionResult> {
   const transferId = `${Date.now()}`;
-  const remoteBundle = `/tmp/fleet-${transferId}.bundle`;
   let shippedViaChannel = false;
   let bundleSha256: string | undefined;
+  // Issue #63: the bundle ships into a per-run PRIVATE dir on the node
+  // (0700, under its FLEET_STATE_DIR / ~/.openclaw/fleet/state), not a public
+  // path in the tmp. The path is resolved on the node (scp cannot expand
+  // remote env vars) and removed again in the finally below — exactly this
+  // dir, nothing else.
+  let remoteStageDir = "";
+  let remoteBundle = "";
   try {
     // Ship the bundle via SSH when available; fall back to the node channel
     // (chunked base64 through opencode.run) when SSH is not reachable.
@@ -204,6 +286,16 @@ export async function provisionToNode(
         if (!channelInvoke) throw new Error("ssh unavailable and no channel invoke provided");
         throw new Error("use-channel"); // routed below via catch
       }
+      // Create this run's private stage dir BEFORE shipping into it, then pin
+      // the concrete path for scp / unpack / cleanup (no remote env expansion
+      // inside scp).
+      const { stdout: dirOut } = await execFileP(
+        "ssh",
+        [...sshPrefix(nodeHost, SSH_ARGS), stageBundleDirCommand(transferId)],
+        { timeout: 30_000 },
+      );
+      remoteStageDir = resolveStageDir(transferId, dirOut);
+      remoteBundle = join(remoteStageDir, bundleStageLayout(transferId).fileName);
       await execFileP("scp", [...scpPrefix(), bundlePath, scpRemote(nodeHost, remoteBundle)], {
         timeout: 120_000,
       });
@@ -339,20 +431,28 @@ export async function provisionToNode(
   } catch (err) {
     return { ok: false, error: (err as Error).message };
   } finally {
-    // Always remove the remote bundle, even on failure, to avoid bloat.
+    // Always remove the remote staging, even on failure, to avoid bloat.
+    // Issue #63: the channel path still cleans its own private channel staging;
+    // over SSH we remove EXACTLY this run's private stage dir — no wildcard,
+    // no other user's/run's files (the old /tmp glob cleanup was not ours to run).
     try {
       if (shippedViaChannel && channelInvoke) {
         await channelInvoke(
           { prompt: "__RECEIVE_CLEAN__", cwd: "/", transport: "http", transferId },
           30_000,
         );
-      } else {
-        await execFileP("ssh", [...sshPrefix(nodeHost, SSH_ARGS), `rm -f "${remoteBundle}"`], {
-          timeout: 30_000,
-        });
       }
     } catch {
       // Best-effort cleanup.
+    }
+    if (remoteStageDir) {
+      try {
+        await execFileP("ssh", [...sshPrefix(nodeHost, SSH_ARGS), cleanBundleStageCommand(transferId, remoteStageDir)], {
+          timeout: 30_000,
+        });
+      } catch {
+        // Best-effort cleanup.
+      }
     }
   }
 }
@@ -417,6 +517,10 @@ export async function syncFromNode(
     pinnedDest ?? (workerBranch && workerBranch !== branch ? workerBranch : branch);
 
   const work = await mkdtemp(join(tmpdir(), "fleet-sync-"));
+  // Issue #63: per-run PRIVATE stage dir on the node for the SSH sync path;
+  // declared up here so every exit path removes exactly what this run created.
+  const stageId = `sync-${Date.now()}`;
+  let remoteStageDir = "";
   try {
     if (prebuilt?.mode === "from-base64") {
       // SSH-free path: the manager already holds the worker's bundle as base64.
@@ -647,7 +751,16 @@ export async function syncFromNode(
     }
 
     // Step 3: worker creates a bundle of its current state.
-    const remoteBundle = `/tmp/fleet-sync-${Date.now()}.bundle`;
+    // Issue #63: staged in a per-run PRIVATE dir on the node (0700, under its
+    // FLEET_STATE_DIR / ~/.openclaw/fleet/state), not the public /tmp —
+    // resolved on the node since scp cannot expand remote env vars.
+    const { stdout: stageOut } = await execFileP(
+      "ssh",
+      [...sshPrefix(nodeHost, SSH_ARGS), stageBundleDirCommand(stageId)],
+      { timeout: 30_000 },
+    );
+    remoteStageDir = resolveStageDir(stageId, stageOut);
+    const remoteBundle = join(remoteStageDir, bundleStageLayout(stageId).fileName);
     const workerCmd = `cd ${shq(cwd)} && git bundle create ${shq(remoteBundle)} --all 2>/dev/null; echo "BUNDLE_READY"`;
     await execFileP("ssh", [...sshPrefix(nodeHost, SSH_ARGS), workerCmd], {
       timeout: 120_000,
@@ -687,7 +800,7 @@ export async function syncFromNode(
     }
     catch {
       // Clean up the remote bundle before failing closed.
-      await execFileP("ssh", [...sshPrefix(nodeHost, SSH_ARGS), `rm -f ${shq(remoteBundle)}`], { timeout: 30_000 });
+      await execFileP("ssh", [...sshPrefix(nodeHost, SSH_ARGS), cleanBundleStageCommand(stageId, remoteStageDir)], { timeout: 30_000 });
       return {
         ok: false,
         cwd,
@@ -706,7 +819,7 @@ export async function syncFromNode(
     {
       const applied = await applyPolicy(cloneDir, workerBranch, destBranch, bundleRef, branch);
       if ("refused" in applied) {
-        await execFileP("ssh", [...sshPrefix(nodeHost, SSH_ARGS), `rm -f ${shq(remoteBundle)}`], { timeout: 30_000 }).catch(() => {});
+        await execFileP("ssh", [...sshPrefix(nodeHost, SSH_ARGS), cleanBundleStageCommand(stageId, remoteStageDir)], { timeout: 30_000 }).catch(() => {});
         return applied.refused;
       }
       destBranch = applied.dest;
@@ -771,8 +884,8 @@ export async function syncFromNode(
     const movedRemote = priorHead !== "" && priorHead !== postHead.trim();
     const hasNewWork = bundleTip.trim() !== baseTip.trim();
 
-    // Clean up the remote bundle.
-    await execFileP("ssh", [...sshPrefix(nodeHost, SSH_ARGS), `rm -f ${shq(remoteBundle)}`], {
+    // Clean up the remote bundle (issue #63: exactly this run's private stage dir).
+    await execFileP("ssh", [...sshPrefix(nodeHost, SSH_ARGS), cleanBundleStageCommand(stageId, remoteStageDir)], {
       timeout: 30_000,
     });
 
@@ -805,5 +918,13 @@ export async function syncFromNode(
     return { ok: false, error: (err as Error).message };
   } finally {
     await rm(work, { recursive: true, force: true });
+    // Issue #63: remove ONLY what this run created — the exact private stage
+    // dir, on every exit path (the old code leaked the /tmp bundle on push
+    // rejections and throws).
+    if (remoteStageDir) {
+      await execFileP("ssh", [...sshPrefix(nodeHost, SSH_ARGS), cleanBundleStageCommand(stageId, remoteStageDir)], {
+        timeout: 30_000,
+      }).catch(() => {});
+    }
   }
 }
