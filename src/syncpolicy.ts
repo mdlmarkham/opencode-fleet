@@ -75,6 +75,10 @@ export function resolveDestination(
 ): Destination {
   const isProtected = policy.protectedBranches.includes(requested);
   if (!isProtected || policy.allowDirectPush.includes(requested)) return { branch: requested };
+  // Issue #68: the seed is the WORKER's branch. When that already lives under
+  // `fleet/` we publish it AS-IS (just normalized) instead of re-prefixing
+  // (otherwise `fleet/verify-gate` became `fleet/fleet/verify-gate`). Only an
+  // empty/unusable seed falls back to the label.
   const seed = workerBranch && !policy.protectedBranches.includes(workerBranch) ? workerBranch : label;
   const safe = seed
     .replace(/[^A-Za-z0-9._/-]/g, "-")
@@ -86,9 +90,21 @@ export function resolveDestination(
   // The redirect target must itself be unprotected (an operator may list
   // fleet/* names), unless that exact name is explicitly allowed.
   const open = (b: string) => !policy.protectedBranches.includes(b) || policy.allowDirectPush.includes(b);
-  const candidates = [`fleet/${safe || label}`, `fleet/sync/${safe || label}`, `fleet/redirect/${label}`].map((b) => b.replace(/\.lock$/, "-lock"));
+  // Issue #68: if the worker branch is already `fleet/<...>`, keep that name (no
+  // re-prefix); otherwise place it under `fleet/`. Candidates are tried in order.
+  const candidates = (
+    safe.startsWith("fleet/") && safe.length > "fleet/".length
+      ? [safe, `fleet/fleet/${safe}`, `fleet/sync/${safe}`, `fleet/redirect/${label}`]
+      : [`fleet/${safe || label}`, `fleet/sync/${safe || label}`, `fleet/redirect/${label}`]
+  ).map((b) => b.replace(/\.lock$/, "-lock")).filter((b) => isSafeBranchName(b));
   const branch = candidates.find(open);
-  if (!branch) return { branch: `fleet/redirect/${label}-${Date.now()}`, redirectedFrom: requested };
+  if (!branch) {
+    // No safe, unprotected candidate (e.g. an empty label with an empty seed).
+    // Fall back to a guaranteed-safe unique ref rather than returning a bare
+    // "fleet/" (an invalid ref) — issue #68 F3.
+    const fallback = `fleet/redirect/${label || "sync"}-${Date.now()}`;
+    return { branch: isSafeBranchName(fallback) ? fallback : `fleet/redirect/sync-${Date.now()}`, redirectedFrom: requested };
+  }
   return { branch, redirectedFrom: requested };
 }
 
