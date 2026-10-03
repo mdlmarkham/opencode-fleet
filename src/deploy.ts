@@ -125,11 +125,17 @@ export async function deployPlugin(req: DeployRequest): Promise<DeployResult> {
       const serviceUser = req.nodeUsers?.[host];
       const loginUser = req.nodeLoginUsers?.[host];
       const sshHost = loginUser ? `${loginUser}@${host}` : host;
-      if (!loginUser || loginUser === "root") {
+      if (loginUser === "root") {
         add(
           `ssh-user-${host}`,
           true,
           "WARNING: managing this node over SSH as root. Prefer an unprivileged login user (nodes[].user) with a narrow sudoers entry; see README 'SSH access'.",
+        );
+      } else if (!loginUser) {
+        add(
+          `ssh-user-${host}`,
+          true,
+          "note: no nodes[].user set, so SSH uses its default login user (often root). Set nodes[].user to an unprivileged account; see README 'SSH access'.",
         );
       }
       const tarballName = tarball.split("/").pop() ?? "";
@@ -204,20 +210,6 @@ export async function deployPlugin(req: DeployRequest): Promise<DeployResult> {
         );
         const stage = stageOut.match(/FLEET_STAGE=(\/tmp\/fleet-deploy\.[A-Za-z0-9]+)\s*$/m)?.[1];
         if (!stage) throw new Error(`could not create a private staging directory on the node: ${stageOut.trim().slice(0, 200)}`);
-        await execFileP("scp", [...scpPrefix(), tarball, scpRemote(sshHost, `${stage}/${tarballName}`)], {
-          timeout: 120_000,
-        });
-        const { stdout: remoteShaOut } = await execFileP(
-          "ssh",
-          [...sshPrefix(sshHost, SSH_ARGS), `chmod 644 -- ${shq(`${stage}/${tarballName}`)} && sha256sum -- ${shq(`${stage}/${tarballName}`)} | cut -d' ' -f1`],
-          { timeout: 30_000 },
-        );
-        const remoteSha = remoteShaOut.trim().split("\n").pop()?.trim() ?? "";
-        if (remoteSha !== tarballSha) {
-          await execFileP("ssh", [...sshPrefix(sshHost, SSH_ARGS), `rm -rf -- ${shq(stage)}`], { timeout: 30_000 }).catch(() => {});
-          throw new Error(`tarball checksum mismatch on the node (expected ${tarballSha.slice(0, 12)}, got ${remoteSha.slice(0, 12) || "none"}); refusing to install`);
-        }
-
         // Issue #18 defect 1: install as the SERVICE principal, not the SSH
         // login user. When the caller names one, install into that user's
         // environment; otherwise fall back to the login user's environment and
@@ -234,8 +226,24 @@ export async function deployPlugin(req: DeployRequest): Promise<DeployResult> {
         const installCmd = serviceUser
           ? `sudo -n -u ${shq(serviceUser)} -H bash -c ${shq(installInner)}`
           : installInner;
+        // Upload, verify and install in one try/finally so the private staging
+        // directory is removed on EVERY failure after it was created.
         let installOut: string;
         try {
+          await execFileP("scp", [...scpPrefix(), tarball, scpRemote(sshHost, `${stage}/${tarballName}`)], {
+            timeout: 120_000,
+          });
+          const { stdout: remoteShaOut } = await execFileP(
+            "ssh",
+            [...sshPrefix(sshHost, SSH_ARGS), `chmod 644 -- ${shq(`${stage}/${tarballName}`)} && sha256sum -- ${shq(`${stage}/${tarballName}`)} | cut -d' ' -f1`],
+            { timeout: 30_000 },
+          );
+          const remoteSha = remoteShaOut.trim().split("\n").pop()?.trim() ?? "";
+          if (remoteSha !== tarballSha) {
+            throw new Error(`tarball checksum mismatch on the node (expected ${tarballSha.slice(0, 12)}, got ${remoteSha.slice(0, 12) || "none"}); refusing to install`);
+          }
+
+
           ({ stdout: installOut } = await execFileP(
             "ssh",
             [...sshPrefix(sshHost, SSH_ARGS), installCmd],

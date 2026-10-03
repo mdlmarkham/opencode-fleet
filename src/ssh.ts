@@ -59,5 +59,11 @@ export function scpPrefix(base: readonly string[] = SSH_ARGS): string[] {
 
 /** A `host:path` scp operand with the host validated. */
 export function scpRemote(host: unknown, path: string): string {
-  return `${assertSafeHost(host)}:${path}`;
+  const h = assertSafeHost(host);
+  // scp splits host from path at the first colon, so an IPv6 literal must be
+  // bracketed (keeping any `user@` outside the brackets).
+  const at = h.lastIndexOf("@");
+  const user = at >= 0 ? h.slice(0, at + 1) : "";
+  const bare = at >= 0 ? h.slice(at + 1) : h;
+  return `${user}${bare.includes(":") ? `[${bare}]` : bare}:${path}`;
 }

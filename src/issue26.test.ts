@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { buildOpenCodeCommand } from "./opencode.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -8,7 +9,7 @@ import {
   cwdGuardScript,
   cwdCheckCommand,
   evaluateCwdCheck,
-  FLEET_ROOT,
+  resolveFleetRoot,
 } from "./cwd.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -25,16 +26,17 @@ const index = readFileSync(join(here, "index.ts"), "utf8");
  */
 describe("issue #26: default cwd lands in a shared workspace", () => {
   it("defaults under the shared fleet root, not /root", () => {
-    const cwd = defaultFleetCwd("git@github.com:mdlmarkham/ohm.git");
-    expect(cwd.startsWith(FLEET_ROOT)).toBe(true);
+    const root = "/home/svcuser/fleet";
+    const cwd = defaultFleetCwd("git@github.com:mdlmarkham/ohm.git", root);
+    expect(cwd.startsWith(root)).toBe(true);
     expect(cwd).toBe("/home/svcuser/fleet/ohm");
     expect(cwd.startsWith("/root")).toBe(false);
   });
 
   it("sanitizes the repo name", () => {
-    expect(defaultFleetCwd("https://example.com/org/my repo!")).toBe("/home/svcuser/fleet/my-repo-");
-    expect(defaultFleetCwd("simple")).toBe("/home/svcuser/fleet/simple");
-    expect(defaultFleetCwd("a/b/c/deep.git")).toBe("/home/svcuser/fleet/deep");
+    expect(defaultFleetCwd("https://example.com/org/my repo!", "/home/svcuser/fleet")).toBe("/home/svcuser/fleet/my-repo-");
+    expect(defaultFleetCwd("simple", "/home/svcuser/fleet")).toBe("/home/svcuser/fleet/simple");
+    expect(defaultFleetCwd("a/b/c/deep.git", "/home/svcuser/fleet")).toBe("/home/svcuser/fleet/deep");
   });
 
   it("handles a trailing slash on the root without doubling", () => {
@@ -125,6 +127,57 @@ describe("issue #26: dispatch wiring", () => {
   });
 
   it("provision defaults its cwd when the caller omits it", () => {
-    expect(index).toContain("const targetCwd = p.cwd ?? defaultFleetCwd(p.repo)");
+    expect(index).toContain("const targetCwd = p.cwd ?? (fleetRoot ? defaultFleetCwd(p.repo, fleetRoot) : undefined)");
+  });
+});
+
+describe("issue #44: fleet root is configuration, not a constant", () => {
+  it("explicit fleetRoot wins", () => {
+    expect(resolveFleetRoot({ fleetRoot: " /srv/work " }, ["a", "b"])).toBe("/srv/work");
+  });
+  it("derives /home/<user>/fleet only when every target shares one non-root service user", () => {
+    expect(resolveFleetRoot({}, ["svc", "svc"])).toBe("/home/svc/fleet");
+    expect(resolveFleetRoot({}, ["svc", "other"])).toBeUndefined();
+    expect(resolveFleetRoot({}, ["svc", undefined])).toBeUndefined();
+    expect(resolveFleetRoot({}, ["root"])).toBeUndefined();
+    expect(resolveFleetRoot({}, [])).toBeUndefined();
+  });
+});
+
+describe("issue #44: no deployment-specific literals in shipped code", () => {
+  const read = (f: string) => readFileSync(join(here, f), "utf8");
+  it("the tailnet catalog host, Pi model and fleet root are not hardcoded", () => {
+    for (const f of ["index.ts", "opencode.ts", "cwd.ts", "guard.ts", "membership.ts"]) {
+      const src = read(f);
+      expect(src, f).not.toContain("tailf9480");
+      expect(src, f).not.toContain("aperture/glm-5.3-flash:cloud\";");
+      expect(src, f).not.toMatch(/"\/home\/svcuser\/fleet"/);
+    }
+  });
+  it("apertureUrl has no default in either config schema", () => {
+    expect(read("index.ts")).not.toMatch(/apertureUrl: \{[^}]*\n\s+default:/);
+    expect(readFileSync(join(here, "..", "openclaw.plugin.json"), "utf8")).not.toContain("tailf9480");
+  });
+});
+
+describe("issue #44: review follow-ups", () => {
+  it("fleetRoot must be an absolute, non-root, '..'-free path", () => {
+    for (const bad of ["fleet", "./fleet", "relative/path", "/", "//", "/a/../b", "/a\nb"]) {
+      expect(() => resolveFleetRoot({ fleetRoot: bad }, []), bad).toThrow(/invalid fleetRoot/);
+    }
+    expect(resolveFleetRoot({ fleetRoot: "/srv/fleet/" }, [])).toBe("/srv/fleet");
+  });
+  it("a derived root needs a plausible username (no path tricks via serviceUser)", () => {
+    expect(resolveFleetRoot({}, ["../etc"])).toBeUndefined();
+    expect(resolveFleetRoot({}, ["a b"])).toBeUndefined();
+    expect(resolveFleetRoot({}, ["svc.user-1"])).toBe("/home/svc.user-1/fleet");
+  });
+  it("a whitespace-only piModel is treated as missing everywhere", () => {
+    expect(() => buildOpenCodeCommand({ prompt: "x", cwd: "/w", transport: "http", harness: "pi", piModel: "   " })).toThrow(/requires piModel/);
+    expect(index).toContain('const clean = (v?: string) => v?.trim() || undefined;');
+    expect(index).toMatch(/clean\(p\.piModel\) \?\? clean\(cfg\.piDefaultModel\)/);
+  });
+  it("provisioning derives the root from serviceUser falling back to user", () => {
+    expect(index).toContain("m?.serviceUser ?? m?.user");
   });
 });

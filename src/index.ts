@@ -54,6 +54,10 @@ interface FleetConfig {
   nodePrefixes?: string[];
   defaultTimeoutMs?: number;
   apertureUrl?: string;
+  /** Shared workspace root on nodes (default: /home/<serviceUser>/fleet when all targets share one service user). */
+  fleetRoot?: string;
+  /** Pi model ref (provider/id) used when harness=pi and the dispatch names none. No built-in default. */
+  piDefaultModel?: string;
   /** Operator switch: let agents pass `autoApprove` on dispatch (default true). */
   allowAutoApprove?: boolean;
   /** Operator switch: let fleet_provision `setup` be an arbitrary shell command, not just a repo script (default false). */
@@ -84,8 +88,8 @@ export default definePluginEntry({
       nodePrefixes: {
         type: "array",
         items: { type: "string" },
-        default: ["dev"],
-        description: "Node display-name prefixes considered fleet members.",
+        default: [],
+        description: "Node display-name prefixes considered fleet members (fallback when `nodes` is not configured). Empty by default.",
       },
       defaultTimeoutMs: {
         type: "number",
@@ -137,8 +141,15 @@ export default definePluginEntry({
       },
       apertureUrl: {
         type: "string",
-        default: "https://ai.tailf9480.ts.net/v1/models",
-        description: "Aperture gateway model catalog URL.",
+        description: "Model catalog URL (OpenAI-style /v1/models). No default: fleet_models and live model resolution are unavailable until set.",
+      },
+      fleetRoot: {
+        type: "string",
+        description: "Shared workspace root on nodes, used as the default provisioning cwd. Default: /home/<serviceUser>/fleet when every target node names the same service user.",
+      },
+      piDefaultModel: {
+        type: "string",
+        description: "Pi model ref (provider/id) used when harness=pi and the dispatch names no piModel. No built-in default.",
       },
     },
   }),
@@ -597,7 +608,7 @@ export default definePluginEntry({
           node: { type: "string", description: "Singular alias for nodes: [node]. Convenience for single-node dispatch." },
           transport: { type: "string", enum: ["http", "acp"], description: "OpenCode transport." },
           harness: { type: "string", enum: ["opencode", "pi"], description: "Worker engine harness." },
-          piModel: { type: "string", description: "Pi model override (harness=pi); `provider/id` ref, e.g. aperture/glm-5.3-flash:cloud." },
+          piModel: { type: "string", description: "Pi model override (harness=pi); `provider/id` ref, e.g. myprovider/some-model. Falls back to the operator's piDefaultModel config." },
           model: { type: "string", description: "Optional model override (must exist on node)." },
           agent: { type: "string", description: "Optional OpenCode agent (build/plan)." },
           autoApprove: { type: "boolean", description: "Opt-in: append --auto to `opencode run` to auto-approve all non-denied permissions for this run. Default false — this widens the trust posture." },
@@ -688,6 +699,13 @@ export default definePluginEntry({
         // is invoked (the node handler re-checks with the same helper).
         const harnessCheck = validateHarnessTransport({ harness: p.harness, transport });
         if (!harnessCheck.ok) return jsonResult({ ok: false, harness: harnessCheck.harness, error: harnessCheck.error });
+        // No built-in Pi model: a dispatch must name one, or the operator must configure a default.
+        // Whitespace-only counts as missing, so a blank per-call value falls back to the configured default.
+        const clean = (v?: string) => v?.trim() || undefined;
+        const piModel = p.harness === "pi" ? (clean(p.piModel) ?? clean(cfg.piDefaultModel)) : clean(p.piModel);
+        if (p.harness === "pi" && !piModel) {
+          return jsonResult({ ok: false, harness: "pi", error: "harness=pi needs a model: pass piModel (provider/id) or set piDefaultModel in the plugin config" });
+        }
         // Issue #34: refuse (never silently drop) env names that execute code or
         // redirect config, and honor the operator's autoApprove ceiling.
         const envPartition = partitionEnv(p.env, cfg.env);
@@ -716,7 +734,7 @@ export default definePluginEntry({
         // A /root path is unreachable by a non-root service user, so the run
         // cannot start — refuse with an actionable error instead of sending it
         // and discovering the failure later (or, pre-#22, reporting success).
-        const { cwdCheckCommand, evaluateCwdCheck, looksWorkerInaccessible, defaultFleetCwd } = await import("./cwd.js");
+        const { cwdCheckCommand, evaluateCwdCheck, looksWorkerInaccessible, defaultFleetCwd, resolveFleetRoot } = await import("./cwd.js");
         const { SSH_ARGS } = await import("./ssh.js");
         const { execFile: execFileCb } = await import("node:child_process");
         const { promisify: promisifyCb } = await import("node:util");
@@ -739,13 +757,15 @@ export default definePluginEntry({
             ?? (node as { member?: { user?: string } }).member?.user;
           const loginUser = (node as { member?: { user?: string } }).member?.user;
           const sshHost = loginUser ? `${loginUser}@${nodeKey}` : nodeKey;
+          let exampleRoot: string | undefined;
+          try { exampleRoot = resolveFleetRoot(cfg, [svcUser]); } catch { /* a bad fleetRoot is reported by provisioning */ }
           if (looksWorkerInaccessible(p.cwd, svcUser)) {
             results[nodeKey] = {
               ok: false,
               error:
                 `refusing to dispatch: cwd ${p.cwd} is unusable — it is not traversable by the worker principal` +
                 `${svcUser ? ` (${svcUser})` : ""} (a /root path is mode 0700 and cannot be entered by a non-root service user). ` +
-                `Provision/dispatch under a workspace both principals share, e.g. ${defaultFleetCwd("your-repo")}.`,
+                `Provision/dispatch under a workspace both principals share${exampleRoot ? `, e.g. ${defaultFleetCwd("your-repo", exampleRoot)}` : ""}.`,
             };
             continue;
           }
@@ -760,7 +780,7 @@ export default definePluginEntry({
             cwd: p.cwd,
             transport,
             harness: p.harness,
-            piModel: p.piModel,
+            piModel,
             model: p.model,
             agent: p.agent,
             autoApprove: p.autoApprove === true,
@@ -781,7 +801,7 @@ export default definePluginEntry({
             model: p.model,
             transport,
             harness: p.harness,
-            piModel: p.piModel,
+            piModel,
             startedAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),
             state: "running" as const,
@@ -1566,8 +1586,7 @@ export default definePluginEntry({
         if (!setupCheck.ok) return jsonResult({ ok: false, error: setupCheck.error });
         // Issue #26: default the landing path to a workspace the worker
         // principal can actually enter, instead of a /root path it cannot.
-        const { defaultFleetCwd } = await import("./cwd.js");
-        const targetCwd = p.cwd ?? defaultFleetCwd(p.repo);
+        const { defaultFleetCwd, resolveFleetRoot } = await import("./cwd.js");
 
         // Resolve target nodes.
         const list = await api.runtime.nodes.list();
@@ -1577,7 +1596,21 @@ export default definePluginEntry({
           ? fleet.filter((n) => p.nodes!.includes(n.displayName ?? n.nodeId) || p.nodes!.includes(n.nodeId))
           : fleet;
         if (!targets.length) {
-          return jsonResult(`No fleet nodes found. Paired nodes: ${nodes.map((n) => n.displayName ?? n.nodeId).join(", ") || "none"}`);
+          return jsonResult(`No fleet nodes found. Paired nodes: ${nodes.map((n) => n.displayName ?? n.nodeId).join(", ") || "none"}. Configure \`nodes\` (or \`nodePrefixes\`) in the plugin config.`);
+        }
+        // The worker principal is serviceUser, defaulting to the login user (same rule as dispatch/deploy).
+        let fleetRoot: string | undefined;
+        try {
+          fleetRoot = resolveFleetRoot(cfg, targets.map((n) => {
+            const m = (n as { member?: { serviceUser?: string; user?: string } }).member;
+            return m?.serviceUser ?? m?.user;
+          }));
+        } catch (e) {
+          return jsonResult({ ok: false, error: (e as Error).message });
+        }
+        const targetCwd = p.cwd ?? (fleetRoot ? defaultFleetCwd(p.repo, fleetRoot) : undefined);
+        if (!targetCwd) {
+          return jsonResult({ ok: false, error: "no cwd given and no fleet root known: pass cwd, set fleetRoot in the plugin config, or give every target node the same serviceUser" });
         }
 
         // Create the bundle once (manager-side, with manager creds).
@@ -1902,8 +1935,9 @@ export default definePluginEntry({
         // the recommendation survives model churn (4-6 week cycle).
         let availableModels: string[] = [];
         try {
-          const res = await fetch(cfg.apertureUrl ?? "https://ai.tailf9480.ts.net/v1/models", { signal });
-          if (res.ok) {
+          // No catalog configured: skip live resolution and use the stored model.
+          const res = cfg.apertureUrl ? await fetch(cfg.apertureUrl, { signal }) : undefined;
+          if (res?.ok) {
             const data = (await res.json()) as { data?: Array<{ id?: string }> };
             availableModels = (data.data ?? []).map((m) => m.id ?? "").filter(Boolean);
           }
@@ -2031,7 +2065,10 @@ export default definePluginEntry({
           return jsonResult(inv);
         }
         // Otherwise query the Aperture gateway directly.
-        const apertureUrl = cfg.apertureUrl ?? "https://ai.tailf9480.ts.net/v1/models";
+        const apertureUrl = cfg.apertureUrl;
+        if (!apertureUrl) {
+          return jsonResult("No model catalog configured: set apertureUrl in the opencode-fleet plugin config (an OpenAI-style /v1/models URL), or use nodes that report their own models.");
+        }
         try {
           const res = await fetch(apertureUrl, { signal });
           if (!res.ok) return jsonResult(`Aperture gateway returned ${res.status}.`);
