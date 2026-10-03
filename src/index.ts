@@ -391,6 +391,22 @@ export default definePluginEntry({
         if (isSentinelPrompt(p.prompt?.trim())) {
           return jsonResult({ ok: false, error: `prompt ${JSON.stringify(p.prompt.trim())} is reserved for node control messages; write a real task description` });
         }
+        // Issue #87, slice 4: SHADOW-ONLY live S1 evidence on dispatch. Fires ONLY
+        // when the operator configured an `s1` config block (mode shadow|enforce —
+        // enforce still records-only in this slice). One fire-and-forget shadow
+        // decision per dispatch with a task (questionId dispatch.route, the task
+        // text in state); the bounded record goes to <rootDir>/.opencode-fleet/
+        // s1-shadow.jsonl and is never read back by any dispatch decision — this
+        // path imports no combineWithStatic and CAN'T enforce anything. With NO
+        // `s1` config the block (and the module import) never runs: the dispatch
+        // stays byte-identical to today, and the record never touches the result,
+        // the ledger or any added field.
+        if (cfg.s1 != null) {
+          const shadowRoot = api.rootDir ?? process.cwd();
+          void import("./s1-shadow.js")
+            .then((shadow) => shadow.recordDispatchShadow(cfg.s1, { task: p.prompt, cwd: p.cwd }, shadowRoot))
+            .catch(() => { /* the shadow path can never break dispatch */ });
+        }
         // Issue #87, slice 3: OPT-IN S1 engine routing. Default OFF: with no
         // `route` param nothing runs here — no S1 call, no field added, and
         // the dispatch is byte-identical to routing being absent. When set,
