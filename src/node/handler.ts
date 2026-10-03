@@ -73,22 +73,21 @@ OPS["abort"] = async ({ task, io, context }: OpCtx) => {
   void io; void context;
       // Issue #30 finding H: cancellation was engine-blind — `pkill -f
       // "opencode (run|acp|serve)"` never matched a Pi worker. Terminate by
-      // the RECORDED run's pid (engine-independent) when a runId is given,
-      // and only report success after confirming termination. The pattern
-      // fallback now also matches Pi.
+      // the run's own script (engine-independent) and only report success
+      // after confirming termination.
       const runId = String(task.runId ?? "");
       if (runId) {
         const r = await abortRunById(runId);
         return JSON.stringify({ ...r, sessionId: task.sessionId });
       }
-      const killed = await runShell(
-        `pkill -f "opencode (run|acp|serve)" 2>/dev/null; pkill -f "[p]i -p " 2>/dev/null; sleep 1; ` +
-          `if pgrep -f "opencode (run|acp|serve)" >/dev/null 2>&1 || pgrep -f "[p]i -p " >/dev/null 2>&1; then echo "REMAINING"; else echo "CLEARED"; fi`,
-        15_000,
-        context?.signal,
-      );
-      const cleared = killed.includes("CLEARED");
-      return JSON.stringify({ ok: cleared, aborted: cleared, sessionId: task.sessionId, detail: killed.trim() });
+      // Issue #63: there is no node-wide fallback. A pattern `pkill` would kill
+      // other runs' (and other users') workers; abort addresses ONE run.
+      return JSON.stringify({
+        ok: false,
+        aborted: false,
+        sessionId: task.sessionId,
+        error: "abort requires a runId; refusing to kill workers by name pattern (use fleet_abort with runId, or a sessionId that fleet_dispatch recorded)",
+      });
 };
 
 OPS["diff"] = async ({ task, io, context }: OpCtx) => {
