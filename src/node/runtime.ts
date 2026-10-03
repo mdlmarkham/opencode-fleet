@@ -211,36 +211,150 @@ export async function runShellDetailed(
 }
 
 
+/** One row of the process table (`ps -eo pid=,pgid=,args=`). */
+export interface ProcRow {
+  pid: number;
+  pgid: number;
+  /** Session id: every descendant of a `setsid` script shares the script's. */
+  sid: number;
+  /** `ps` state letters (first letter `Z` = zombie: dead, merely not yet reaped). */
+  stat: string;
+  args: string;
+}
+
+/** Command whose output `parseProcessTable` reads. */
+export const PS_TABLE_COMMAND = "ps -eo pid=,pgid=,sid=,stat=,args=";
+
+/** Parse `PS_TABLE_COMMAND` output. Unparseable lines are skipped; zombies are dropped (they are dead). */
+export function parseProcessTable(raw: string): ProcRow[] {
+  const rows: ProcRow[] = [];
+  for (const line of raw.split("\n")) {
+    const m = line.match(/^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/);
+    if (m && !m[4].startsWith("Z")) rows.push({ pid: Number(m[1]), pgid: Number(m[2]), sid: Number(m[3]), stat: m[4], args: m[5] });
+  }
+  return rows;
+}
+
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
 /**
- * Engine-independent termination of a recorded run (issue #30 findings H).
- * Reads the recorded pid and kills its process group (covers Pi AND opencode),
- * waiting until the group is actually gone before reporting success.
+ * The processes that ARE a run's script: `bash [flags] <scriptPath>` and nothing
+ * else that merely mentions the path (an editor, `tail -f`, ...). The script path
+ * is unique per run and lives in a private directory, so this identifies the run
+ * without trusting a recorded pid (which can be stale, reused, or the launcher
+ * subshell instead of the script: issue #69).
+ */
+export function runScriptRows(rows: ProcRow[], scriptPath: string): ProcRow[] {
+  const re = new RegExp(`^(?:\\S*/)?bash(?:\\s+-\\S+)*\\s+${escapeRe(scriptPath)}\\s*$`);
+  return rows.filter((r) => re.test(r.args));
+}
+
+/** Injection points so the abort logic is testable with real or fake processes. */
+export interface AbortDeps {
+  /** Raw `PS_TABLE_COMMAND` output. */
+  list: () => Promise<string>;
+  kill: (pid: number, signal: NodeJS.Signals) => void;
+  sleep: (ms: number) => Promise<void>;
+}
+
+/** Raw process table; THROWS if `ps` failed or timed out (its diagnostics must never parse as "no processes"). */
+export async function listProcessTable(signal?: AbortSignal): Promise<string> {
+  const r = await runShellDetailed(PS_TABLE_COMMAND, 10_000, signal);
+  if (r.timedOut || r.exitCode !== 0) throw new Error(`ps failed (exit ${r.exitCode}${r.timedOut ? ", timed out" : ""})`);
+  return r.output;
+}
+
+const realAbortDeps = (): AbortDeps => ({
+  list: () => listProcessTable(),
+  kill: (pid, signal) => void process.kill(pid, signal),
+  sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+});
+
+/** Poll until no process remains in any of `pgids`, up to `waitMs`. */
+async function groupsGone(deps: AbortDeps, pgids: Set<number>, sids: Set<number>, waitMs: number): Promise<boolean> {
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    const rows = parseProcessTable(await deps.list());
+    if (!rows.some((r) => pgids.has(r.pgid) || sids.has(r.sid))) return true;
+    if (Date.now() >= deadline) return false;
+    await deps.sleep(150);
+  }
+}
+
+/**
+ * Engine-independent termination of a detached run (issues #30, #69).
+ *
+ * The run is found by its SCRIPT, not by a recorded pid: the process table is
+ * searched for `bash <run script>`, its process group (the script is a
+ * session/group leader after `setsid`) is signalled — TERM, then KILL — and
+ * success is reported only when NO process remains in that group. If nothing
+ * is running, that is said plainly; it is never reported as an abort.
  */
 export async function abortRunById(
   runId: string,
-): Promise<{ ok: boolean; aborted: boolean; pid?: number; confirmed?: boolean; error?: string }> {
+  deps: AbortDeps = realAbortDeps(),
+): Promise<{ ok: boolean; aborted: boolean; pid?: number; pgid?: number; confirmed?: boolean; alreadyFinished?: boolean; error?: string }> {
   const statePath = runStatePath(runId);
-  let pid: number | undefined;
+  const scriptPath = runScriptPath(runId);
+  let rows: ProcRow[];
   try {
-    const raw = await (await import("node:fs/promises")).readFile(statePath, "utf8");
-    pid = (JSON.parse(raw) as { pid?: number }).pid;
-  } catch {
-    // no state file
+    rows = parseProcessTable(await deps.list());
+  } catch (e) {
+    return { ok: false, aborted: false, error: `cannot list processes on this node: ${(e as Error).message}` };
   }
-  if (!pid) {
-    return { ok: false, aborted: false, error: "no recorded run state/pid — cannot terminate engine-independently" };
+  const leaders = runScriptRows(rows, scriptPath);
+  if (!leaders.length) {
+    let finished = false;
+    try {
+      await (await import("node:fs/promises")).stat(runPaths(runId).done);
+      finished = true;
+    } catch { /* no done record */ }
+    return {
+      ok: false,
+      aborted: false,
+      alreadyFinished: finished,
+      error: finished
+        ? "run already finished; nothing to abort"
+        : "no live process for this run (it never started, died, or was already stopped); nothing was signalled",
+    };
   }
-  const out = await runShell(
-    `kill -TERM -- -${pid} 2>/dev/null; sleep 1; ` +
-      `if kill -0 -- -${pid} 2>/dev/null; then kill -9 -- -${pid} 2>/dev/null; sleep 1; fi; ` +
-      `if kill -0 -- -${pid} 2>/dev/null; then echo ALIVE; else echo DEAD; fi`,
-    15_000,
-  );
-  const confirmed = out.includes("DEAD");
+  // Never signal our own group, init, or a group that is not the script's own.
+  const own = rows.find((r) => r.pid === process.pid)?.pgid;
+  // The engine usually runs in its OWN process group (e.g. under `timeout`), so
+  // signal every group in the script's session, not just the script's.
+  const sids = new Set(leaders.map((r) => r.sid).filter((x) => x > 1));
+  const pgids = new Set(leaders.map((r) => r.pgid));
+  for (const r of rows) if (sids.has(r.sid)) pgids.add(r.pgid);
+  for (const g of pgids) {
+    if (g <= 1 || g === own) {
+      return { ok: false, aborted: false, error: `refusing to signal process group ${g}: it is not the run's own group` };
+    }
+  }
+  // Groups can appear after any snapshot (an engine child may setsid), so every
+  // signal round re-reads the table and targets the session's CURRENT groups.
+  const signalRound = async (sig: NodeJS.Signals): Promise<void> => {
+    const live = parseProcessTable(await deps.list());
+    for (const r of live) if (sids.has(r.sid)) pgids.add(r.pgid);
+    for (const g of pgids) {
+      if (g <= 1 || g === own) continue;
+      try { deps.kill(-g, sig); } catch { /* group already gone */ }
+    }
+  };
+  let gone: boolean;
+  try {
+    await signalRound("SIGTERM");
+    gone = await groupsGone(deps, pgids, sids, 3_000);
+    if (!gone) {
+      await signalRound("SIGKILL");
+      gone = await groupsGone(deps, pgids, sids, 2_000);
+    }
+  } catch (e) {
+    return { ok: false, aborted: false, error: `cannot confirm termination: ${(e as Error).message}` };
+  }
+  const confirmed = gone;
+  const pid = leaders[0].pid;
+  const pgid = leaders[0].pgid;
   // Issue #30 finding H: only record `aborted` when termination is CONFIRMED.
-  // Otherwise leave the state file untouched — never claim aborted for a
-  // possibly-live run. Preserve existing fields (harness/piModel/pid/startedAt)
-  // so later __RUN_STATUS__/__RUN_RESULT__ reads still parse correctly.
   let existing: Record<string, unknown> = {};
   try {
     existing = JSON.parse(await (await import("node:fs/promises")).readFile(statePath, "utf8"));
@@ -249,7 +363,24 @@ export async function abortRunById(
   if (next) {
     await writePrivate(statePath, JSON.stringify(next)).catch(() => {});
   }
-  return { ok: confirmed, aborted: confirmed, pid, confirmed };
+  return { ok: confirmed, aborted: confirmed, pid, pgid, confirmed };
+}
+
+/**
+ * Lines at the top of a run's script that publish its OWN state: the script is
+ * the one process that knows its real pid/pgid (after `setsid` it leads both),
+ * so it writes the state file itself, atomically, as valid JSON, before doing
+ * anything else. No placeholder, no dependence on the launcher or the handler
+ * surviving (issue #64).
+ */
+export function selfStateLines(statePath: string, base: Record<string, unknown>): string[] {
+  // JSON for the static fields, with the closing brace left off; `%` doubled for printf.
+  const head = JSON.stringify(base).slice(0, -1).replace(/\\/g, "\\\\").replace(/%/g, "%%");
+  return [
+    `__ST=${shq(statePath)}`,
+    `__PG=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')`,
+    `printf '${head.replace(/'/g, `'\\''`)},"pid":%s,"pgid":%s,"startedAt":"%s","state":"running"}\n' "$$" "\${__PG:-$$}" "$(date -u +%FT%TZ)" > "$__ST.tmp" && mv -f "$__ST.tmp" "$__ST"`,
+  ];
 }
 
 
@@ -284,7 +415,6 @@ export function detachedLaunchCommand(runId: string, scriptPath: string, statePa
   // `wait`-free structure means LAUNCHED_PID is echoed right after spawn.
   return [
     `rm -f ${shq(statePath)}`,
-    `printf 'pid=0\nstartedAt=%s\n' "$(date +%s)" > ${shq(statePath)}`,
     // setsid detaches from the node-host process group so relay cancellation
     // (node.invoke.cancel kills the process tree) cannot reach the child.
     // NOTE: the background `&` must terminate the whole chain, not sit inside a
@@ -292,7 +422,7 @@ export function detachedLaunchCommand(runId: string, scriptPath: string, statePa
     // join the setup steps with `&&`, background that entire chain, then emit
     // the LAUNCHED_PID line as a separate statement.
     `setsid nohup /bin/bash ${shq(scriptPath)} > ${shq(runPaths(runId).log)} 2>&1`,
-  ].join(" && ") + ` &\necho "LAUNCHED_PID=$!"`;
+  ].join(" && ").replace(/^/, "{ ") + `; } > /dev/null 2>&1 < /dev/null &\necho "LAUNCHED_PID=$!"`;
 }
 
 /** Options for the verification-gate section of the generated launcher. */
