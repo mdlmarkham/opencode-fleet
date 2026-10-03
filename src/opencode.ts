@@ -29,7 +29,7 @@ export interface OpenCodeTask {
   harness?: FleetHarness;
   /**
    * Pi model override (harness="pi"). Pi refs are `provider/id`
-   * (e.g. aperture/glm-5.3-flash:cloud), NOT opencode's `aperture-anthropic/...`.
+   * (e.g. myprovider/some-model), NOT opencode's `provider-prefix/...` form.
    */
   piModel?: string;
   /** Optional model override (must exist on the node's provider). */
@@ -181,16 +181,14 @@ export function buildOpenCodeCommand(task: OpenCodeTask): string {
     `cd ${shq(cwd)} || { echo "FLEET_ERROR: cannot enter cwd ${cwd} as $(id -un) (uid $(id -u)): $?" >&2; exit 66; }`;
 
   // Pi harness: same cd guard and env block, but drive the `pi` coding agent
-  // in one-shot prompt mode. Pi model refs are `provider/id`
-  // (e.g. aperture/glm-5.3-flash:cloud) — NOT opencode's `aperture-anthropic/...`
-  // — so a plain `model` value cannot be forwarded safely; fall back to a known
-  // default when `piModel` is absent.
+  // in one-shot prompt mode. Pi model refs are `provider/id`, unlike opencode's
+  // provider-prefixed ids, so an opencode `model` is never forwarded; the caller
+  // (or operator config) must supply `piModel`.
   if (task.harness === "pi") {
-    // Issue #30 finding B: Pi model refs are `provider/id`
-    // (e.g. aperture/glm-5.3-flash:cloud) — NOT opencode's
-    // `aperture-anthropic/...` — so the opencode `model` value must NEVER be
-    // forwarded. Fall back to a known Pi default when `piModel` is absent.
-    const piModel = task.piModel ?? "aperture/glm-5.3-flash:cloud";
+    // Issue #30 finding B: the opencode `model` value must NEVER be forwarded
+    // to Pi (different ref format). Issue #44: and there is no built-in model.
+    const piModel = task.piModel;
+    if (!piModel) throw new Error("harness=pi requires piModel (provider/id); there is no built-in default");
     // Issue #30 finding C (VALIDATED LIVE on dev2, pi 0.73.1 as svcuser):
     // pi does NOT support `--` (`Error: Unknown option: --`), and a positional
     // prompt beginning with `-`/`--` is parsed as a FLAG (`pi -p -- --version`

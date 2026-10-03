@@ -18,8 +18,25 @@
  *     report a hard, legible refusal (#26 item 3).
  */
 
-/** The shared fleet workspace root. Traversable+writable by the service principal. */
-export const FLEET_ROOT = "/home/svcuser/fleet";
+/** Directory name of the shared workspace under a service user's home. */
+export const FLEET_DIRNAME = "fleet";
+
+/**
+ * The shared fleet workspace root (traversable+writable by the service
+ * principal). Nothing is assumed about the deployment: an explicit
+ * `fleetRoot` wins; otherwise `/home/<serviceUser>/fleet` when every target
+ * node names the SAME service user; otherwise undefined and the caller must
+ * pass a `cwd` or configure `fleetRoot`.
+ */
+export function resolveFleetRoot(
+  cfg: { fleetRoot?: string },
+  serviceUsers: Array<string | undefined> = [],
+): string | undefined {
+  if (cfg.fleetRoot?.trim()) return cfg.fleetRoot.trim();
+  const users = new Set(serviceUsers);
+  const only = users.size === 1 ? [...users][0] : undefined;
+  return only && only !== "root" ? `/home/${only}/${FLEET_DIRNAME}` : undefined;
+}
 
 /** Quote a string for safe use as a single POSIX shell argument. */
 function shq(s: string): string {
@@ -35,7 +52,7 @@ function shq(s: string): string {
  *
  * @param repo short repo name (e.g. "ohm") or a path-ish string; sanitized.
  */
-export function defaultFleetCwd(repo: string, root: string = FLEET_ROOT): string {
+export function defaultFleetCwd(repo: string, root: string): string {
   const name = repo
     .replace(/\.git$/, "")
     .split(/[/:]/)
@@ -104,7 +121,9 @@ export function evaluateCwdCheck(raw: string, cwd: string, serviceUser?: string)
     status,
     error:
       `refusing to dispatch: cwd ${cwd} is unusable — ${remedy}. ` +
-      `Provision/dispatch under a workspace both principals share, e.g. ${defaultFleetCwd("your-repo")}.`,
+      `Provision/dispatch under a workspace both principals share${
+        resolveFleetRoot({}, [serviceUser]) ? `, e.g. ${defaultFleetCwd("your-repo", resolveFleetRoot({}, [serviceUser])!)}` : " (the fleet root, under the service user's home)"
+      }.`,
   };
 }
 
