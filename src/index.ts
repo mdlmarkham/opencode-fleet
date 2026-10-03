@@ -1632,7 +1632,11 @@ export default definePluginEntry({
                 signal,
               });
               const pp = (pr as { payload?: unknown }).payload;
-              entry.prune = typeof pp === "string" ? JSON.parse(pp) : pp;
+              // A policy refusal (e.g. a node below protocol 3) may come back as a result
+              // without a payload rather than a throw: report it, never silently drop it.
+              entry.prune = pp === undefined || pp === null
+                ? { ok: false, error: String((pr as { message?: unknown }).message ?? "node did not run the prune (no payload; node may predate protocol 3)") }
+                : typeof pp === "string" ? JSON.parse(pp) : pp;
             } catch (e) {
               entry.prune = { ok: false, error: (e as Error).message };
             }
