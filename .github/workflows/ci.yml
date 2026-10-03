@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # OpenClaw refuses Node < 22.22.3 (SQLite WAL bug); see package.json "engines".
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      # `npm run build` runs `tsc`, so this is also the typecheck.
+      - run: npm run build
+      - run: npm test
+
+  # NOTE: `openclaw plugins validate` is deliberately not run. This plugin registers
+  # its tools with definePluginEntry (not defineToolPlugin), so the validator rejects
+  # the entry ("does not expose defineToolPlugin metadata") by design. The manifest
+  # <-> tool-surface contract is covered by src/index.test.ts instead.
