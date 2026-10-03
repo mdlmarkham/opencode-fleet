@@ -94,6 +94,86 @@
           }
         }
       },
+      "s1": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "S1 decision layer (issue #79). Defaults: backend local-kev, mode shadow (decisions are logged, never acted on). A hosted or non-loopback backend sends data off this machine only when its allowEgress is true, with secrets redacted. A failure or an off layer always leaves the static rules in force.",
+        "properties": {
+          "backend": {
+            "type": "string",
+            "enum": [
+              "local-kev",
+              "zen-jev",
+              "typesafe-jev"
+            ],
+            "default": "local-kev"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "off",
+              "shadow",
+              "enforce"
+            ],
+            "default": "shadow"
+          },
+          "timeoutMs": {
+            "type": "number",
+            "default": 10000,
+            "description": "Per-call timeout, 100-120000 ms."
+          },
+          "thresholds": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "description": "Per-question block thresholds (block when probabilityTrue >= threshold), from the #78 calibration report."
+          },
+          "calibration": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "The model/version the thresholds were measured with. A different model reported at runtime downgrades enforce to shadow until re-calibrated.",
+            "properties": {
+              "model": {
+                "type": "string"
+              },
+              "date": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "model"
+            ]
+          },
+          "backends": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "url": {
+                  "type": "string",
+                  "description": "Base URL of the S1 endpoint (local-kev defaults to http://127.0.0.1:8009)."
+                },
+                "model": {
+                  "type": "string"
+                },
+                "apiKey": {
+                  "type": "string",
+                  "description": "Bearer token for hosted backends. Never logged."
+                },
+                "allowEgress": {
+                  "type": "boolean",
+                  "default": false,
+                  "description": "Opt in to sending (redacted) data to this backend when it is not loopback."
+                }
+              }
+            }
+          }
+        }
+      },
       "sync": {
         "type": "object",
         "additionalProperties": false,
