@@ -278,6 +278,7 @@ export default definePluginEntry({
               `if [ -n "$DIRTY" ]; then git add -A && git -c user.email=fleet-worker@node -c user.name="fleet-worker" commit -q -m "fleet_sync: auto-commit worker working-tree changes before sync"; fi`,
               `git bundle create ${shq(join(accDir, "sync.bundle"))} --all`,
               `git rev-parse HEAD`,
+              `git rev-parse --abbrev-ref HEAD`,
               `echo "${B64_MARKER}"`,
               `base64 ${shq(join(accDir, "sync.bundle"))}`,
             ].filter(Boolean).join(" && "),
@@ -289,7 +290,7 @@ export default definePluginEntry({
           await (await import("node:fs/promises")).writeFile(join(accDir, "bundle.b64"), bundled.base64);
           const bundleBytes = await (await import("node:fs/promises")).readFile(join(accDir, "sync.bundle"));
           return JSON.stringify({
-            ok: true, transferId, staged: true, head: bundled.head,
+            ok: true, transferId, staged: true, head: bundled.head, branch: bundled.branch,
             sha256: createHash("sha256").update(bundleBytes).digest("hex"), bytes: bundleBytes.length,
           });
         }
@@ -1723,6 +1724,9 @@ export default definePluginEntry({
             mode: "from-base64",
             base64: assembled,
             branch: p.branch ?? "main",
+            // The branch the worker actually has checked out (SSH-free path), so a
+            // feature-branch worker publishes its own commits instead of the base.
+            workerBranch: typeof bundlePl.branch === "string" ? bundlePl.branch : undefined,
             destBranch: p.branch,
           }, undefined, cfg.sync);
           return jsonResult({ ...r, viaChannel: true });

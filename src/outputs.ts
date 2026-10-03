@@ -34,11 +34,12 @@ export function parseStatusOutput(out: string): StatusResult {
   return { ok: true, files: out.slice(0, i).trim(), uncommittedCount: parseInt(tail, 10) };
 }
 
-export type BundleParse = { ok: true; head: string; base64: string } | { ok: false; error: string };
+export type BundleParse = { ok: true; head: string; branch?: string; base64: string } | { ok: false; error: string };
 
 /**
- * Split `__BUNDLE__` output into the metadata before the marker (last line is
- * the HEAD sha) and the base64 payload after it. Fails closed on a missing
+ * Split `__BUNDLE__` output into the metadata before the marker (second-last
+ * line the HEAD sha, last line the checked-out branch, `HEAD` when detached)
+ * and the base64 payload after it. Fails closed on a missing
  * marker or an empty payload.
  */
 export function parseBundleOutput(out: string): BundleParse {
@@ -48,8 +49,11 @@ export function parseBundleOutput(out: string): BundleParse {
   const base64 = out.slice(i + B64_MARKER.length).replace(/\s+/g, "");
   if (!base64) return { ok: false, error: `bundle failed: ${meta.slice(0, 300) || "empty bundle"}` };
   const lines = meta.trim().split("\n");
-  const head = (lines[lines.length - 1] ?? "").trim().slice(-40);
-  return { ok: true, head, base64 };
+  const branchLine = (lines[lines.length - 1] ?? "").trim();
+  const head = (lines[lines.length - 2] ?? "").trim().slice(-40);
+  // A detached HEAD reports "HEAD"; leave the branch unknown rather than guess.
+  const branch = branchLine && branchLine !== "HEAD" ? branchLine : undefined;
+  return { ok: true, head, ...(branch ? { branch } : {}), base64 };
 }
 
 /** Maximum base64 characters accepted for a single transferred bundle (~256 MiB decoded). */

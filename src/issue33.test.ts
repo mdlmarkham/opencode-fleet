@@ -4,6 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { syncFromNode } from "./provision.js";
+import { B64_MARKER, parseBundleOutput } from "./outputs.js";
 import {
   countSecretLines, evaluateChange, globToRegex, isSafeBranchName, resolveDestination, resolvePolicy, sensitivePaths,
 } from "./syncpolicy.js";
@@ -83,7 +84,7 @@ function harness(opts: { workerBranch?: string; files: Record<string, string> })
   const originRef = (b: string) => { try { return git(origin, "rev-parse", "--verify", "--quiet", `refs/heads/${b}`); } catch { return ""; } };
   const run = (policy?: Parameters<typeof syncFromNode>[6], pinned?: string) =>
     syncFromNode("local", worker, origin, "main", { mode: "from-base64", base64: b64, branch: "main", workerBranch: opts.workerBranch ?? "main", destBranch: pinned }, pinned, policy);
-  return { base, origin, originRef, run, cleanup: () => rmSync(base, { recursive: true, force: true }) };
+  return { base, origin, worker, originRef, run, cleanup: () => rmSync(base, { recursive: true, force: true }) };
 }
 
 describe("issue #33: end-to-end against real git repos", () => {
@@ -191,6 +192,26 @@ describe("issue #33: binary files do not hide secrets (real git)", () => {
       expect(r.ok).toBe(false);
       expect(r.commit).toBe("policy-refused");
       expect(h.originRef("feature/bin")).toBe("");
+    } finally { h.cleanup(); }
+  });
+});
+
+describe("issue #33: channel path publishes the worker's own branch", () => {
+  it("__BUNDLE__ output -> workerBranch -> feature branch is pushed (not 'no changes' on main)", async () => {
+    const h = harness({ workerBranch: "feature/chan", files: { "a.txt": "x\n" } });
+    try {
+      const out = execFileSync("bash", ["-c",
+        `git bundle create ${JSON.stringify(join(h.base, "c.bundle"))} --all 2>/dev/null && git rev-parse HEAD && git rev-parse --abbrev-ref HEAD && echo "${B64_MARKER}" && base64 ${JSON.stringify(join(h.base, "c.bundle"))}`],
+        { cwd: h.worker, encoding: "utf8" });
+      const parsed = parseBundleOutput(out);
+      expect(parsed.ok).toBe(true);
+      if (!parsed.ok) return;
+      expect(parsed.branch).toBe("feature/chan");
+      const r = await syncFromNode("local", h.worker, h.origin, "main",
+        { mode: "from-base64", base64: parsed.base64, branch: "main", workerBranch: parsed.branch, destBranch: undefined }, undefined);
+      expect(r.synced).toBe(true);
+      expect(r.branch).toBe("feature/chan");
+      expect(h.originRef("feature/chan")).not.toBe("");
     } finally { h.cleanup(); }
   });
 });
