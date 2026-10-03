@@ -122,6 +122,12 @@ Worker work is pushed with the manager's credentials, so `fleet_sync` applies a 
 - **Credential-shaped text** in added lines (tokens, keys, private keys, password assignments) is refused; nothing is pushed and the secret is never echoed.
 - Branch names that could be read as git options (leading `-`, `..`, …) are refused, and the repo argument is passed after `--`.
 
+## Node protocol
+
+`opencode.run` requests carry an explicit `op` (`run`, `run.start`, `run.status`, `xfer.receive`, `bundle`, ...) and a `protocol` version; every node reply echoes `protocol`. The old `__SENTINEL__` prompts remain as a compatibility encoding: with no `op` the prompt decides, and when both are present they must agree, so a task prompt can never be promoted to a control message nor a control message passed off as a task. `fleet_dispatch` also rejects a task prompt that equals a sentinel.
+
+Nodes that predate the protocol report none (protocol 0). They ignore `harness`/`piModel`, so a dispatch with a non-default harness first probes the node (a harmless `run.status` for an id that cannot exist) and is refused with "upgrade opencode-fleet on the node" instead of silently running the wrong engine. The probe result is cached for five minutes.
+
 ## SSH access
 
 The manager reaches nodes with `ssh`/`scp` (provisioning, sync, deploy). Every call passes `--` before the host and validates the host string, so a node record cannot smuggle in an ssh option.

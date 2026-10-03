@@ -15,6 +15,8 @@ import { createHash } from "node:crypto";
 import { quoteUntrusted, sanitizeQuestion } from "./untrusted.js";
 import { checkSetup, partitionEnv } from "./policy.js";
 import { handleOpencodeRun, type FleetOpenCodeTask } from "./node/handler.js";
+import { handleOpencodeRunPolicy, newProtocolCache, type PolicyCtx } from "./gateway-policy.js";
+import { isSentinelPrompt } from "./protocol.js";
 import { OPCODE_PS_COMMAND, abortRunById, parseActivity, runStatePath, type NodeActivityEntry } from "./node/runtime.js";
 import { isCanonicalBase64 } from "./xfer.js";
 import { runPaths, xferPaths, ensureStateDir, writePrivate } from "./paths.js";
@@ -159,27 +161,12 @@ export default definePluginEntry({
     // ------------------------------------------------------------------
     // Node invoke policy: `opencode.run` (gateway-side permission boundary)
     // ------------------------------------------------------------------
+    const protocolCache = newProtocolCache();
     api.registerNodeInvokePolicy({
       commands: ["opencode.run"],
       dangerous: true,
       classifyRisk: () => ({ level: "high", family: "opencode-run" }),
-      handle: async (ctx) => {
-        const task = ctx.params as OpenCodeTask;
-        if (!task || typeof task.prompt !== "string" || !task.prompt.trim()) {
-          return { ok: false, message: "opencode.run requires a non-empty prompt." };
-        }
-        if (!task.cwd || typeof task.cwd !== "string") {
-          return { ok: false, message: "opencode.run requires a cwd." };
-        }
-        const result = await ctx.invokeNode({
-          params: task,
-          timeoutMs: task.timeoutMs,
-        });
-        if (!result.ok) {
-          return { ok: false, message: result.message ?? "opencode.run failed on node." };
-        }
-        return { ok: true, payload: result.payload };
-      },
+      handle: (ctx) => handleOpencodeRunPolicy(ctx as unknown as PolicyCtx, protocolCache),
     });
 
     // ------------------------------------------------------------------
@@ -294,6 +281,11 @@ export default definePluginEntry({
         const transport = p.transport ?? cfg.defaultTransport ?? "http";
         // Issue #48: refuse an unsupported engine/transport pair before any node
         // is invoked (the node handler re-checks with the same helper).
+        // Issue #43: a task prompt that equals a control sentinel would be read as
+        // a control message by nodes that predate the explicit protocol op.
+        if (isSentinelPrompt(p.prompt?.trim())) {
+          return jsonResult({ ok: false, error: `prompt ${JSON.stringify(p.prompt.trim())} is reserved for node control messages; write a real task description` });
+        }
         const harnessCheck = validateHarnessTransport({ harness: p.harness, transport });
         if (!harnessCheck.ok) return jsonResult({ ok: false, harness: harnessCheck.harness, error: harnessCheck.error });
         // No built-in Pi model: a dispatch must name one, or the operator must configure a default.
