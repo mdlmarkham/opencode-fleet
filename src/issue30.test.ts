@@ -1,4 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 import { buildOpenCodeCommand, parsePiOutput, validateHarnessTransport } from "./opencode.js";
 import {
   interpretProbe,
@@ -251,5 +254,18 @@ describe("issue #30I: engine-independent liveness", () => {
   });
   it("reports dead when nothing matches (finding I)", () => {
     expect(interpretLiveness("", 4242).alive).toBe(false);
+  });
+});
+
+describe("issue #48: validateHarnessTransport is the single production guard", () => {
+  const index = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.ts"), "utf8");
+  it("is called from both the gateway dispatch and the node handler", () => {
+    expect((index.match(/validateHarnessTransport\(/g) ?? []).length).toBe(2);
+  });
+  it("no longer carries an inline copy of the predicate", () => {
+    expect(index).not.toMatch(/task\.transport === "acp" && task\.harness === "pi"/);
+  });
+  it("the dead __RUN_ABORT__ handler is gone (fleet_abort routes through __ABORT__ + runId)", () => {
+    expect(index).not.toContain('task.prompt === "__RUN_ABORT__"');
   });
 });
