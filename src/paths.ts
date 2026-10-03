@@ -67,6 +67,22 @@ export function xferPaths(transferId: string, dir: string = ensureStateDir()): {
   return { dir: join(dir, `xfer-${id}`), bundle: join(dir, `xfer-${id}.bundle`) };
 }
 
+/**
+ * Issue #63: per-run PRIVATE staging for the SSH provisioning/sync path.
+ * The manager ships/creates node-side git bundles over ssh and used to park
+ * them in PUBLIC /tmp under predictable names. This gives the same layout as
+ * the channel path (same `xfer-<id>` naming under the same per-user private
+ * state dir), but the bundle lives INSIDE the per-run dir so cleanup removes
+ * exactly one run's directory and cannot touch other runs' (or other users')
+ * files. provision.ts mirrors this layout in the node-side shell command
+ * (remoteStageDirCmd); ids are validated like transferIds.
+ */
+export function stagePaths(id: string, dir: string = fleetStateDir()): { dir: string; bundle: string } {
+  const safe = seg("transferId", id);
+  const staging = join(dir, `xfer-${safe}`);
+  return { dir: staging, bundle: join(staging, "bundle") };
+}
+
 /** Write a file privately and atomically (temp + rename within the private dir). */
 export async function writePrivate(path: string, data: string | Buffer, mode = 0o600): Promise<void> {
   const tmp = `${path}.${process.pid}.tmp`;

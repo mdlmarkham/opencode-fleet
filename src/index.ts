@@ -1590,7 +1590,7 @@ export default definePluginEntry({
       name: "fleet_cleanup",
       label: "Fleet Cleanup",
       description:
-        "Keep fleet nodes tidy: remove leftover git bundles, run git GC on checkouts to prevent bloat, and report disk usage. Run periodically to avoid node bloat.",
+        "Keep fleet nodes tidy: run git GC on checkouts to prevent bloat and report disk usage. Node-side git bundles stage in per-run PRIVATE state dirs and every provision/sync run cleans its own staging (issue #63), so nothing is swept on other runs' behalf. Run periodically to avoid node bloat.",
       parameters: {
         type: "object",
         additionalProperties: false,
