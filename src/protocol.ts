@@ -82,7 +82,19 @@ export type ResolvedOp = { ok: true; op: Op } | { ok: false; error: string };
  * looks like a control message can never be promoted to one, and a control
  * message can never be smuggled in under op "run".
  */
-export function resolveOp(task: { op?: unknown; prompt: string }): ResolvedOp {
+export function resolveOp(task: { op?: unknown; protocol?: unknown; prompt: string }): ResolvedOp {
+  // Issue #61: `protocol` on a request is the MINIMUM node protocol the request
+  // needs (the gateway stamps it only for features an older node would silently
+  // ignore, after discovery). A node refuses what it cannot honor, loudly. Only
+  // an ABSENT value (a legacy gateway, a plain run, the discovery probe) is lenient.
+  if (task.protocol !== undefined) {
+    if (typeof task.protocol !== "number" || !Number.isInteger(task.protocol) || task.protocol < 0) {
+      return { ok: false, error: `invalid protocol: ${JSON.stringify(String(task.protocol).slice(0, 20))}` };
+    }
+    if (task.protocol > PROTOCOL_VERSION) {
+      return { ok: false, error: `request needs protocol ${task.protocol}, newer than this node's protocol ${PROTOCOL_VERSION}; upgrade the node plugin` };
+    }
+  }
   const fromPrompt = opFromPrompt(task.prompt);
   if (task.op === undefined || task.op === null) return { ok: true, op: fromPrompt };
   if (typeof task.op !== "string" || !KNOWN_OPS.has(task.op)) return { ok: false, error: `unknown op: ${JSON.stringify(String(task.op).slice(0, 40))}` };

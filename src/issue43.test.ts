@@ -121,11 +121,12 @@ function fakeCtx(replies: Array<{ ok: boolean; message?: string; payload?: unkno
 }
 
 describe("issue #43: gateway policy", () => {
-  it("stamps op + protocol on the forwarded request and returns the payload", async () => {
+  it("stamps the op on the forwarded request and returns the payload (a plain run needs no protocol)", async () => {
     const { ctx, calls } = fakeCtx([{ ok: true, payload: { ok: true, protocol: 1 } }], { prompt: "do work", cwd: "/w" });
     const r = await handleOpencodeRunPolicy(ctx, newProtocolCache());
     expect(r).toEqual({ ok: true, payload: { ok: true, protocol: 1 } });
-    expect(calls[0]).toMatchObject({ prompt: "do work", op: "run", protocol: PROTOCOL_VERSION });
+    expect(calls[0]).toMatchObject({ prompt: "do work", op: "run" });
+    expect("protocol" in (calls[0] as object)).toBe(false);
   });
   it("derives the op from a sentinel prompt (legacy callers)", async () => {
     const { ctx, calls } = fakeCtx([{ ok: true, payload: {} }], { prompt: "__DIFF__", cwd: "/w" });

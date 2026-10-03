@@ -9,7 +9,7 @@
  * engine we therefore verify the node first instead of running the wrong engine.
  */
 
-import { PROTOCOL_VERSION, nodeProtocolOf, requiredProtocol, resolveOp } from "./protocol.js";
+import { nodeProtocolOf, requiredProtocol, resolveOp } from "./protocol.js";
 import { relayTimeoutWithGate } from "./verify.js";
 import { checkSetup } from "./policy.js";
 
@@ -64,7 +64,7 @@ function payloadOfResult(r: { payload?: unknown; payloadJSON?: string | null }):
  */
 async function probeProtocol(ctx: PolicyCtx): Promise<number> {
   const r = await ctx.invokeNode({
-    params: { prompt: "__RUN_STATUS__", cwd: "/", transport: "http", runId: PROBE_RUN_ID, op: "run.status", protocol: PROTOCOL_VERSION },
+    params: { prompt: "__RUN_STATUS__", cwd: "/", transport: "http", runId: PROBE_RUN_ID, op: "run.status" },  // no `protocol`: discovery must work against any node
     timeoutMs: 20_000,
   });
   if (!r.ok) throw new Error(r.message ?? "protocol probe failed");
@@ -84,6 +84,9 @@ export async function handleOpencodeRunPolicy(
   if (!task.cwd || typeof task.cwd !== "string") {
     return { ok: false, message: "opencode.run requires a cwd." };
   }
+  // The gateway decides what protocol a request needs; a caller-supplied value is ignored.
+  const { protocol: _ignored, ...taskNoProtocol } = task as Record<string, unknown>;
+  void _ignored;
   const resolved = resolveOp({ op: task.op, prompt: task.prompt });
   if (!resolved.ok) return { ok: false, message: resolved.error };
 
@@ -127,7 +130,10 @@ export async function handleOpencodeRunPolicy(
   const timeoutMs =
     baseTimeout !== undefined ? relayTimeoutWithGate(baseTimeout, launches && task.expect != null) : undefined;
   const result = await ctx.invokeNode({
-    params: { ...task, op: resolved.op, protocol: PROTOCOL_VERSION },
+    // Issue #61: stamp the MINIMUM protocol this request needs, and only when it
+    // needs one (already verified against the node above). Plain runs and the
+    // probe carry none, so an older node keeps serving them as before.
+    params: { ...taskNoProtocol, op: resolved.op, ...(need.version > 0 ? { protocol: need.version } : {}) },
     timeoutMs,
   });
   if (!result.ok) return { ok: false, message: result.message ?? "opencode.run failed on node." };
