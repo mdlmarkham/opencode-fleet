@@ -34,6 +34,11 @@ describe("issue #33: pure policy", () => {
     // and it never grows a second prefix on the sync branch either
     expect(resolveDestination("master", "fleet/48-harness-cleanup", "sync-9", pol).branch).toBe("fleet/48-harness-cleanup");
   });
+  it("issue #68: a protected fleet/ worker branch falls back under fleet/sync/ without a double prefix", () => {
+    const p2 = { ...pol, protectedBranches: [...pol.protectedBranches, "fleet/x"] };
+    const d = resolveDestination("main", "fleet/x", "sync-1", p2);
+    expect(d.branch).not.toMatch(/fleet\/fleet\//);
+  });
   it("redirected names are always safe branch names", () => {
     for (const w of ["a b", "x..y", "-rf", "feat/.hidden", "weird\u0001name", "a.lock"]) {
       expect(isSafeBranchName(resolveDestination("main", w, "sync-1", pol).branch), w).toBe(true);

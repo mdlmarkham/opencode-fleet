@@ -364,6 +364,11 @@ export async function provisionToNode(
           const rcMatch = out.match(/---FLEET_SETUP_RC=(-?\d+)/);
           const rc = rcMatch ? parseInt(rcMatch[1], 10) : 0;
           setupResult = { ran: true, command: req.setup, ok: rc === 0, output: out.slice(-2000) };
+          // Setup ran as the SSH principal (often root): hand over what it created
+          // (node_modules, caches) and re-verify the worker can write (issue #71).
+          await execFileP("ssh", [...sshPrefix(nodeHost, SSH_ARGS), ownershipCommand(req.cwd, req.serviceUser)], {
+            timeout: 120_000,
+          });
         }
       } catch (setupErr) {
         setupResult = { ran: true, command: req.setup, ok: false, error: (setupErr as Error).message };
