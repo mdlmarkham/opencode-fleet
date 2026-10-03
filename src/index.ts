@@ -923,6 +923,51 @@ export default definePluginEntry({
     });
 
     api.registerTool({
+      name: "fleet_run_report",
+      label: "Fleet Run Report",
+      description:
+        "The audit manifest of a FINISHED fleet run (issue #42): files changed against the start commit, git diff --stat, commands the engine ran (when it reports them), exit code, duration, token/cost usage, verification result, scope, and event-log size, plus the dispatch spec from the ledger. Read it to see what an unattended run actually did (e.g. exit 0 with no files changed). Secrets are redacted. Fields that could not be captured are null/commandsRecorded:false, never an implied empty list.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          node: { type: "string", description: "Node display name or id." },
+          runId: { type: "string", description: "The fleet run id." },
+        },
+        required: ["node", "runId"],
+      },
+      execute: async (toolCallId, params, signal) => {
+        const p = params as { node: string; runId: string };
+        const list = await api.runtime.nodes.list();
+        const node = (list.nodes ?? []).find((n) => n.displayName === p.node || n.nodeId === p.node);
+        if (!node) return jsonResult(`Node "${p.node}" not found.`);
+        const st = payloadOf(
+          await api.runtime.nodes.invoke({
+            nodeId: node.nodeId,
+            command: "opencode.run",
+            params: { prompt: "__RUN_STATUS__", cwd: "/", transport: "http", runId: p.runId, report: true },
+            timeoutMs: 30_000,
+            signal,
+          }),
+        );
+        const { redactAudit } = await import("./audit.js");
+        const { loadLedger } = await import("./ledger.js");
+        const entry = (await loadLedger(api.rootDir ?? process.cwd())).find((r) => r.runId === p.runId);
+        const run = entry
+          ? { state: entry.state, harness: entry.harness, prompt: entry.prompt, spec: entry.spec, summary: entry.summary, verified: entry.verified ?? null }
+          : undefined;
+        if (!st.ok && st.error) return jsonResult(redactAudit({ ok: false, runId: p.runId, status: st.status ?? "missing-state", error: String(st.error), ...(run ? { run } : {}) }));
+        if (!st.finishedAt) {
+          return jsonResult(redactAudit({ ok: false, runId: p.runId, status: st.alive ? "running" : "no-completion-record", note: "the audit manifest is written once the run has finished; poll fleet_run_status", ...(run ? { run } : {}) }));
+        }
+        if (!st.manifest) {
+          return jsonResult(redactAudit({ ok: true, runId: p.runId, manifest: null, note: "the node did not return a manifest (it predates the audit trail); upgrade opencode-fleet on the node", ...(run ? { run } : {}) }));
+        }
+        return jsonResult(redactAudit({ ok: true, runId: p.runId, manifest: st.manifest, ...(run ? { run } : {}) }));
+      },
+    });
+
+    api.registerTool({
       name: "fleet_run_status",
       label: "Fleet Run Status",
       description:
