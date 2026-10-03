@@ -164,11 +164,16 @@ OPS["xfer.unpack"] = async ({ task, io, context }: OpCtx) => {
           return JSON.stringify({ ok: false, error: `bundle checksum mismatch (expected ${task.sha256.slice(0, 12)}…, got ${got.slice(0, 12)}…); refusing to unpack a corrupted transfer` });
         }
         await (await import("node:fs/promises")).writeFile(bundlePath, decoded);
+        // Issue #71 (F2): the clone runs as whatever principal the node process
+        // is; on SSH-free nodes the manager never ssh'd a chown, so hand the
+        // checkout to the node's service user (when present) so the worker
+        // principal can actually write it. Mirror of the SSH-path unpackCmd.
         const unpackCmd = [
           `rm -rf ${shq(task.cwd)}`,
           `mkdir -p ${shq(task.cwd)}`,
           `git clone -q ${shq(bundlePath)} ${shq(task.cwd)}`,
           task.commit ? `cd ${shq(task.cwd)} && git checkout -q ${shq(task.commit)}` : "",
+          `if id -u svcuser >/dev/null 2>&1; then chown -R svcuser:svcuser ${shq(task.cwd)}; fi`,
           `cd ${shq(task.cwd)} && git rev-parse HEAD`,
         ].filter(Boolean).join(" && ");
         const out = await runShell(unpackCmd, 180_000, context?.signal);

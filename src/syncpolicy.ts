@@ -95,12 +95,18 @@ export function resolveDestination(
   // Issue #68: if the worker branch is already `fleet/<...>`, keep that name (no
   // re-prefix); otherwise place it under `fleet/`. Candidates are tried in order.
   const candidates = (
-    safe.startsWith("fleet/")
-      ? [safe, `fleet/${safe}`, `fleet/sync/${safe}`, `fleet/redirect/${label}`]
+    safe.startsWith("fleet/") && safe.length > "fleet/".length
+      ? [safe, `fleet/fleet/${safe}`, `fleet/sync/${safe}`, `fleet/redirect/${label}`]
       : [`fleet/${safe || label}`, `fleet/sync/${safe || label}`, `fleet/redirect/${label}`]
-  ).map((b) => b.replace(/\.lock$/, "-lock"));
+  ).map((b) => b.replace(/\.lock$/, "-lock")).filter((b) => isSafeBranchName(b));
   const branch = candidates.find(open);
-  if (!branch) return { branch: `fleet/redirect/${label}-${Date.now()}`, redirectedFrom: requested };
+  if (!branch) {
+    // No safe, unprotected candidate (e.g. an empty label with an empty seed).
+    // Fall back to a guaranteed-safe unique ref rather than returning a bare
+    // "fleet/" (an invalid ref) — issue #68 F3.
+    const fallback = `fleet/redirect/${label || "sync"}-${Date.now()}`;
+    return { branch: isSafeBranchName(fallback) ? fallback : `fleet/redirect/sync-${Date.now()}`, redirectedFrom: requested };
+  }
   return { branch, redirectedFrom: requested };
 }
 
