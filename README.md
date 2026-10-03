@@ -105,7 +105,7 @@ The plugin bundles a **skill** (`skills/opencode-fleet/SKILL.md`) that teaches a
 Text an agent passes to `fleet_dispatch`/`fleet_provision` can originate from content the agent read, so these channels are restricted:
 
 - **`env`** — names that execute code or redirect configuration are refused (the dispatch fails and names them; they are never silently dropped): `BASH_ENV`, `ENV`, `NODE_OPTIONS`, `PYTHONSTARTUP`, `LD_*`, `GIT_SSH*`, `GIT_CONFIG*`, `XDG_CONFIG_HOME`, `OPENCODE_CONFIG*`, `OPENCODE_PERMISSION`, and similar. Ordinary variables (`CI`, API keys, proxies) pass.
-- **`setup`** — a repo-relative script path with plain arguments only, unless the operator sets `allowSetupCommands`.
+- **`setup`** — a repo-relative script path (it must contain a `/`, e.g. `scripts/setup.sh` or `./setup.sh`, so bare names like `sh -c id` are refused) with plain arguments only, unless the operator sets `allowSetupCommands`. Operators can narrow `env` further with `env.allowOnly` / `env.extraDeny`.
 - **`autoApprove`** — opt-in per dispatch, and forbiddable with `allowAutoApprove: false`. It widens what a detached worker may do without asking; pair it with deny rules on the node.
 - **`cwd`** — confined to the node's allowed roots (`FLEET_ALLOWED_ROOTS`, default: the fleet workspace root and the service home).
 
