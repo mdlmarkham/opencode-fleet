@@ -109,6 +109,19 @@ export function capLedger(runs: LedgerEntry[], cap = LEDGER_TERMINAL_CAP): Ledge
   });
 }
 
+/**
+ * Which run does `fleet_abort` mean when given only a sessionId (issue #63)?
+ * Entries must match the session AND the node. Prefers the newest non-terminal
+ * run (running, timed-out, ... — a worker may still be alive), else the newest
+ * match overall. Independent of the ledger's stored order.
+ */
+export function resolveAbortRunId(runs: LedgerEntry[], sessionId: string, nodeNames: string[]): string | undefined {
+  const hits = runs
+    .filter((r) => r.sessionId === sessionId && nodeNames.includes(r.node))
+    .sort((a, b) => (a.startedAt < b.startedAt ? 1 : a.startedAt > b.startedAt ? -1 : 0));
+  return (hits.find((r) => !TERMINAL.has(r.state)) ?? hits[0])?.runId;
+}
+
 // Writers to the same ledger file are serialized in-process: fan-out dispatch
 // upserts concurrently, and an unserialized read-modify-write loses updates
 // (and raced on a shared temp file name).

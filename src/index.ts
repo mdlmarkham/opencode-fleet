@@ -2005,14 +2005,14 @@ export default definePluginEntry({
     api.registerTool({
       name: "fleet_abort",
       label: "Fleet Abort",
-      description: "Abort a running OpenCode session on a fleet node.",
+      description: "Abort a run on a fleet node. Needs the runId (from fleet_dispatch); a sessionId is accepted if the ledger knows the run it belongs to. Never kills by name pattern.",
       parameters: {
         type: "object",
         additionalProperties: false,
         properties: {
           node: { type: "string", description: "Node display name or id." },
-          sessionId: { type: "string", description: "Optional session id to abort." },
-          runId: { type: "string", description: "Optional runId (from fleet_dispatch). When given, terminates the recorded run engine-independently (works for Pi and opencode) and reports confirmed termination." },
+          sessionId: { type: "string", description: "Session id; resolved to its runId through the ledger when runId is omitted." },
+          runId: { type: "string", description: "The runId (from fleet_dispatch). Terminates that run engine-independently (Pi and opencode) and reports confirmed termination." },
         },
         required: ["node"],
       },
@@ -2021,10 +2021,23 @@ export default definePluginEntry({
         const list = await api.runtime.nodes.list();
         const node = (list.nodes ?? []).find((n) => n.displayName === p.node || n.nodeId === p.node);
         if (!node) return jsonResult(`Node "${p.node}" not found.`);
+        // Issue #63: abort addresses one run. Resolve a sessionId through the ledger.
+        let runId = p.runId;
+        if (!runId && p.sessionId) {
+          const { loadLedger, resolveAbortRunId } = await import("./ledger.js");
+          runId = resolveAbortRunId(
+            await loadLedger(api.rootDir ?? process.cwd()),
+            p.sessionId,
+            [node.displayName, node.nodeId].filter((x): x is string => !!x),
+          );
+        }
+        if (!runId) {
+          return jsonResult({ ok: false, aborted: false, error: "runId required: pass the runId from fleet_dispatch, or a sessionId the ledger recorded for this node" });
+        }
         const inv = await api.runtime.nodes.invoke({
           nodeId: node.nodeId,
           command: "opencode.run",
-          params: { prompt: "__ABORT__", cwd: "/", transport: "http", sessionId: p.sessionId, runId: p.runId },
+          params: { prompt: "__ABORT__", cwd: "/", transport: "http", sessionId: p.sessionId, runId },
           timeoutMs: 15000,
           signal,
         });
