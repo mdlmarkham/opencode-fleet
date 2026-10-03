@@ -35,12 +35,12 @@ describe("issue #13 layer 3: fleet_sync destination branch", () => {
     // The old buggy line must be gone.
     expect(provision).not.toContain("const destBranch = prebuilt.branch ?? branch;");
     // The from-base64 path must route through the resolver.
-    expect(provision).toContain("const destBranch = chooseDest(workerBranch, prebuilt.destBranch);");
+    expect(provision).toContain("let destBranch = chooseDest(workerBranch, prebuilt.destBranch);");
   });
 
   it("does not infer the SSH destination from workerBranch !== branch alone", () => {
     expect(provision).not.toContain("const destBranch = workerBranch !== branch ? workerBranch : branch;");
-    expect(provision).toContain("const destBranch = chooseDest(workerBranch, destBranchPinned);");
+    expect(provision).toContain("let destBranch = chooseDest(workerBranch, destBranchPinned);");
   });
 
   it("clones the clone base, never the worker branch, on both paths", () => {
@@ -52,7 +52,7 @@ describe("issue #13 layer 3: fleet_sync destination branch", () => {
 
   it("passes a pinned destination only when the caller explicitly named one", () => {
     // SSH path: 6th arg is `p.branch` (undefined when defaulted).
-    expect(index).toContain("syncFromNode(host, p.cwd, p.repo, p.branch ?? \"main\", undefined, p.branch)");
+    expect(index).toContain("syncFromNode(host, p.cwd, p.repo, p.branch ?? \"main\", undefined, p.branch, cfg.sync)");
     // Channel path: destBranch carries the raw (possibly undefined) caller value.
     expect(index).toContain("destBranch: p.branch,");
   });

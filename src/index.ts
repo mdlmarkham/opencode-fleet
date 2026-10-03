@@ -58,6 +58,8 @@ interface FleetConfig {
   allowAutoApprove?: boolean;
   /** Operator switch: let fleet_provision `setup` be an arbitrary shell command, not just a repo script (default false). */
   allowSetupCommands?: boolean;
+  /** fleet_sync publish policy (issue #33). */
+  sync?: { protectedBranches?: string[]; allowDirectPush?: string[]; allowSensitivePaths?: boolean; sensitivePaths?: string[] };
   /** Dispatch env refinements: allowOnly makes injection allowlist-only; extraDeny adds refused names. */
   env?: { allowOnly?: string[]; extraDeny?: string[] };
 }
@@ -100,6 +102,17 @@ export default definePluginEntry({
         properties: {
           allowOnly: { type: "array", items: { type: "string" }, description: "If set, only these variable names may be injected." },
           extraDeny: { type: "array", items: { type: "string" }, description: "Additional variable names to refuse." },
+        },
+      },
+      sync: {
+        type: "object",
+        additionalProperties: false,
+        description: "fleet_sync publish policy: protected branches are never pushed directly (work is redirected to fleet/<name>) unless listed in allowDirectPush.",
+        properties: {
+          protectedBranches: { type: "array", items: { type: "string" }, default: ["main", "master"] },
+          allowDirectPush: { type: "array", items: { type: "string" }, default: [] },
+          allowSensitivePaths: { type: "boolean", default: false, description: "Allow worker changes to CI/CODEOWNERS paths." },
+          sensitivePaths: { type: "array", items: { type: "string" }, default: [], description: "Extra path globs treated as sensitive (e.g. ci/**), added to the built-in list." },
         },
       },
       allowSetupCommands: {
@@ -265,6 +278,7 @@ export default definePluginEntry({
               `if [ -n "$DIRTY" ]; then git add -A && git -c user.email=fleet-worker@node -c user.name="fleet-worker" commit -q -m "fleet_sync: auto-commit worker working-tree changes before sync"; fi`,
               `git bundle create ${shq(join(accDir, "sync.bundle"))} --all`,
               `git rev-parse HEAD`,
+              `git rev-parse --abbrev-ref HEAD`,
               `echo "${B64_MARKER}"`,
               `base64 ${shq(join(accDir, "sync.bundle"))}`,
             ].filter(Boolean).join(" && "),
@@ -276,7 +290,7 @@ export default definePluginEntry({
           await (await import("node:fs/promises")).writeFile(join(accDir, "bundle.b64"), bundled.base64);
           const bundleBytes = await (await import("node:fs/promises")).readFile(join(accDir, "sync.bundle"));
           return JSON.stringify({
-            ok: true, transferId, staged: true, head: bundled.head,
+            ok: true, transferId, staged: true, head: bundled.head, branch: bundled.branch,
             sha256: createHash("sha256").update(bundleBytes).digest("hex"), bytes: bundleBytes.length,
           });
         }
@@ -1655,7 +1669,7 @@ export default definePluginEntry({
           node: { type: "string", description: "Node display name or id." },
           cwd: { type: "string", description: "Working directory on the node." },
           repo: { type: "string", description: "Git URL the manager can access." },
-          branch: { type: "string", description: "Destination branch to publish the worker's work to. When omitted, the worker's own checked-out branch is published if it differs from `main` (so feature-branch work stays reviewable); otherwise `main`." },
+          branch: { type: "string", description: "Destination branch to publish the worker's work to. When omitted, the worker's own checked-out branch is published if it differs from `main`. A protected destination (default main/master) is not pushed directly: the work goes to `fleet/<name>` and the result reports `redirectedFrom`, unless the operator lists the branch in sync.allowDirectPush." },
         },
         required: ["node", "cwd", "repo"],
       },
@@ -1710,13 +1724,16 @@ export default definePluginEntry({
             mode: "from-base64",
             base64: assembled,
             branch: p.branch ?? "main",
+            // The branch the worker actually has checked out (SSH-free path), so a
+            // feature-branch worker publishes its own commits instead of the base.
+            workerBranch: typeof bundlePl.branch === "string" ? bundlePl.branch : undefined,
             destBranch: p.branch,
-          });
+          }, undefined, cfg.sync);
           return jsonResult({ ...r, viaChannel: true });
         }
 
         const { syncFromNode } = await import("./provision.js");
-        const r = await syncFromNode(host, p.cwd, p.repo, p.branch ?? "main", undefined, p.branch);
+        const r = await syncFromNode(host, p.cwd, p.repo, p.branch ?? "main", undefined, p.branch, cfg.sync);
         return jsonResult(r);
       },
     });

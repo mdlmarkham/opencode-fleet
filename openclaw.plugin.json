@@ -95,6 +95,43 @@
             "description": "Additional variable names to refuse."
           }
         }
+      },
+      "sync": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "fleet_sync publish policy: protected branches are never pushed directly (work is redirected to fleet/<name>) unless listed in allowDirectPush.",
+        "properties": {
+          "protectedBranches": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [
+              "main",
+              "master"
+            ]
+          },
+          "allowDirectPush": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": []
+          },
+          "allowSensitivePaths": {
+            "type": "boolean",
+            "default": false,
+            "description": "Allow worker changes to CI/CODEOWNERS paths."
+          },
+          "sensitivePaths": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [],
+            "description": "Extra path globs treated as sensitive (e.g. ci/**), added to the built-in list."
+          }
+        }
       }
     }
   },

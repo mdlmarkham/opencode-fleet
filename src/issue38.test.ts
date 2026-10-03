@@ -56,13 +56,19 @@ describe("issue #38: __BUNDLE__ parsing against a real bundle", () => {
   it("splits head and base64 payload that decodes to the bundle", () => {
     const d = repo(0);
     try {
-      const out = sh(`git bundle create ${q(join(d, "s.bundle"))} --all 2>/dev/null && git rev-parse HEAD && echo "${B64_MARKER}" && base64 ${q(join(d, "s.bundle"))}`, d);
+      const out = sh(`git bundle create ${q(join(d, "s.bundle"))} --all 2>/dev/null && git rev-parse HEAD && git rev-parse --abbrev-ref HEAD && echo "${B64_MARKER}" && base64 ${q(join(d, "s.bundle"))}`, d);
       const r = parseBundleOutput(out);
       expect(r.ok).toBe(true);
       if (!r.ok) return;
       expect(r.head).toBe(sh("git rev-parse HEAD", d).trim());
+      expect(r.branch).toBe("main");
       expect(Buffer.from(r.base64, "base64").equals(readFileSync(join(d, "s.bundle")))).toBe(true);
     } finally { rmSync(d, { recursive: true, force: true }); }
+  });
+  it("a detached HEAD leaves the branch unknown; a feature branch is reported", () => {
+    expect(parseBundleOutput(`abc123\nHEAD\n${B64_MARKER}\nQUJD\n`)).toMatchObject({ ok: true, head: "abc123" });
+    expect((parseBundleOutput(`abc123\nHEAD\n${B64_MARKER}\nQUJD\n`) as { branch?: string }).branch).toBeUndefined();
+    expect(parseBundleOutput(`abc123\nfeature/x\n${B64_MARKER}\nQUJD\n`)).toMatchObject({ ok: true, branch: "feature/x" });
   });
   it("fails closed without a marker or with an empty payload", () => {
     expect(parseBundleOutput("fatal: not a git repository").ok).toBe(false);
