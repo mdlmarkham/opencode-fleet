@@ -88,6 +88,32 @@ After the worker exits, the node evaluates the gate in the run's cwd and records
 
 The outcome is recorded as `verified: boolean` with per-check `verifyDetails`, and is surfaced by `fleet_run_status`. **`verified` is separate from `ok`** (`ok` remains the raw process exit status): `ok: true, verified: false` means the worker exited cleanly but the expected artifacts were not produced — treat the run as unverified, not successful. Omitting `expect` changes nothing (`verified: null`).
 
+## Task spec (structured dispatch)
+
+`fleet_dispatch` also accepts a structured task spec as the dispatch unit (issue #65):
+
+```jsonc
+{
+  "cwd": "...",
+  "spec": {
+    "goal": "Implement the config loader",
+    "acceptance": ["loads YAML", "fails loudly on bad input"],
+    "verify": { "files": ["dist/index.js"], "command": "npm test -- --silent" }
+  }
+}
+```
+
+- When `spec` is given, the engine prompt is **rendered** from it: the goal on the
+  first line, then an `Acceptance criteria:` bullet list (`spec.ts/renderSpec`).
+  The flat `prompt` is optional then and ignored.
+- `spec.verify` maps onto the **same verification gate** as the flat `expect`
+  param above — same parser, same node-side evaluator, same `verified`/`verifyDetails`
+  recording and ledger shape. A spec without `verify` runs gateless (nothing extra).
+- A prompt-only dispatch behaves exactly as before (`renderSpec({goal: prompt})`
+  returns the prompt byte-identically), and the spec is recorded on the run's
+  ledger entry.
+- A call with neither `prompt` nor `spec` is refused.
+
 ## Install
 
 ```bash
