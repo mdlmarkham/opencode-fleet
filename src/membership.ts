@@ -13,7 +13,7 @@
  *     "dev2":    { "roles": ["worker"], "ssh": true },
  *     "desktop": { "roles": ["worker"], "ssh": false }
  *   },
- *   "nodePrefixes": ["dev"]   // fallback when `nodes` absent
+ *   "nodePrefixes": ["dev"]   // optional fallback when `nodes` is absent; no default
  * }
  *
  * Keys are matched against the node's operator display name (case-insensitive,
@@ -92,7 +92,7 @@ export function resolveFleetNodes(
       continue;
     }
     // Fallback: prefix auto-include (legacy behavior).
-    const prefixes = cfg.nodePrefixes ?? ["dev"];
+    const prefixes = cfg.nodePrefixes ?? [];
     if (prefixes.some((p) => name.startsWith(p))) {
       out.push({ ...n, viaPrefix: true });
     }

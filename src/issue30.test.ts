@@ -25,9 +25,9 @@ import { shq } from "./shell.js";
  */
 
 describe("issue #30A: buildOpenCodeCommand (pi) + autoApprove", () => {
-  it("drives pi with the default Pi model, prompt via stdin (findings B+C)", () => {
-    const cmd = buildOpenCodeCommand({ prompt: "do work", cwd: "/work", transport: "http", harness: "pi" });
-    expect(cmd).toContain("pi -p --model 'aperture/glm-5.3-flash:cloud'");
+  it("drives pi with the supplied Pi model, prompt via stdin (findings B+C)", () => {
+    const cmd = buildOpenCodeCommand({ prompt: "do work", cwd: "/work", transport: "http", harness: "pi", piModel: "p/m1" });
+    expect(cmd).toContain("pi -p --model 'p/m1'");
     expect(cmd).toContain("printf '%s' 'do work' |");
     expect(cmd).not.toContain("opencode run");
   });
@@ -38,10 +38,16 @@ describe("issue #30A: buildOpenCodeCommand (pi) + autoApprove", () => {
       cwd: "/w",
       transport: "http",
       harness: "pi",
+      piModel: "p/m1",
       model: "aperture-anthropic/claude-sonnet-4",
     });
     expect(cmd).not.toContain("aperture-anthropic");
-    expect(cmd).toContain("'aperture/glm-5.3-flash:cloud'");
+    expect(cmd).toContain("'p/m1'");
+  });
+
+  it("issue #44: there is no built-in Pi model; a missing piModel is a hard error", () => {
+    expect(() => buildOpenCodeCommand({ prompt: "x", cwd: "/w", transport: "http", harness: "pi", model: "aperture-anthropic/x" }))
+      .toThrow(/requires piModel/);
   });
 
   it("honors an explicit piModel", () => {
@@ -54,7 +60,7 @@ describe("issue #30A: buildOpenCodeCommand (pi) + autoApprove", () => {
     // positional `-`-leading prompt is parsed as a flag. The fix pipes the
     // prompt via stdin, quoted.
     const hostile = `-rf /; echo "$(id)" && it's`;
-    const cmd = buildOpenCodeCommand({ prompt: hostile, cwd: "/w", transport: "http", harness: "pi" });
+    const cmd = buildOpenCodeCommand({ prompt: hostile, cwd: "/w", transport: "http", harness: "pi", piModel: "p/m1" });
     expect(cmd).toContain(`printf '%s' ${shq(hostile)} |`);
     expect(cmd).toContain("pi -p --model");
     // No `--` end-of-options separator (pi rejects it: Unknown option: --),

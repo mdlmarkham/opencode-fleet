@@ -12,7 +12,7 @@
 import { realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { FLEET_ROOT } from "./cwd.js";
+import { FLEET_DIRNAME } from "./cwd.js";
 
 /** Allowed shape for runId / transferId: safe as a path segment and as a shell word. */
 export const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
@@ -37,7 +37,7 @@ export function allowedRoots(
   home: string = homedir(),
 ): string[] {
   const raw = env.FLEET_ALLOWED_ROOTS?.trim();
-  const roots = raw ? raw.split(/[:;]/).map((s) => s.trim()).filter(Boolean) : [FLEET_ROOT, home];
+  const roots = raw ? raw.split(/[:;]/).map((s) => s.trim()).filter(Boolean) : [join(home, FLEET_DIRNAME), home];
   return roots.filter((r) => isAbsolute(r)).map((r) => resolve(r));
 }
 
@@ -57,7 +57,7 @@ export function checkCwd(cwd: unknown, roots: string[], resolved?: string): CwdC
   }
   const target = resolve(resolved ?? cwd);
   // Refuse a target equal to ANY allowed root. The roots can nest (e.g.
-  // FLEET_ROOT=/home/u/fleet is a descendant of home=/home/u), so a plain
+  // <home>/fleet is a descendant of home=/home/u), so a plain
   // strict-descendant test would ADMIT the workspace root as a child of home.
   // A destructive op (rm -rf) on a root would wipe the whole workspace.
   for (const root of roots) {

@@ -92,9 +92,11 @@ The plugin bundles a **skill** (`skills/opencode-fleet/SKILL.md`) that teaches a
 | Key | Default | Description |
 |---|---|---|
 | `defaultTransport` | `http` | Default OpenCode transport |
-| `nodePrefixes` | `["dev"]` | Node display-name prefixes treated as fleet members |
+| `nodePrefixes` | _(none)_ | Optional fallback: node display-name prefixes treated as fleet members when `nodes` does not list them. No default. |
 | `defaultTimeoutMs` | `300000` | Default timeout for OpenCode runs |
-| `apertureUrl` | `https://ai.tailf9480.ts.net/v1/models` | Aperture model catalog URL |
+| `apertureUrl` | _(none)_ | Model catalog URL (OpenAI-style `/v1/models`). `fleet_models` and live model resolution need it. |
+| `fleetRoot` | _(derived)_ | Shared workspace root on nodes, the default provisioning cwd. Derived as `/home/<serviceUser>/fleet` when every target node has the same `serviceUser`; otherwise pass `cwd` or set this. |
+| `piDefaultModel` | _(none)_ | Pi model ref (`provider/id`) for `harness: "pi"` when the dispatch names no `piModel`. There is no built-in default; without either, a Pi dispatch is refused. |
 | `allowAutoApprove` | `true` | Whether `fleet_dispatch` may pass `autoApprove` (`opencode run --auto`, auto-approves every non-denied permission). Set `false` to forbid it fleet-wide. |
 | `allowSetupCommands` | `false` | Whether `fleet_provision`'s `setup` may be an arbitrary shell command. By default it must be a repo-relative script path with plain arguments (e.g. `scripts/setup.sh`). |
 | `sync` | see below | `fleet_sync` publish policy: `protectedBranches` (default `["main","master"]`), `allowDirectPush` (default `[]`), `allowSensitivePaths` (default `false`), `sensitivePaths` (extra path globs, e.g. `ci/**`, added to the built-in list). |

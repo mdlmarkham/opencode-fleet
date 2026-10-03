@@ -21,9 +21,7 @@
         "items": {
           "type": "string"
         },
-        "default": [
-          "dev"
-        ],
+        "default": [],
         "description": "Fallback: prefixes treated as fleet members when nodes is not configured"
       },
       "defaultTimeoutMs": {
@@ -132,6 +130,18 @@
             "description": "Extra path globs treated as sensitive (e.g. ci/**), added to the built-in list."
           }
         }
+      },
+      "apertureUrl": {
+        "type": "string",
+        "description": "Model catalog URL (OpenAI-style /v1/models). No default: fleet_models and live model resolution are unavailable until set."
+      },
+      "fleetRoot": {
+        "type": "string",
+        "description": "Shared workspace root on nodes, used as the default provisioning cwd. Default: /home/<serviceUser>/fleet when every target node names the same service user."
+      },
+      "piDefaultModel": {
+        "type": "string",
+        "description": "Pi model ref (provider/id) used when harness=pi and the dispatch names no piModel. No built-in default."
       }
     }
   },
