@@ -36,6 +36,10 @@ import {
   runShell,
   runShellDetailed,
   runStatePath,
+  PS_TABLE_COMMAND,
+  parseProcessTable,
+  runScriptRows,
+  selfStateLines,
   verifyGateScript,
 } from "./runtime.js";
 
@@ -275,6 +279,8 @@ OPS["run.start"] = async ({ task, io, context }: OpCtx) => {
         // enough on its own; we already fail closed at each step, and the
         // final exit propagates the worker's real status.
         "set -u",
+        // The script publishes its own pid/pgid/state first (issues #64, #69).
+        ...selfStateLines(statePath, { runId, harness: task.harness ?? "opencode", ...(task.piModel ? { piModel: task.piModel } : {}) }),
         inner,
         `EC=$?`,
         ...(gate?.verifyLines ?? []),
@@ -297,19 +303,27 @@ OPS["run.start"] = async ({ task, io, context }: OpCtx) => {
           error: `launch failed (no LAUNCHED_PID): ${launchOut.trim().slice(0, 200) || "empty launcher output"}`,
         });
       }
-      await writePrivate(
-        statePath,
-        // Issue #30 finding F: persist the harness so __RUN_RESULT__ can
-        // select the correct parser later (Pi is NOT opencode NDJSON).
-        JSON.stringify({
-          runId,
-          pid: Number(pidMatch[1]),
-          startedAt: new Date().toISOString(),
-          state: "running",
-          harness: task.harness ?? "opencode",
-        }),
-      );
-      return JSON.stringify({ ok: true, detached: true, runId, pid: Number(pidMatch[1]), statePath, logPath, harness: task.harness ?? "opencode" });
+      // The script writes its own state (real pid and group) as its first action.
+      // Wait briefly for it; if it has not appeared (a very loaded node) fall back
+      // to the launcher subshell's pid, marked as such. Abort and liveness do not
+      // depend on this pid: they find the run by its script.
+      const launcherPid = Number(pidMatch[1]);
+      let selfState: { pid?: number; pgid?: number } | undefined;
+      for (let i = 0; i < 40 && !selfState; i++) {
+        try {
+          const st = JSON.parse(await (await import("node:fs/promises")).readFile(statePath, "utf8")) as { pid?: number; pgid?: number };
+          if (Number.isInteger(st.pid) && (st.pid as number) > 1) selfState = st;
+        } catch { /* not written yet */ }
+        if (!selfState) await new Promise((r) => setTimeout(r, 100));
+      }
+      if (!selfState) {
+        await writePrivate(
+          statePath,
+          JSON.stringify({ runId, pid: launcherPid, pidSource: "launcher", startedAt: new Date().toISOString(), state: "running", harness: task.harness ?? "opencode", ...(task.piModel ? { piModel: task.piModel } : {}) }),
+        );
+      }
+      const runPid = selfState?.pid ?? launcherPid;
+      return JSON.stringify({ ok: true, detached: true, runId, pid: runPid, ...(selfState?.pgid ? { pgid: selfState.pgid } : {}), pidSource: selfState ? "script" : "launcher", statePath, logPath, harness: task.harness ?? "opencode" });
 };
 
 OPS["run.status"] = async ({ task, io, context }: OpCtx) => {
@@ -334,10 +348,16 @@ OPS["run.status"] = async ({ task, io, context }: OpCtx) => {
           }
         } catch { /* still running or not finished */ }
         // Liveness: is the pid still alive?
+        // Alive = the run's script is in the process table (not `kill -0` on a
+        // recorded pid, which may be the launcher subshell or a reused pid).
         let alive = false;
-        if (st.pid) {
-          const ps = await runShell(`kill -0 ${st.pid} 2>/dev/null && echo ALIVE || echo DEAD`, 10_000, context?.signal);
-          alive = ps.includes("ALIVE");
+        try {
+          alive = runScriptRows(parseProcessTable(await runShell(PS_TABLE_COMMAND, 10_000, context?.signal)), runScriptPath(runId)).length > 0;
+        } catch {
+          if (st.pid) {
+            const ps = await runShell(`kill -0 ${Number(st.pid)} 2>/dev/null && echo ALIVE || echo DEAD`, 10_000, context?.signal);
+            alive = ps.includes("ALIVE");
+          }
         }
         return JSON.stringify({ ok: true, runId, ...st, alive, verified: typeof st.verified === "boolean" ? st.verified : null, verifyDetails: st.verifyDetails ?? null });
       } catch {
@@ -353,6 +373,14 @@ OPS["run.status"] = async ({ task, io, context }: OpCtx) => {
           .stat(runPaths(runId).log)
           .then(() => true)
           .catch(() => false);
+        // A state file that EXISTS but could not be parsed is not "cleaned" (#64).
+        const stateExists = await (await import("node:fs/promises"))
+          .stat(runStatePath(runId))
+          .then(() => true)
+          .catch(() => false);
+        if (stateExists) {
+          return JSON.stringify({ ok: false, status: "unknown-state", error: "run state file exists but is unreadable or not valid JSON" });
+        }
         return JSON.stringify({
           ok: false,
           status: scriptExists || logExists ? "cleaned" : "never-started",
