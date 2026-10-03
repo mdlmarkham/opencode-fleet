@@ -28,18 +28,7 @@ jobs:
       - run: npm run build
       - run: npm test
 
-  # Checks the manifest against the registered tools. Reported but not yet
-  # required: it has not been run in CI before, so a failure here is a prompt to
-  # look, not a blocker, until it has proven stable (then drop continue-on-error).
-  plugin-validate:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .nvmrc
-          cache: npm
-      - run: npm ci
-      - run: npm run plugin:validate
+  # NOTE: `openclaw plugins validate` is deliberately not run. This plugin registers
+  # its tools with definePluginEntry (not defineToolPlugin), so the validator rejects
+  # the entry ("does not expose defineToolPlugin metadata") by design. The manifest
+  # <-> tool-surface contract is covered by src/index.test.ts instead.
