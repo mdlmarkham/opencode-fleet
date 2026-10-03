@@ -50,7 +50,7 @@ interface FleetConfig {
   /** Operator switch: let fleet_provision `setup` be an arbitrary shell command, not just a repo script (default false). */
   allowSetupCommands?: boolean;
   /** fleet_sync publish policy (issue #33). */
-  sync?: { protectedBranches?: string[]; allowDirectPush?: string[]; allowSensitivePaths?: boolean; sensitivePaths?: string[] };
+  sync?: { protectedBranches?: string[]; allowDirectPush?: string[]; allowSensitivePaths?: boolean; sensitivePaths?: string[]; requireVerified?: boolean };
   /** Dispatch env refinements: allowOnly makes injection allowlist-only; extraDeny adds refused names. */
   env?: { allowOnly?: string[]; extraDeny?: string[] };
   /** SSH client policy for manager-to-node commands. */
@@ -104,6 +104,7 @@ export default definePluginEntry({
         properties: {
           protectedBranches: { type: "array", items: { type: "string" }, default: ["main", "master"] },
           allowDirectPush: { type: "array", items: { type: "string" }, default: [] },
+          requireVerified: { type: "boolean", default: false, description: "Refuse fleet_sync for work with no verification result (a run that did not use expect/spec.verify). A run whose gate FAILED is always refused unless allowUnverified is passed." },
           allowSensitivePaths: { type: "boolean", default: false, description: "Allow worker changes to CI/CODEOWNERS paths." },
           sensitivePaths: { type: "array", items: { type: "string" }, default: [], description: "Extra path globs treated as sensitive (e.g. ci/**), added to the built-in list." },
         },
@@ -1517,12 +1518,13 @@ export default definePluginEntry({
           node: { type: "string", description: "Node display name or id." },
           cwd: { type: "string", description: "Working directory on the node." },
           repo: { type: "string", description: "Git URL the manager can access." },
+          allowUnverified: { type: "boolean", description: "Publish even though the latest fleet run on this node and checkout FAILED its verification gate (or, with sync.requireVerified, has none). Off by default." },
           branch: { type: "string", description: "Clone BASE branch: a branch that already EXISTS on origin, checked out so the worker's changes can be applied on top of it (default main). NOT the destination — the destination is resolved from the worker's own branch (or from a pinned destination set internally); a protected destination is redirected to `fleet/<name>` and reported as `redirectedFrom`." },
         },
         required: ["node", "cwd", "repo"],
       },
       execute: async (toolCallId, params, signal) => {
-        const p = params as { node: string; cwd: string; repo: string; branch?: string };
+        const p = params as { node: string; cwd: string; repo: string; branch?: string; allowUnverified?: boolean };
         const list = await api.runtime.nodes.list();
         const nodes = list.nodes ?? [];
         const node = nodes.find((n) => n.displayName === p.node || n.nodeId === p.node);
@@ -1531,6 +1533,15 @@ export default definePluginEntry({
         const cfg = (api.pluginConfig ?? {}) as FleetConfig;
         const fleet = (await import("./membership.js")).resolveFleetNodes(nodes, cfg);
         const member = fleet.find((t) => (t.displayName ?? t.nodeId) === (node.displayName ?? node.nodeId))?.member;
+
+        // Issue #65: do not publish work whose verification gate failed.
+        const { loadLedger, latestRunFor, syncGate } = await import("./ledger.js");
+        const gate = syncGate(
+          latestRunFor(await loadLedger(api.rootDir ?? process.cwd()), [node.displayName, node.nodeId].filter((x): x is string => !!x), p.cwd),
+          { allowUnverified: p.allowUnverified === true, requireVerified: cfg.sync?.requireVerified === true },
+        );
+        if (!gate.allow) return jsonResult({ ok: false, error: gate.reason, verified: gate.verified, ...(gate.runId ? { runId: gate.runId } : {}) });
+        const gateNote = gate.reason ? { verifiedNote: gate.reason, verified: gate.verified } : { verified: gate.verified };
 
         // SSH-free node: bundle on the worker via the node channel, pull the
         // base64 back in chunks, then push with manager credentials.
@@ -1577,12 +1588,12 @@ export default definePluginEntry({
             workerBranch: typeof bundlePl.branch === "string" ? bundlePl.branch : undefined,
             destBranch: p.branch,
           }, undefined, cfg.sync);
-          return jsonResult({ ...r, viaChannel: true });
+          return jsonResult({ ...r, ...gateNote, viaChannel: true });
         }
 
         const { syncFromNode } = await import("./provision.js");
         const r = await syncFromNode(host, p.cwd, p.repo, p.branch ?? "main", undefined, p.branch, cfg.sync);
-        return jsonResult(r);
+        return jsonResult({ ...r, ...gateNote });
       },
     });
 
@@ -1773,7 +1784,8 @@ export default definePluginEntry({
           transport: { type: "string", enum: ["http", "acp"], description: "Transport used." },
           tokens: { type: "number", description: "Token usage." },
           cost: { type: "number", description: "Cost in USD." },
-          success: { type: "boolean", description: "Whether the task succeeded." },
+          success: { type: "boolean", description: "Whether the task succeeded. Not trusted on its own: with runId, a run whose verification gate or process FAILED is recorded as a failure whatever is passed here." },
+          runId: { type: "string", description: "The fleet runId this outcome is about. When given, success is derived from the run's recorded result (verified/state), never from self-report alone." },
           churn: { type: "boolean", description: "Whether the task churned (too-light model / repeated attempts)." },
           rating: { type: "number", description: "Subjective rating 1-5 (5 = excellent fit for this task)." },
           goodFor: { type: "string", description: "What this combo was good for (indication)." },
@@ -1793,6 +1805,7 @@ export default definePluginEntry({
           tokens?: number;
           cost?: number;
           success: boolean;
+          runId?: string;
           churn?: boolean;
           rating?: number;
           goodFor?: string;
@@ -1801,21 +1814,27 @@ export default definePluginEntry({
         };
         const { recordOutcome } = await import("./recipes.js");
         const storePath = join(api.rootDir ?? process.cwd(), "recipes.json");
+        // Issue #65: success derives from the recorded run, not from self-report.
+        let derived = { success: p.success, overridden: false };
+        if (p.runId) {
+          const { loadLedger, recipeSuccess } = await import("./ledger.js");
+          derived = recipeSuccess(p.success, (await loadLedger(api.rootDir ?? process.cwd())).find((r) => r.runId === p.runId));
+        }
         const entry = await recordOutcome(storePath, {
           taskType: p.taskType,
           codebase: p.codebase,
           combo: { model: p.model, thinking: p.thinking, agent: p.agent, transport: p.transport },
           tokens: p.tokens,
           cost: p.cost,
-          success: p.success,
+          success: derived.success,
           churn: p.churn,
           rating: p.rating,
           goodFor: p.goodFor,
           badFor: p.badFor,
-          notes: p.notes,
+          notes: derived.overridden ? `${p.notes ? `${p.notes}\n` : ""}success overridden to false: run ${p.runId} failed (verification gate or process).` : p.notes,
           timestamp: new Date().toISOString(),
         });
-        return jsonResult(entry);
+        return jsonResult(derived.overridden ? { ...entry, successOverridden: true } : entry);
       },
     });
 

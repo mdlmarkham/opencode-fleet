@@ -116,6 +116,11 @@
             },
             "default": []
           },
+          "requireVerified": {
+            "type": "boolean",
+            "default": false,
+            "description": "Refuse fleet_sync for work with no verification result (a run that did not use expect/spec.verify). A run whose gate FAILED is always refused unless allowUnverified is passed."
+          },
           "allowSensitivePaths": {
             "type": "boolean",
             "default": false,
