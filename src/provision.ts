@@ -268,6 +268,13 @@ export async function provisionToNode(
       `git clone -q ${shq(remoteBundle)} ${shq(req.cwd)}`,
       req.commit ? `cd ${shq(req.cwd)} && git checkout -q ${shq(req.commit)}` : "",
       `cd ${shq(req.cwd)} && git gc --prune=now 2>/dev/null`,
+      // Issue #71: the manager lands as the SSH principal (root by default),
+      // so the clone would be root-owned and the worker principal could not
+      // write it (mkdir/edit/branch all fail — a silent no-op). Hand the
+      // checkout to the node's service user. `id -u svcuser` is used when the
+      // user exists; otherwise fall back to the SSH principal's uid (so an
+      // already-correct owner is not broken).
+      `if id -u svcuser >/dev/null 2>&1; then chown -R svcuser:svcuser ${shq(req.cwd)}; fi`,
       // Issue #14: set safe.directory for the landing principal right after
       // the clone, before any later operation can trip over dubious ownership.
       safeDirCmd,

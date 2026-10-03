@@ -28,6 +28,12 @@ describe("issue #33: pure policy", () => {
     expect(resolveDestination("release", "release", "l", p).redirectedFrom).toBe("release");
     expect(resolveDestination("main", "main", "l", p).redirectedFrom).toBeUndefined();
   });
+  it("issue #68: a worker branch already under fleet/ is not re-prefixed", () => {
+    expect(resolveDestination("main", "fleet/verify-gate", "sync-1", pol)).toEqual({ branch: "fleet/verify-gate", redirectedFrom: "main" });
+    expect(resolveDestination("main", "fleet/feature/x", "sync-1", pol).branch).toBe("fleet/feature/x");
+    // and it never grows a second prefix on the sync branch either
+    expect(resolveDestination("master", "fleet/48-harness-cleanup", "sync-9", pol).branch).toBe("fleet/48-harness-cleanup");
+  });
   it("redirected names are always safe branch names", () => {
     for (const w of ["a b", "x..y", "-rf", "feat/.hidden", "weird\u0001name", "a.lock"]) {
       expect(isSafeBranchName(resolveDestination("main", w, "sync-1", pol).branch), w).toBe(true);

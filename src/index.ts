@@ -1514,7 +1514,7 @@ export default definePluginEntry({
           node: { type: "string", description: "Node display name or id." },
           cwd: { type: "string", description: "Working directory on the node." },
           repo: { type: "string", description: "Git URL the manager can access." },
-          branch: { type: "string", description: "Destination branch to publish the worker's work to. When omitted, the worker's own checked-out branch is published if it differs from `main`. A protected destination (default main/master) is not pushed directly: the work goes to `fleet/<name>` and the result reports `redirectedFrom`, unless the operator lists the branch in sync.allowDirectPush." },
+          branch: { type: "string", description: "Clone BASE branch: a branch that already EXISTS on origin, checked out so the worker's changes can be applied on top of it (default main). NOT the destination — the destination is resolved from the worker's own branch (or from a pinned destination set internally); a protected destination is redirected to `fleet/<name>` and reported as `redirectedFrom`." },
         },
         required: ["node", "cwd", "repo"],
       },
