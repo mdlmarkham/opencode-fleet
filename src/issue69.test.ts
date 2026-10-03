@@ -38,6 +38,10 @@ describe("#69: process table parsing", () => {
     expect(hits.map((r) => r.pid)).toEqual([500]);
     expect(runScriptRows(parseProcessTable(table), "/home/u/.openclaw/fleet/state/run-zzz.sh")).toEqual([]);
   });
+  it("an unrelated process that merely has `bash <script>` in its arguments is not the run", () => {
+    const rows = parseProcessTable("  9 9 9 S python helper.py /bin/bash /s/run-a.sh");
+    expect(runScriptRows(rows, "/s/run-a.sh")).toHaveLength(0);
+  });
   it("a path with regex metacharacters is matched literally", () => {
     const rows = parseProcessTable("  9 9 9 Ss /bin/bash /tmp/a.b+c/run(1).sh");
     expect(runScriptRows(rows, "/tmp/a.b+c/run(1).sh")).toHaveLength(1);

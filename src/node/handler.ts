@@ -36,7 +36,7 @@ import {
   runShell,
   runShellDetailed,
   runStatePath,
-  PS_TABLE_COMMAND,
+  listProcessTable,
   parseProcessTable,
   runScriptRows,
   selfStateLines,
@@ -352,7 +352,7 @@ OPS["run.status"] = async ({ task, io, context }: OpCtx) => {
         // recorded pid, which may be the launcher subshell or a reused pid).
         let alive = false;
         try {
-          alive = runScriptRows(parseProcessTable(await runShell(PS_TABLE_COMMAND, 10_000, context?.signal)), runScriptPath(runId)).length > 0;
+          alive = runScriptRows(parseProcessTable(await listProcessTable(context?.signal)), runScriptPath(runId)).length > 0;
         } catch {
           if (st.pid) {
             const ps = await runShell(`kill -0 ${Number(st.pid)} 2>/dev/null && echo ALIVE || echo DEAD`, 10_000, context?.signal);

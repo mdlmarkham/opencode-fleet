@@ -245,7 +245,7 @@ const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
  * subshell instead of the script: issue #69).
  */
 export function runScriptRows(rows: ProcRow[], scriptPath: string): ProcRow[] {
-  const re = new RegExp(`(?:^|/)bash(?:\\s+-\\S+)*\\s+${escapeRe(scriptPath)}\\s*$`);
+  const re = new RegExp(`^(?:\\S*/)?bash(?:\\s+-\\S+)*\\s+${escapeRe(scriptPath)}\\s*$`);
   return rows.filter((r) => re.test(r.args));
 }
 
@@ -257,8 +257,15 @@ export interface AbortDeps {
   sleep: (ms: number) => Promise<void>;
 }
 
+/** Raw process table; THROWS if `ps` failed or timed out (its diagnostics must never parse as "no processes"). */
+export async function listProcessTable(signal?: AbortSignal): Promise<string> {
+  const r = await runShellDetailed(PS_TABLE_COMMAND, 10_000, signal);
+  if (r.timedOut || r.exitCode !== 0) throw new Error(`ps failed (exit ${r.exitCode}${r.timedOut ? ", timed out" : ""})`);
+  return r.output;
+}
+
 const realAbortDeps = (): AbortDeps => ({
-  list: () => runShell(PS_TABLE_COMMAND, 10_000),
+  list: () => listProcessTable(),
   kill: (pid, signal) => void process.kill(pid, signal),
   sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
 });
@@ -323,15 +330,26 @@ export async function abortRunById(
       return { ok: false, aborted: false, error: `refusing to signal process group ${g}: it is not the run's own group` };
     }
   }
-  for (const g of pgids) {
-    try { deps.kill(-g, "SIGTERM"); } catch { /* group already gone */ }
-  }
-  let gone = await groupsGone(deps, pgids, sids, 3_000);
-  if (!gone) {
+  // Groups can appear after any snapshot (an engine child may setsid), so every
+  // signal round re-reads the table and targets the session's CURRENT groups.
+  const signalRound = async (sig: NodeJS.Signals): Promise<void> => {
+    const live = parseProcessTable(await deps.list());
+    for (const r of live) if (sids.has(r.sid)) pgids.add(r.pgid);
     for (const g of pgids) {
-      try { deps.kill(-g, "SIGKILL"); } catch { /* gone */ }
+      if (g <= 1 || g === own) continue;
+      try { deps.kill(-g, sig); } catch { /* group already gone */ }
     }
-    gone = await groupsGone(deps, pgids, sids, 2_000);
+  };
+  let gone: boolean;
+  try {
+    await signalRound("SIGTERM");
+    gone = await groupsGone(deps, pgids, sids, 3_000);
+    if (!gone) {
+      await signalRound("SIGKILL");
+      gone = await groupsGone(deps, pgids, sids, 2_000);
+    }
+  } catch (e) {
+    return { ok: false, aborted: false, error: `cannot confirm termination: ${(e as Error).message}` };
   }
   const confirmed = gone;
   const pid = leaders[0].pid;
