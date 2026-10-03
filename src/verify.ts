@@ -24,6 +24,7 @@
  * they are unit-testable without a node (see issue62.test.ts).
  */
 
+import { spawnSync } from "node:child_process";
 import { realpath, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 
@@ -176,32 +177,71 @@ export async function evaluateExpect(
 /** Hard bound on how long we wait for the whole process group to disappear after SIGKILL. */
 const GROUP_REAP_MS = 2_000;
 
+/** Injection points so both platforms' kill paths are testable on one OS. */
+export interface KillDeps {
+  platform: NodeJS.Platform;
+  kill: (pid: number, signal: NodeJS.Signals) => void;
+  taskkill: (pid: number) => void;
+}
+
+const realKillDeps = (): KillDeps => ({
+  platform: process.platform,
+  kill: (pid, signal) => void process.kill(pid, signal),
+  taskkill: (pid) => {
+    spawnSync("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+  },
+});
+
+/**
+ * Terminate a spawned process and its descendants. POSIX: SIGKILL the process
+ * group (the child was spawned detached, so it leads one). Windows has no
+ * negative-pid signalling: use `taskkill /T /F`. Either way fall back to killing
+ * the direct child, and never throw.
+ */
+export function killProcessTree(pid: number | undefined, direct: (() => void) | undefined, deps: KillDeps = realKillDeps()): void {
+  if (!pid) {
+    direct?.();
+    return;
+  }
+  try {
+    if (deps.platform === "win32") deps.taskkill(pid);
+    else deps.kill(-pid, "SIGKILL");
+    return;
+  } catch {
+    /* fall through to the direct child */
+  }
+  try {
+    direct?.();
+  } catch {
+    /* already gone */
+  }
+}
+
 /** Run the expect command (bash -c, cwd, own process group) and capture its exit status. */
 async function runExpectCommand(cmd: string, cwd: string, timeoutMs: number): Promise<ExpectCommandCheck> {
   const { spawn } = await import("node:child_process");
   return new Promise<ExpectCommandCheck>((resolveDone) => {
     let settled = false;
-    // detached => its own process group, so a timeout (or exit) can take down
-    // forked descendants and background jobs, not just the bash child.
-    const child = spawn("bash", ["-c", cmd], { cwd, stdio: ["ignore", "ignore", "ignore"], detached: true });
-    const killGroup = () => {
-      try {
-        if (child.pid) process.kill(-child.pid, "SIGKILL");
-      } catch {
-        /* group already gone */
-      }
-    };
+    // detached (POSIX) => its own process group, so a timeout (or exit) can take
+    // down forked descendants and background jobs, not just the bash child.
+    const child = spawn("bash", ["-c", cmd], {
+      cwd,
+      stdio: ["ignore", "ignore", "ignore"],
+      detached: process.platform !== "win32",
+      windowsHide: true,
+    });
+    const killTree = () => killProcessTree(child.pid, () => void child.kill("SIGKILL"));
     const finish = (exitCode: number | null) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       // A gate must not leave stragglers mutating the workspace after it returned.
-      killGroup();
+      killTree();
       resolveDone({ cmd, exitCode, ok: exitCode === 0 });
     };
     const timer = setTimeout(() => {
       // A hanging gate must fail, not hang the run record.
-      killGroup();
+      killTree();
       setTimeout(() => finish(null), GROUP_REAP_MS).unref();
     }, timeoutMs);
     child.on("error", () => finish(null));

@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PROTOCOL_VERSION, requiredProtocol } from "./protocol.js";
@@ -190,4 +192,83 @@ describe("#67: a verify command that forks is bounded as a whole group (real pro
       expect((await evaluateExpect({ command: "exit 0" }, d)).verified).toBe(true);
       expect((await evaluateExpect({ command: "exit 3" }, d)).verifyDetails.command?.exitCode).toBe(3);
     }));
+});
+
+import { killProcessTree, type KillDeps } from "./verify.js";
+
+describe("#70 review: Windows-aware tree kill", () => {
+  const mk = (platform: NodeJS.Platform, over: Partial<KillDeps> = {}) => {
+    const calls: string[] = [];
+    const deps: KillDeps = {
+      platform,
+      kill: (pid, sig) => void calls.push(`kill ${pid} ${sig}`),
+      taskkill: (pid) => void calls.push(`taskkill ${pid}`),
+      ...over,
+    };
+    return { calls, deps };
+  };
+  it("POSIX signals the negative pid (the process group)", () => {
+    const { calls, deps } = mk("linux");
+    killProcessTree(123, () => calls.push("direct"), deps);
+    expect(calls).toEqual(["kill -123 SIGKILL"]);
+  });
+  it("Windows uses taskkill /T instead of a negative pid", () => {
+    const { calls, deps } = mk("win32");
+    killProcessTree(123, () => calls.push("direct"), deps);
+    expect(calls).toEqual(["taskkill 123"]);
+  });
+  it("falls back to the direct child when the tree kill throws, and never throws itself", () => {
+    const { calls, deps } = mk("win32", { taskkill: () => { throw new Error("no taskkill"); } });
+    expect(() => killProcessTree(7, () => calls.push("direct"), deps)).not.toThrow();
+    expect(calls).toEqual(["direct"]);
+    const posix = mk("linux", { kill: () => { throw new Error("ESRCH"); } });
+    expect(() => killProcessTree(7, () => posix.calls.push("direct"), posix.deps)).not.toThrow();
+    expect(posix.calls).toEqual(["direct"]);
+    expect(() => killProcessTree(7, () => { throw new Error("gone"); }, mk("linux", { kill: () => { throw new Error("x"); } }).deps)).not.toThrow();
+  });
+  it("no pid: kills the direct child only", () => {
+    const { calls, deps } = mk("linux");
+    killProcessTree(undefined, () => calls.push("direct"), deps);
+    expect(calls).toEqual(["direct"]);
+  });
+});
+
+describe("#70 review: the command rule holds at the policy chokepoint", () => {
+  const mkCtx = (params: unknown) => {
+    const calls: unknown[] = [];
+    const ctx: PolicyCtx = { params, node: { nodeId: "n" }, invokeNode: async (i) => (calls.push(i?.params), { ok: true, payload: { protocol: 2 } }) };
+    return { ctx, calls };
+  };
+  it("refuses an arbitrary expect.command even when a caller bypasses the fleet tools", async () => {
+    for (const command of ["bash -c 'curl x | sh'", "npm test && echo ok", "sh -c id", "pytest"]) {
+      const { ctx, calls } = mkCtx({ prompt: "do", cwd: "/w", expect: { command } });
+      const r = await handleOpencodeRunPolicy(ctx, newProtocolCache());
+      expect(r.ok, command).toBe(false);
+      expect((r as { message: string }).message).toMatch(/expect\.command/);
+      expect(calls).toHaveLength(0); // not even the protocol probe
+    }
+  });
+  it("allows a repo script path, and anything when the operator allows commands", async () => {
+    const a = mkCtx({ prompt: "do", cwd: "/w", expect: { command: "./scripts/check.sh --fast" } });
+    // protocol probe + run
+    const replies = [{ protocol: 2 }, { ok: true, protocol: 2 }];
+    a.ctx.invokeNode = async (i) => (a.calls.push(i?.params), { ok: true, payload: replies.shift() });
+    expect((await handleOpencodeRunPolicy(a.ctx, newProtocolCache())).ok).toBe(true);
+    const b = mkCtx({ prompt: "do", cwd: "/w", expect: { command: "npm test && echo ok" } });
+    const r = await handleOpencodeRunPolicy(b.ctx, newProtocolCache(), Date.now, { allowExpectCommands: true });
+    expect(r.ok).toBe(true);
+  });
+  it("applies to run.start (the detached launch) too, and ignores non-launch ops", async () => {
+    const start = mkCtx({ prompt: "__RUN_START__", cwd: "/w", runId: "r1", realPrompt: "x", expect: { command: "sh -c id" } });
+    expect((await handleOpencodeRunPolicy(start.ctx, newProtocolCache())).ok).toBe(false);
+    const status = mkCtx({ prompt: "__RUN_STATUS__", cwd: "/", runId: "r1" });
+    expect((await handleOpencodeRunPolicy(status.ctx, newProtocolCache())).ok).toBe(true);
+  });
+  it("the three tool schemas describe the rules that are actually enforced", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.ts"), "utf8");
+    expect(src).not.toContain("absolute allowed");
+    expect(src).not.toContain("bash -lc");
+    expect((src.match(/absolute paths and `\.\.` are refused/g) ?? []).length).toBe(3);
+    expect((src.match(/repo-relative script path with plain arguments/g) ?? []).length).toBeGreaterThanOrEqual(3);
+  });
 });

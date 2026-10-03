@@ -11,6 +11,13 @@
 
 import { PROTOCOL_VERSION, nodeProtocolOf, requiredProtocol, resolveOp } from "./protocol.js";
 import { relayTimeoutWithGate } from "./verify.js";
+import { checkSetup } from "./policy.js";
+
+/** Operator policy applied at the chokepoint every dispatch passes through. */
+export interface PolicyOptions {
+  /** Allow an arbitrary `expect.command` (operator `allowSetupCommands`); default: repo script paths only. */
+  allowExpectCommands?: boolean;
+}
 
 export interface PolicyCtx {
   params: unknown;
@@ -68,6 +75,7 @@ export async function handleOpencodeRunPolicy(
   ctx: PolicyCtx,
   cache: ProtocolCache,
   now: () => number = Date.now,
+  opts: PolicyOptions = {},
 ): Promise<PolicyResult> {
   const task = ctx.params as (Record<string, unknown> & { prompt?: unknown; cwd?: unknown; harness?: unknown; timeoutMs?: number }) | null;
   if (!task || typeof task.prompt !== "string" || !task.prompt.trim()) {
@@ -81,6 +89,15 @@ export async function handleOpencodeRunPolicy(
 
   const nodeId = ctx.node?.nodeId;
   const launches = resolved.op === "run" || resolved.op === "run.start";
+
+  // `expect.command` runs on the node outside the engine's permission system. This
+  // is the one place every launch passes through (tools, direct invocations), so the
+  // operator's rule is enforced here and not only in the tool wrappers.
+  const cmd = (task.expect as { command?: unknown } | null | undefined)?.command;
+  if (launches && cmd !== undefined && cmd !== null) {
+    const check = typeof cmd === "string" ? checkSetup(cmd, opts.allowExpectCommands === true) : { ok: false as const, error: "expect.command must be a string" };
+    if (!check.ok) return { ok: false, message: `invalid expect.command: ${check.error}` };
+  }
   const need = launches ? requiredProtocol(task as { harness?: unknown; expect?: unknown }) : { version: 0 };
   if (need.version > 0) {
     // A node below the needed protocol would silently ignore the field (run the

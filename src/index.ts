@@ -166,7 +166,7 @@ export default definePluginEntry({
       commands: ["opencode.run"],
       dangerous: true,
       classifyRisk: () => ({ level: "high", family: "opencode-run" }),
-      handle: (ctx) => handleOpencodeRunPolicy(ctx as unknown as PolicyCtx, protocolCache),
+      handle: (ctx) => handleOpencodeRunPolicy(ctx as unknown as PolicyCtx, protocolCache, undefined, { allowExpectCommands: cfg.allowSetupCommands === true }),
     });
 
     // ------------------------------------------------------------------
@@ -205,8 +205,8 @@ export default definePluginEntry({
             type: "object",
             additionalProperties: false,
             properties: {
-              files: { type: "array", items: { type: "string" }, description: "Artifact paths that must exist after the run (relative to the run cwd; absolute allowed), e.g. ['dist/index.js', 'docs/api.md']." },
-              command: { type: "string", description: "Verification command run via `bash -lc` in the run cwd after the worker exits (e.g. `npm test -- --silent`); must exit 0. Bounded to 120s." },
+              files: { type: "array", items: { type: "string" }, description: "Artifact paths that must exist after the run (relative to the run cwd and inside it: absolute paths and `..` are refused), e.g. ['dist/index.js', 'docs/api.md']." },
+              command: { type: "string", description: "Verification command run via `bash -c` in the run cwd after the worker exits; must exit 0. Bounded to 120s (process group killed). It runs outside the engine's permission system, so it must be a repo-relative script path with plain arguments (e.g. `./scripts/check.sh --fast`) unless the operator set allowSetupCommands; an arbitrary shell command such as `npm test && echo ok` is refused." },
             },
             description: "Optional post-run verification gate (issue #62). After the worker exits, the node checks that every listed file exists and — when given — that the command exits 0, recording verified/verifyDetails on the run result. verified is separate from ok (which stays the process exit status): use it so a run that exits 0 but produced nothing is not trusted as success. Poll it with fleet_run_status.",
           },
@@ -993,8 +993,8 @@ export default definePluginEntry({
             type: "object",
             additionalProperties: false,
             properties: {
-              files: { type: "array", items: { type: "string" }, description: "Artifact paths that must exist after each iteration (relative to the run cwd; absolute allowed)." },
-              command: { type: "string", description: "Verification command run via `bash -lc` in the run cwd after the worker exits; must exit 0. Bounded to 120s." },
+              files: { type: "array", items: { type: "string" }, description: "Artifact paths that must exist after each iteration (relative to the run cwd and inside it: absolute paths and `..` are refused)." },
+              command: { type: "string", description: "Verification command run via `bash -c` in the run cwd after the worker exits; must exit 0. Bounded to 120s (process group killed). It runs outside the engine's permission system, so it must be a repo-relative script path with plain arguments (e.g. `./scripts/check.sh --fast`) unless the operator set allowSetupCommands; an arbitrary shell command such as `npm test && echo ok` is refused." },
             },
             description: "Optional post-run verification gate (issue #62), identical to fleet_dispatch.expect: after each iteration the node records verified/verifyDetails on the result. An iteration with verified:false is NOT success — the loop keeps iterating (or escalates) instead of stopping there.",
           },
@@ -1154,8 +1154,8 @@ export default definePluginEntry({
             type: "object",
             additionalProperties: false,
             properties: {
-              files: { type: "array", items: { type: "string" }, description: "Artifact paths that must exist after the run (relative to the run cwd; absolute allowed)." },
-              command: { type: "string", description: "Verification command run via `bash -lc` in the run cwd after the worker exits; must exit 0. Bounded to 120s." },
+              files: { type: "array", items: { type: "string" }, description: "Artifact paths that must exist after the run (relative to the run cwd and inside it: absolute paths and `..` are refused)." },
+              command: { type: "string", description: "Verification command run via `bash -c` in the run cwd after the worker exits; must exit 0. Bounded to 120s (process group killed). It runs outside the engine's permission system, so it must be a repo-relative script path with plain arguments (e.g. `./scripts/check.sh --fast`) unless the operator set allowSetupCommands; an arbitrary shell command such as `npm test && echo ok` is refused." },
             },
             description: "Optional post-run verification gate (issue #62), identical to fleet_dispatch.expect: after the worker exits the node records verified/verifyDetails on the result. A FAILED gate means the watched run must not be reported as successful work.",
           },
