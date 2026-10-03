@@ -56,6 +56,15 @@ export function checkCwd(cwd: unknown, roots: string[], resolved?: string): CwdC
     return { ok: false, error: `cwd must be an absolute path: ${cwd}` };
   }
   const target = resolve(resolved ?? cwd);
+  // Refuse a target equal to ANY allowed root. The roots can nest (e.g.
+  // FLEET_ROOT=/home/u/fleet is a descendant of home=/home/u), so a plain
+  // strict-descendant test would ADMIT the workspace root as a child of home.
+  // A destructive op (rm -rf) on a root would wipe the whole workspace.
+  for (const root of roots) {
+    if (resolve(root) === target) {
+      return { ok: false, error: `cwd ${cwd} is a workspace root itself; refusing a destructive op on a root` };
+    }
+  }
   for (const root of roots) {
     const rel = relative(root, target);
     if (rel && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)) {

@@ -35,6 +35,10 @@ describe("issue #31: cwd confinement", () => {
       expect(checkCwd(c, roots).ok).toBe(false);
     }
     expect(checkCwd("/home/svcuser/fleet", ["/home/svcuser/fleet"]).ok).toBe(false);
+    // Nested roots: the workspace root is a descendant of home, so a plain
+    // strict-descendant test would ADMIT it as a child of home. It must be refused.
+    expect(checkCwd("/home/svcuser/fleet", ["/home/svcuser/fleet", "/home/svcuser"]).ok).toBe(false);
+    expect(checkCwd("/home/svcuser/fleet/claw-rss", ["/home/svcuser/fleet", "/home/svcuser"]).ok).toBe(true);
   });
   it("refuses relative, empty and NUL-containing paths", () => {
     for (const c of ["", ".", "fleet/x", "/a\0b"]) expect(checkCwd(c, roots).ok).toBe(false);
@@ -78,5 +82,8 @@ describe("issue #31: which messages are cwd-checked", () => {
     for (const p of ["__UNPACK__", "__BUNDLE__", "__DIFF__", "__STATUS__", "__RUN_START__", "fix the bug"]) {
       expect(taskUsesCwd(p)).toBe(true);
     }
+  });
+  it("__DIFF__ runs `cd <cwd> && git diff`, so its cwd is confined like any other (read-only is not safe for an attacker-chosen path)", () => {
+    expect(taskUsesCwd("__DIFF__")).toBe(true);
   });
 });
