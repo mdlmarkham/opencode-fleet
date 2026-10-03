@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { mkdtemp, readdir, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { LEDGER_TERMINAL_CAP, capLedger, ledgerPath, loadLedger, upsertRun, type LedgerEntry } from "./ledger.js";
+import { LEDGER_TERMINAL_CAP, capLedger, ledgerPath, loadLedger, outcomeEntry, upsertRun, type LedgerEntry } from "./ledger.js";
 
 const entry = (i: number, state: LedgerEntry["state"] = "running", startedAt?: string): LedgerEntry => ({
   runId: `run-${i}`, node: "dev2", cwd: "/home/u/p", prompt: `task ${i}`,
@@ -63,5 +63,28 @@ describe("issue #37: retention never evicts in-flight runs", () => {
     const runs = Array.from({ length: 5 }, (_, i) => entry(i, "failed"));
     const out = capLedger(runs, 3);
     expect(out.map((r) => r.runId).sort()).toEqual(["run-2", "run-3", "run-4"]);
+  });
+});
+
+describe("issue #37: review follow-ups", () => {
+  it("timed-out runs are not terminal: never evicted by the cap (worker may still be running)", () => {
+    const timedOut = [entry(1, "timed-out", "2020-01-01T00:00:00Z")];
+    const terminal = Array.from({ length: LEDGER_TERMINAL_CAP + 10 }, (_, i) => entry(1000 + i, "completed"));
+    expect(capLedger([...timedOut, ...terminal]).some((r) => r.runId === "run-1")).toBe(true);
+  });
+  it("outcomeEntry keeps the original entry (startedAt, engine, pid)", () => {
+    const base: LedgerEntry = { ...entry(7), harness: "pi", piModel: "p/m", pid: 4242, startedAt: "2026-01-01T00:00:00Z" };
+    const out = outcomeEntry(base, { timedOut: false, reconciledDead: false, parsed: { ok: true, summary: "done", sessionId: "s" } });
+    expect(out).toMatchObject({ startedAt: "2026-01-01T00:00:00Z", harness: "pi", piModel: "p/m", pid: 4242, state: "completed", summary: "done", sessionId: "s" });
+  });
+  it("a silent-death failure is not overwritten by the timed-out outcome", () => {
+    const out = outcomeEntry(entry(8), { timedOut: true, reconciledDead: true, parsed: {} });
+    expect(out.state).toBe("failed");
+    expect(out.summary).toMatch(/silent death/);
+  });
+  it("state mapping: timed-out, failed (ok:false), completed", () => {
+    expect(outcomeEntry(entry(1), { timedOut: true, reconciledDead: false, parsed: {} }).state).toBe("timed-out");
+    expect(outcomeEntry(entry(1), { timedOut: false, reconciledDead: false, parsed: { ok: false } }).state).toBe("failed");
+    expect(outcomeEntry(entry(1), { timedOut: false, reconciledDead: false, parsed: { ok: true } }).state).toBe("completed");
   });
 });

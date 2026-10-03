@@ -72,8 +72,13 @@ export async function saveLedger(rootDir: string, runs: LedgerEntry[]): Promise<
   await rename(tmp, p);
 }
 
-/** Terminal states: only these are subject to the retention cap. */
-const TERMINAL: ReadonlySet<RunState> = new Set(["completed", "failed", "timed-out", "discarded"]);
+/**
+ * Terminal states: only these are subject to the retention cap. `timed-out` is
+ * deliberately NOT terminal: a relay timeout does not mean the worker stopped
+ * (fleet_resume treats it as incomplete), so its recovery record is kept until
+ * the run is reconciled to completed/failed/discarded.
+ */
+const TERMINAL: ReadonlySet<RunState> = new Set(["completed", "failed", "discarded"]);
 
 /** How many terminal runs to keep. In-flight (`running`) entries are never evicted. */
 export const LEDGER_TERMINAL_CAP = 200;
@@ -110,6 +115,31 @@ export function upsertRun(rootDir: string, entry: LedgerEntry): Promise<void> {
     else runs.push(entry);
     await saveLedger(rootDir, capLedger(runs));
   });
+}
+
+export interface DispatchOutcome {
+  timedOut: boolean;
+  /** The silent-death reconcile already recorded this run as failed. */
+  reconciledDead: boolean;
+  parsed: { ok?: boolean; summary?: string; sessionId?: string; handRaised?: boolean; question?: string };
+}
+
+/**
+ * Final ledger entry for a synchronous dispatch: the SAME run with its new
+ * state (startedAt/engine/pid preserved), never a fresh entry, and never
+ * overriding a silent-death failure with timed-out.
+ */
+export function outcomeEntry(base: LedgerEntry, o: DispatchOutcome, now: string = new Date().toISOString()): LedgerEntry {
+  const state: RunState = o.reconciledDead ? "failed" : o.timedOut ? "timed-out" : o.parsed.ok === false ? "failed" : "completed";
+  return {
+    ...base,
+    updatedAt: now,
+    state,
+    summary: o.reconciledDead ? "run died without completion record (silent death)" : o.parsed.summary,
+    sessionId: o.parsed.sessionId,
+    handRaised: o.parsed.handRaised,
+    question: o.parsed.question,
+  };
 }
 
 export function newRunId(): string {
