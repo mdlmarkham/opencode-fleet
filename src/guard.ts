@@ -109,7 +109,6 @@ export async function guardCwd(
 /** Control messages that do not operate on `cwd` (the gateway sends "/" or the run's cwd as filler). */
 const CWD_FREE_OPS = new Set([
   "__ABORT__",
-  "__DIFF__",
   "__MODELS__",
   "__ACTIVITY__",
   "__RECEIVE__",
