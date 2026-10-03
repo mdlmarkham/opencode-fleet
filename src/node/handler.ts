@@ -25,6 +25,7 @@ import { guardCwd, taskUsesCwd, validateTaskIds } from "../guard.js";
 import { ensureStateDir, runPaths, xferPaths, writePrivate } from "../paths.js";
 import { resolveOp, stampProtocol, type Op } from "../protocol.js";
 import { parseScope, scopeViolations } from "../scope.js";
+import { buildManifest, capLogFile, extractEvents, parseChanges } from "../audit.js";
 import {
   OPCODE_PS_COMMAND,
   abortRunById,
@@ -42,8 +43,12 @@ import {
   parseProcessTable,
   runScriptRows,
   selfStateLines,
+  changesCaptureLines,
   verifyGateScript,
 } from "./runtime.js";
+
+/** Cap on a run's stored event log when its audit manifest is composed (head + tail kept). */
+const MAX_AUDIT_LOG_BYTES = 20 * 1024 * 1024;
 
 /** OpenCode task plus the dispatch watchdog knobs (idle/duration guards). */
 export type FleetOpenCodeTask = OpenCodeTask & {
@@ -297,8 +302,9 @@ OPS["run.start"] = async ({ task, io, context }: OpCtx) => {
       // not trust the gateway); the HEAD at start lets run.status list what changed.
       const scopeSpec = parseScope((task as { scope?: unknown }).scope);
       if (!scopeSpec.ok) return JSON.stringify({ ok: false, error: `refused: ${scopeSpec.error}` });
+      // The start commit is recorded for every run (issue #42 manifest, #65 scope).
       let startHead: string | undefined;
-      if (scopeSpec.scope) {
+      {
         const head = (await runShell(`git -C ${shq(task.cwd)} rev-parse --verify HEAD 2>/dev/null`, 10_000, context?.signal)).trim();
         if (/^[0-9a-f]{40,64}$/.test(head)) startHead = head;
       }
@@ -316,10 +322,11 @@ OPS["run.start"] = async ({ task, io, context }: OpCtx) => {
         // final exit propagates the worker's real status.
         "set -u",
         // The script publishes its own pid/pgid/state first (issues #64, #69).
-        ...selfStateLines(statePath, { runId, harness: task.harness ?? "opencode", ...(task.piModel ? { piModel: task.piModel } : {}), ...(scopeSpec.scope ? { scope: scopeSpec.scope, cwd: task.cwd, ...(startHead ? { startHead } : {}) } : {}) }),
+        ...selfStateLines(statePath, { runId, harness: task.harness ?? "opencode", ...(task.piModel ? { piModel: task.piModel } : {}), cwd: task.cwd, ...(startHead ? { startHead } : {}), ...(scopeSpec.scope ? { scope: scopeSpec.scope } : {}) }),
         inner,
         `EC=$?`,
         ...(gate?.verifyLines ?? []),
+        ...changesCaptureLines(task.cwd, startHead, runPaths(runId).changes),
         gate?.doneLine ?? doneMarkerLine(donePath),
         `exit $EC`,
       ].join("\n");
@@ -404,6 +411,28 @@ OPS["run.status"] = async ({ task, io, context }: OpCtx) => {
             }
           }
         }
+        // Issue #42: the audit manifest, on request, once the run has finished. Composed
+        // from files the run itself left (done marker, change capture, event log) and
+        // cached, so it stays stable after the worktree moves on.
+        let manifest: unknown;
+        if ((task as { report?: unknown }).report === true && st.finishedAt) {
+          const fsp = await import("node:fs/promises");
+          const paths = runPaths(runId);
+          try {
+            manifest = JSON.parse(await fsp.readFile(paths.manifest, "utf8"));
+          } catch {
+            const meta = st as typeof st & { harness?: string; piModel?: string };
+            const logInfo = await capLogFile(paths.log, MAX_AUDIT_LOG_BYTES);
+            const rawLog = await fsp.readFile(paths.log, "utf8").catch(() => "");
+            const changes = await fsp.readFile(paths.changes, "utf8").then(parseChanges, () => undefined);
+            manifest = buildManifest({
+              runId, harness: meta.harness ?? "opencode", piModel: meta.piModel, cwd: st.cwd, startHead: st.startHead,
+              startedAt: st.startedAt, finishedAt: st.finishedAt, exitCode: st.exitCode, verified: st.verified, verifyDetails: st.verifyDetails,
+              scope: st.scope, changes, events: extractEvents(rawLog, meta.harness ?? "opencode"), log: logInfo,
+            });
+            await writePrivate(paths.manifest, JSON.stringify(manifest)).catch(() => {});
+          }
+        }
         // Liveness: is the pid still alive?
         // Alive = the run's script is in the process table (not `kill -0` on a
         // recorded pid, which may be the launcher subshell or a reused pid).
@@ -416,7 +445,7 @@ OPS["run.status"] = async ({ task, io, context }: OpCtx) => {
             alive = ps.includes("ALIVE");
           }
         }
-        return JSON.stringify({ ok: true, runId, ...st, alive, verified: typeof st.verified === "boolean" ? st.verified : null, verifyDetails: st.verifyDetails ?? null });
+        return JSON.stringify({ ok: true, runId, ...st, ...(manifest ? { manifest } : {}), alive, verified: typeof st.verified === "boolean" ? st.verified : null, verifyDetails: st.verifyDetails ?? null });
       } catch {
         // Distinguish never-started from cleaned (issue #21): if the
         // launch was never acked, no state file was ever written. We can't

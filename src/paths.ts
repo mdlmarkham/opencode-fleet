@@ -48,6 +48,10 @@ export interface RunPaths {
   script: string;
   log: string;
   done: string;
+  /** Raw git capture taken when the run finishes (issue #42): end HEAD, name-status, stat. */
+  changes: string;
+  /** Audit manifest, composed once the run has finished (issue #42). */
+  manifest: string;
 }
 
 /** All per-run file paths, inside the private state dir. Throws on an unsafe id. */
@@ -58,6 +62,8 @@ export function runPaths(runId: string, dir: string = ensureStateDir()): RunPath
     script: join(dir, `run-${id}.sh`),
     log: join(dir, `run-${id}.log`),
     done: join(dir, `done-${id}.json`),
+    changes: join(dir, `run-${id}.changes`),
+    manifest: join(dir, `manifest-${id}.json`),
   };
 }
 

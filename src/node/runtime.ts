@@ -595,3 +595,19 @@ export async function pruneStateDir(
   }
   return out;
 }
+
+
+/**
+ * Script-tail lines (issue #42) that capture what the run changed, as raw git
+ * output, before the done marker is written. Only emitted when the start commit
+ * is known (the cwd is a git repo); a missing capture later reads as "unknown",
+ * never as "no changes". No JSON is assembled in bash.
+ */
+export function changesCaptureLines(cwd: string, startHead: string | undefined, changesPath: string): string[] {
+  if (!startHead || !/^[0-9a-f]{40,64}$/.test(startHead)) return [];
+  const g = `git -C ${shq(cwd)} -c core.quotePath=false`;
+  return [
+    "# Issue #42: record what changed, for the audit manifest.",
+    `{ echo "endHead=$(${g} rev-parse HEAD 2>/dev/null)"; echo "---status"; ${g} diff --name-status ${startHead} -- 2>/dev/null; ${g} ls-files --others --exclude-standard 2>/dev/null | awk '{print "?\t" $0}'; echo "---stat"; ${g} diff --stat ${startHead} -- 2>/dev/null; } > ${shq(changesPath)} 2>/dev/null`,
+  ];
+}
