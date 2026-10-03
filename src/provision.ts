@@ -22,6 +22,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { shq } from "./shell.js";
 import { SSH_ARGS } from "./ssh.js";
+import { checkSetup } from "./policy.js";
 
 const execFileP = promisify(execFile);
 
@@ -74,6 +75,8 @@ export interface ProvisionRequest {
    * environment (e.g. "scripts/setup.sh"). Runs as the node's checkout user.
    */
   setup?: string;
+  /** Operator opt-in: `setup` may be an arbitrary shell command (issue #34). */
+  allowSetupCommands?: boolean;
 }
 
 export interface ProvisionResult {
@@ -292,6 +295,10 @@ export async function provisionToNode(
     // hardcoded. Failures are reported, not swallowed.
     let setupResult: ProvisionResult["setup"];
     if (req.setup && req.setup.trim()) {
+      const setupPolicy = checkSetup(req.setup, req.allowSetupCommands === true);
+      if (!setupPolicy.ok) {
+        return { ok: false, cwd: req.cwd, error: setupPolicy.error, setup: { ran: false, command: req.setup, ok: false, error: setupPolicy.error } };
+      }
       const setupCmd = `cd ${shq(req.cwd)} && (${req.setup}) && echo "---FLEET_SETUP_RC=$?"`;
       try {
         let out = "";

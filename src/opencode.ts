@@ -104,6 +104,7 @@ export interface OpenCodeRunResult {
 }
 
 import { shq } from "./shell.js";
+import { partitionEnv } from "./policy.js";
 import { redactSecrets, sanitizeQuestion } from "./untrusted.js";
 
 /**
@@ -166,10 +167,11 @@ export function buildOpenCodeCommand(task: OpenCodeTask): string {
   // process (and anything it spawns) sees them. Keys/values are shell-escaped.
   // PATH/HOME/LD_* are deliberately excluded — overriding those on a remote
   // node is a footgun; use the node's own service config for that.
-  const envExports = Object.entries(task.env ?? {})
-    .filter(([k]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(k))
-    .filter(([k]) => !/^(PATH|HOME|LD_PRELOAD|LD_LIBRARY_PATH|SHELL|USER|LOGNAME|PWD|OLDPWD)$/i.test(k))
-    .map(([k, v]) => `export ${k}=${shq(String(v))}`)
+  // Names that execute code or redirect config are filtered by policy.ts; the
+  // gateway refuses a dispatch that names any (see partitionEnv), so reaching
+  // this filter with one means a caller bypassed it — drop, never export.
+  const envExports = Object.entries(partitionEnv(task.env).allowed)
+    .map(([k, v]) => `export ${k}=${shq(v)}`)
     .join("\n");
 
   // Issue #22 bug 1/4: fail closed if we cannot enter the checkout. `cd X || {
