@@ -55,6 +55,8 @@ interface FleetConfig {
   allowAutoApprove?: boolean;
   /** Operator switch: let fleet_provision `setup` be an arbitrary shell command, not just a repo script (default false). */
   allowSetupCommands?: boolean;
+  /** Dispatch env refinements: allowOnly makes injection allowlist-only; extraDeny adds refused names. */
+  env?: { allowOnly?: string[]; extraDeny?: string[] };
 }
 
 export default definePluginEntry({
@@ -87,6 +89,15 @@ export default definePluginEntry({
         type: "boolean",
         default: true,
         description: "Allow fleet_dispatch autoApprove (opencode --auto). Set false to forbid it fleet-wide.",
+      },
+      env: {
+        type: "object",
+        additionalProperties: false,
+        description: "Refine the dispatch env policy. Built-in denials (BASH_ENV, NODE_OPTIONS, LD_*, ...) always apply.",
+        properties: {
+          allowOnly: { type: "array", items: { type: "string" }, description: "If set, only these variable names may be injected." },
+          extraDeny: { type: "array", items: { type: "string" }, description: "Additional variable names to refuse." },
+        },
       },
       allowSetupCommands: {
         type: "boolean",
@@ -551,7 +562,7 @@ export default definePluginEntry({
           maxIdleMs: { type: "number", description: "Kill the run if no output for this long, ms (stuck-loop guard). Default 120000." },
           maxDurationMs: { type: "number", description: "Kill the run if total runtime exceeds this, ms (stuck-loop guard). Default 600000." },
           async: { type: "boolean", description: "Run detached: returns a run handle immediately (runId + pid); the worker survives relay timeouts and its completion is recorded. Poll with fleet_watch or fleet_run_status. Default true." },
-          env: { type: "object", additionalProperties: { type: "string" }, description: "Environment variables for the worker process (per-dispatch environment). PATH/HOME/LD_* are ignored for safety." },
+          env: { type: "object", additionalProperties: { type: "string" }, description: "Environment variables for the worker process (per-dispatch environment). Names that execute code or redirect configuration (PATH, HOME, BASH_ENV, NODE_OPTIONS, LD_*, GIT_SSH*, OPENCODE_CONFIG*, ...) are REFUSED: the dispatch fails and names them. Operators can narrow this further (config env.allowOnly / env.extraDeny)." },
           ref: { type: "object", additionalProperties: false, properties: { branch: { type: "string", description: "Branch to check out before running." }, commit: { type: "string", description: "Commit SHA to check out before running." } }, description: "Git ref to check out before running. Refused if the checkout has uncommitted changes." },
           requires: {
             type: "object",
@@ -636,7 +647,7 @@ export default definePluginEntry({
         if (!harnessCheck.ok) return jsonResult({ ok: false, harness: harnessCheck.harness, error: harnessCheck.error });
         // Issue #34: refuse (never silently drop) env names that execute code or
         // redirect config, and honor the operator's autoApprove ceiling.
-        const envPartition = partitionEnv(p.env);
+        const envPartition = partitionEnv(p.env, cfg.env);
         if (envPartition.rejected.length) {
           return jsonResult({ ok: false, error: `env not allowed: ${envPartition.rejected.join(", ")}` });
         }
@@ -1513,7 +1524,7 @@ export default definePluginEntry({
           setup: {
             type: "string",
             description:
-              "Optional repo-declared setup command to run on each node after checkout (issue #19), e.g. \"scripts/setup.sh\" or \"python3 -m venv .venv && .venv/bin/pip install -r requirements.txt\". Lets a repo declare its own environment bootstrap so 'provisioned' means 'can run the tests'. Reported per node; never hardcoded.",
+              "Optional repo-declared setup command to run on each node after checkout (issue #19), a repo-relative script path with plain arguments, e.g. \"scripts/setup.sh\" or \"./setup.sh --fast\" (the path must contain a \"/\"). Arbitrary shell commands (pipelines, &&, e.g. \"python3 -m venv .venv && ...\") are refused unless the operator sets allowSetupCommands. Lets a repo declare its own environment bootstrap so 'provisioned' means 'can run the tests'. Reported per node; never hardcoded.",
           },
         },
         required: ["repo"],
