@@ -166,7 +166,7 @@ export default definePluginEntry({
       commands: ["opencode.run"],
       dangerous: true,
       classifyRisk: () => ({ level: "high", family: "opencode-run" }),
-      handle: (ctx) => handleOpencodeRunPolicy(ctx as unknown as PolicyCtx, protocolCache),
+      handle: (ctx) => handleOpencodeRunPolicy(ctx as unknown as PolicyCtx, protocolCache, undefined, { allowExpectCommands: cfg.allowSetupCommands === true }),
     });
 
     // ------------------------------------------------------------------
@@ -205,8 +205,8 @@ export default definePluginEntry({
             type: "object",
             additionalProperties: false,
             properties: {
-              files: { type: "array", items: { type: "string" }, description: "Artifact paths that must exist after the run (relative to the run cwd; absolute allowed), e.g. ['dist/index.js', 'docs/api.md']." },
-              command: { type: "string", description: "Verification command run via `bash -lc` in the run cwd after the worker exits (e.g. `npm test -- --silent`); must exit 0. Bounded to 120s." },
+              files: { type: "array", items: { type: "string" }, description: "Artifact paths that must exist after the run (relative to the run cwd and inside it: absolute paths and `..` are refused), e.g. ['dist/index.js', 'docs/api.md']." },
+              command: { type: "string", description: "Verification command run via `bash -c` in the run cwd after the worker exits; must exit 0. Bounded to 120s (process group killed). It runs outside the engine's permission system, so it must be a repo-relative script path with plain arguments (e.g. `./scripts/check.sh --fast`) unless the operator set allowSetupCommands; an arbitrary shell command such as `npm test && echo ok` is refused." },
             },
             description: "Optional post-run verification gate (issue #62). After the worker exits, the node checks that every listed file exists and — when given — that the command exits 0, recording verified/verifyDetails on the run result. verified is separate from ok (which stays the process exit status): use it so a run that exits 0 but produced nothing is not trusted as success. Poll it with fleet_run_status.",
           },
@@ -316,10 +316,17 @@ export default definePluginEntry({
         }
         // Issue #62: validate the optional verification gate up front so a
         // malformed spec is a clear refusal, never a silently-dropped gate.
-        const { parseExpectSpec, withVerified } = await import("./verify.js");
+        const { parseExpectSpec, withVerified, relayTimeoutWithGate } = await import("./verify.js");
         const expectSpec = parseExpectSpec(p.expect);
         if (!expectSpec.ok) {
           return jsonResult({ ok: false, error: `invalid expect: ${expectSpec.error}` });
+        }
+        // `expect.command` runs on the node OUTSIDE the engine's permission system,
+        // so it gets the same rule as provision `setup`: a repo-relative script
+        // path unless the operator allows arbitrary commands (issue #34).
+        if (expectSpec.expect?.command) {
+          const cmdCheck = checkSetup(expectSpec.expect.command, cfg.allowSetupCommands === true);
+          if (!cmdCheck.ok) return jsonResult({ ok: false, error: `invalid expect.command: ${cmdCheck.error}` });
         }
         const { upsertRun, newRunId, probeRun, loadLedger, outcomeEntry } = await import("./ledger.js");
         const rootDir = api.rootDir ?? process.cwd();
@@ -443,7 +450,7 @@ export default definePluginEntry({
                 nodeId: node.nodeId,
                 command: "opencode.run",
                 params: task,
-                timeoutMs: task.timeoutMs,
+                timeoutMs: task.timeoutMs === undefined ? undefined : relayTimeoutWithGate(task.timeoutMs, expectSpec.expect !== undefined),
                 signal,
               })
               .catch((err: Error) => ({
@@ -986,8 +993,8 @@ export default definePluginEntry({
             type: "object",
             additionalProperties: false,
             properties: {
-              files: { type: "array", items: { type: "string" }, description: "Artifact paths that must exist after each iteration (relative to the run cwd; absolute allowed)." },
-              command: { type: "string", description: "Verification command run via `bash -lc` in the run cwd after the worker exits; must exit 0. Bounded to 120s." },
+              files: { type: "array", items: { type: "string" }, description: "Artifact paths that must exist after each iteration (relative to the run cwd and inside it: absolute paths and `..` are refused)." },
+              command: { type: "string", description: "Verification command run via `bash -c` in the run cwd after the worker exits; must exit 0. Bounded to 120s (process group killed). It runs outside the engine's permission system, so it must be a repo-relative script path with plain arguments (e.g. `./scripts/check.sh --fast`) unless the operator set allowSetupCommands; an arbitrary shell command such as `npm test && echo ok` is refused." },
             },
             description: "Optional post-run verification gate (issue #62), identical to fleet_dispatch.expect: after each iteration the node records verified/verifyDetails on the result. An iteration with verified:false is NOT success — the loop keeps iterating (or escalates) instead of stopping there.",
           },
@@ -1014,10 +1021,17 @@ export default definePluginEntry({
         // Issue #62 review (coverage gap): fleet_iterate accepts the same
         // optional verification gate as fleet_dispatch, validated up front and
         // threaded to the node on EVERY iteration.
-        const { parseExpectSpec, withVerified } = await import("./verify.js");
+        const { parseExpectSpec, withVerified, relayTimeoutWithGate } = await import("./verify.js");
         const expectSpec = parseExpectSpec(p.expect);
         if (!expectSpec.ok) {
           return jsonResult({ ok: false, error: `invalid expect: ${expectSpec.error}` });
+        }
+        // `expect.command` runs on the node OUTSIDE the engine's permission system,
+        // so it gets the same rule as provision `setup`: a repo-relative script
+        // path unless the operator allows arbitrary commands (issue #34).
+        if (expectSpec.expect?.command) {
+          const cmdCheck = checkSetup(expectSpec.expect.command, cfg.allowSetupCommands === true);
+          if (!cmdCheck.ok) return jsonResult({ ok: false, error: `invalid expect.command: ${cmdCheck.error}` });
         }
 
         const maxIter = p.maxIterations ?? 5;
@@ -1040,7 +1054,7 @@ export default definePluginEntry({
               timeoutMs: p.timeoutMs ?? 300_000,
               expect: expectSpec.expect,
             },
-            timeoutMs: p.timeoutMs ?? 300_000,
+            timeoutMs: relayTimeoutWithGate(p.timeoutMs ?? 300_000, expectSpec.expect !== undefined),
             signal,
           });
           const payload = (inv as { payload?: unknown }).payload;
@@ -1140,8 +1154,8 @@ export default definePluginEntry({
             type: "object",
             additionalProperties: false,
             properties: {
-              files: { type: "array", items: { type: "string" }, description: "Artifact paths that must exist after the run (relative to the run cwd; absolute allowed)." },
-              command: { type: "string", description: "Verification command run via `bash -lc` in the run cwd after the worker exits; must exit 0. Bounded to 120s." },
+              files: { type: "array", items: { type: "string" }, description: "Artifact paths that must exist after the run (relative to the run cwd and inside it: absolute paths and `..` are refused)." },
+              command: { type: "string", description: "Verification command run via `bash -c` in the run cwd after the worker exits; must exit 0. Bounded to 120s (process group killed). It runs outside the engine's permission system, so it must be a repo-relative script path with plain arguments (e.g. `./scripts/check.sh --fast`) unless the operator set allowSetupCommands; an arbitrary shell command such as `npm test && echo ok` is refused." },
             },
             description: "Optional post-run verification gate (issue #62), identical to fleet_dispatch.expect: after the worker exits the node records verified/verifyDetails on the result. A FAILED gate means the watched run must not be reported as successful work.",
           },
@@ -1166,10 +1180,17 @@ export default definePluginEntry({
         // Issue #62 review (coverage gap): fleet_watch accepts the same
         // optional verification gate as fleet_dispatch — validated up front
         // and threaded to the node on every watch.
-        const { parseExpectSpec, withVerified } = await import("./verify.js");
+        const { parseExpectSpec, withVerified, relayTimeoutWithGate } = await import("./verify.js");
         const expectSpec = parseExpectSpec(p.expect);
         if (!expectSpec.ok) {
           return jsonResult({ ok: false, error: `invalid expect: ${expectSpec.error}` });
+        }
+        // `expect.command` runs on the node OUTSIDE the engine's permission system,
+        // so it gets the same rule as provision `setup`: a repo-relative script
+        // path unless the operator allows arbitrary commands (issue #34).
+        if (expectSpec.expect?.command) {
+          const cmdCheck = checkSetup(expectSpec.expect.command, cfg.allowSetupCommands === true);
+          if (!cmdCheck.ok) return jsonResult({ ok: false, error: `invalid expect.command: ${cmdCheck.error}` });
         }
 
         const timeoutMs = p.timeoutMs ?? 300_000;
@@ -1189,7 +1210,7 @@ export default definePluginEntry({
             timeoutMs,
             expect: expectSpec.expect,
           },
-          timeoutMs,
+          timeoutMs: relayTimeoutWithGate(timeoutMs, expectSpec.expect !== undefined),
           signal,
         });
 

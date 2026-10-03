@@ -9,8 +9,9 @@
  * After the worker process finishes, the NODE evaluates the spec in the run's
  * cwd and records the outcome alongside the run result:
  *
- *   - every path in `expect.files` must exist (relative to cwd);
- *   - if `expect.command` is given, it is run via `bash -lc` in cwd and must
+ *   - every path in `expect.files` must exist (relative to cwd, and inside it:
+ *     absolute paths and `..` are refused, symlinks that leave cwd do not count);
+ *   - if `expect.command` is given, it is run via `bash -c` in cwd and must
  *     exit 0.
  *
  * The outcome is recorded as `verified: boolean` + `verifyDetails` on the
@@ -23,14 +24,15 @@
  * they are unit-testable without a node (see issue62.test.ts).
  */
 
-import { stat } from "node:fs/promises";
-import { resolve } from "node:path";
+import { spawnSync } from "node:child_process";
+import { realpath, stat } from "node:fs/promises";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 
 /** The `expect` gate spec a dispatch can carry. */
 export interface ExpectCheck {
-  /** Paths (relative to the run cwd, absolute allowed) that must exist after the run. */
+  /** Paths relative to the run cwd that must exist after the run (absolute paths and `..` are refused). */
   files?: string[];
-  /** Command run via `bash -lc` in the run cwd; must exit 0. */
+  /** Command run via `bash -c` in the run cwd; must exit 0. */
   command?: string;
 }
 
@@ -90,6 +92,14 @@ export function parseExpectSpec(value: unknown): ExpectSpecResult {
     if (e.files.some((x) => typeof x !== "string" || x.trim().length === 0)) {
       return bad("expect.files must be an array of non-empty strings");
     }
+    for (const f of e.files as string[]) {
+      if (f.includes("\0")) return bad("expect.files entries must not contain NUL");
+      // The check runs with the node's privileges: an absolute or `..` path would
+      // let the caller probe for files anywhere on the node.
+      if (isAbsolute(f) || f.split(/[\\/]/).includes("..")) {
+        return bad(`expect.files entry ${JSON.stringify(f)} must be relative to the run directory without '..'`);
+      }
+    }
     files = e.files as string[];
   }
 
@@ -98,6 +108,7 @@ export function parseExpectSpec(value: unknown): ExpectSpecResult {
     if (typeof e.command !== "string" || e.command.trim().length === 0) {
       return bad("expect.command must be a non-empty string");
     }
+    if (e.command.includes("\0")) return bad("expect.command must not contain NUL");
     command = e.command;
   }
 
@@ -117,11 +128,19 @@ export function resolveExpectPath(cwd: string, p: string): string {
   return resolve(cwd, p);
 }
 
-/** Existence check following symlinks (a broken link does not "exist"). */
+/**
+ * Existence check following symlinks (a broken link does not "exist"). The
+ * resolved target must stay inside the run directory: a symlink to somewhere
+ * else on the node does not satisfy the gate.
+ */
 export async function expectFileOk(cwd: string, p: string): Promise<boolean> {
   try {
-    await stat(resolveExpectPath(cwd, p));
-    return true;
+    const target = resolveExpectPath(cwd, p);
+    await stat(target);
+    const root = await realpath(cwd);
+    const real = await realpath(target);
+    const rel = relative(root, real);
+    return rel !== "" && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
   } catch {
     return false;
   }
@@ -131,7 +150,7 @@ export async function expectFileOk(cwd: string, p: string): Promise<boolean> {
  * The pure evaluator for the expect gate (issue #62).
  *
  * Checks every path in `files` (relative to `cwd`), runs `command` via
- * `bash -lc` in `cwd` when given, and derives `verified` as: all files exist
+ * `bash -c` in `cwd` when given, and derives `verified` as: all files exist
  * AND (no command OR command exited 0). Never throws for expected failure
  * modes — a missing file, a failing command, or a killed command all produce
  * an honest `verified: false` outcome.
@@ -155,30 +174,78 @@ export async function evaluateExpect(
   return { verified, verifyDetails: command ? { files, command } : { files } };
 }
 
-/** Run the expect command (bash -lc, cwd) and capture its exit status. */
+/** Hard bound on how long we wait for the whole process group to disappear after SIGKILL. */
+const GROUP_REAP_MS = 2_000;
+
+/** Injection points so both platforms' kill paths are testable on one OS. */
+export interface KillDeps {
+  platform: NodeJS.Platform;
+  kill: (pid: number, signal: NodeJS.Signals) => void;
+  taskkill: (pid: number) => void;
+}
+
+const realKillDeps = (): KillDeps => ({
+  platform: process.platform,
+  kill: (pid, signal) => void process.kill(pid, signal),
+  taskkill: (pid) => {
+    spawnSync("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+  },
+});
+
+/**
+ * Terminate a spawned process and its descendants. POSIX: SIGKILL the process
+ * group (the child was spawned detached, so it leads one). Windows has no
+ * negative-pid signalling: use `taskkill /T /F`. Either way fall back to killing
+ * the direct child, and never throw.
+ */
+export function killProcessTree(pid: number | undefined, direct: (() => void) | undefined, deps: KillDeps = realKillDeps()): void {
+  if (!pid) {
+    direct?.();
+    return;
+  }
+  try {
+    if (deps.platform === "win32") deps.taskkill(pid);
+    else deps.kill(-pid, "SIGKILL");
+    return;
+  } catch {
+    /* fall through to the direct child */
+  }
+  try {
+    direct?.();
+  } catch {
+    /* already gone */
+  }
+}
+
+/** Run the expect command (bash -c, cwd, own process group) and capture its exit status. */
 async function runExpectCommand(cmd: string, cwd: string, timeoutMs: number): Promise<ExpectCommandCheck> {
   const { spawn } = await import("node:child_process");
   return new Promise<ExpectCommandCheck>((resolveDone) => {
-    let exitCode: number | null = null;
     let settled = false;
-    const child = spawn("bash", ["-lc", cmd], { cwd, stdio: ["ignore", "ignore", "ignore"] });
+    // detached (POSIX) => its own process group, so a timeout (or exit) can take
+    // down forked descendants and background jobs, not just the bash child.
+    const child = spawn("bash", ["-c", cmd], {
+      cwd,
+      stdio: ["ignore", "ignore", "ignore"],
+      detached: process.platform !== "win32",
+      windowsHide: true,
+    });
+    const killTree = () => killProcessTree(child.pid, () => void child.kill("SIGKILL"));
+    const finish = (exitCode: number | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      // A gate must not leave stragglers mutating the workspace after it returned.
+      killTree();
+      resolveDone({ cmd, exitCode, ok: exitCode === 0 });
+    };
     const timer = setTimeout(() => {
       // A hanging gate must fail, not hang the run record.
-      child.kill("SIGKILL");
+      killTree();
+      setTimeout(() => finish(null), GROUP_REAP_MS).unref();
     }, timeoutMs);
-    child.on("error", () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolveDone({ cmd, exitCode: null, ok: false });
-    });
-    child.on("close", (code) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      exitCode = typeof code === "number" ? code : null;
-      resolveDone({ cmd, exitCode, ok: exitCode === 0 });
-    });
+    child.on("error", () => finish(null));
+    child.on("close", (code) => finish(typeof code === "number" ? code : null));
   });
 }
 
@@ -203,4 +270,16 @@ export function withVerified<T extends Record<string, unknown>>(
     verified,
     verifyDetails: outcome?.verifyDetails ?? null,
   };
+}
+
+/** Extra time the relay must allow when a verification gate runs after the worker. */
+export const GATE_RELAY_GRACE_MS = 15_000;
+
+/**
+ * The relay timeout for a run that carries a gate: the worker's own budget PLUS
+ * the gate's bound and a grace period, so a worker that uses its whole budget
+ * still returns `verified` instead of the relay timing out mid-gate.
+ */
+export function relayTimeoutWithGate(timeoutMs: number, hasGate: boolean): number {
+  return hasGate ? timeoutMs + DEFAULT_EXPECT_COMMAND_TIMEOUT_MS + GATE_RELAY_GRACE_MS : timeoutMs;
 }

@@ -326,7 +326,7 @@ describe("issue #62: node handler — threading through the detached launcher", 
     const script = readFileSync(runScriptPath("vthread"), "utf8");
     // The gate fragment must carry the caller's paths + command...
     expect(script).toContain("'report.md'");
-    expect(script).toContain("bash -lc 'printf done > .verify-ran'");
+    expect(script).toContain("bash -c 'printf done > .verify-ran'");
     // ...and the done write must record verified + verifyDetails.
     expect(script).toContain('"verified":%s,"verifyDetails":%s');
   });

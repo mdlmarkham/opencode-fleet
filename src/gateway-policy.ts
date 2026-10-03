@@ -9,7 +9,15 @@
  * engine we therefore verify the node first instead of running the wrong engine.
  */
 
-import { PROTOCOL_VERSION, nodeProtocolOf, resolveOp } from "./protocol.js";
+import { PROTOCOL_VERSION, nodeProtocolOf, requiredProtocol, resolveOp } from "./protocol.js";
+import { relayTimeoutWithGate } from "./verify.js";
+import { checkSetup } from "./policy.js";
+
+/** Operator policy applied at the chokepoint every dispatch passes through. */
+export interface PolicyOptions {
+  /** Allow an arbitrary `expect.command` (operator `allowSetupCommands`); default: repo script paths only. */
+  allowExpectCommands?: boolean;
+}
 
 export interface PolicyCtx {
   params: unknown;
@@ -67,6 +75,7 @@ export async function handleOpencodeRunPolicy(
   ctx: PolicyCtx,
   cache: ProtocolCache,
   now: () => number = Date.now,
+  opts: PolicyOptions = {},
 ): Promise<PolicyResult> {
   const task = ctx.params as (Record<string, unknown> & { prompt?: unknown; cwd?: unknown; harness?: unknown; timeoutMs?: number }) | null;
   if (!task || typeof task.prompt !== "string" || !task.prompt.trim()) {
@@ -79,31 +88,47 @@ export async function handleOpencodeRunPolicy(
   if (!resolved.ok) return { ok: false, message: resolved.error };
 
   const nodeId = ctx.node?.nodeId;
-  const engine = typeof task.harness === "string" && task.harness ? task.harness : "opencode";
   const launches = resolved.op === "run" || resolved.op === "run.start";
-  if (launches && engine !== "opencode") {
+
+  // `expect.command` runs on the node outside the engine's permission system. This
+  // is the one place every launch passes through (tools, direct invocations), so the
+  // operator's rule is enforced here and not only in the tool wrappers.
+  const cmd = (task.expect as { command?: unknown } | null | undefined)?.command;
+  if (launches && cmd !== undefined && cmd !== null) {
+    const check = typeof cmd === "string" ? checkSetup(cmd, opts.allowExpectCommands === true) : { ok: false as const, error: "expect.command must be a string" };
+    if (!check.ok) return { ok: false, message: `invalid expect.command: ${check.error}` };
+  }
+  const need = launches ? requiredProtocol(task as { harness?: unknown; expect?: unknown }) : { version: 0 };
+  if (need.version > 0) {
+    // A node below the needed protocol would silently ignore the field (run the
+    // wrong engine, or skip the verification gate and report an ungated run).
     let cached = nodeId ? cache.get(nodeId) : undefined;
-    if (!cached || now() - cached.at > CACHE_TTL_MS) {
+    if (!cached || now() - cached.at > CACHE_TTL_MS || cached.version < need.version) {
       let version: number;
       try {
         version = await probeProtocol(ctx);
       } catch (e) {
-        return { ok: false, message: `cannot verify the node supports harness "${engine}": ${(e as Error).message}` };
+        return { ok: false, message: `cannot verify the node supports ${need.feature}: ${(e as Error).message}` };
       }
       cached = { version, at: now() };
       if (nodeId) cache.set(nodeId, cached);
     }
-    if (cached.version < PROTOCOL_VERSION) {
+    if (cached.version < need.version) {
       return {
         ok: false,
-        message: `node speaks protocol ${cached.version} (< ${PROTOCOL_VERSION}) and would ignore harness "${engine}"; upgrade opencode-fleet on the node first`,
+        message: `node speaks protocol ${cached.version} (< ${need.version}) and would silently ignore ${need.feature}; upgrade opencode-fleet on the node first`,
       };
     }
   }
 
+  // The gate runs after the worker; give the relay time for it so a worker that
+  // uses its whole budget still returns `verified` instead of timing out mid-gate.
+  const baseTimeout = typeof task.timeoutMs === "number" ? task.timeoutMs : undefined;
+  const timeoutMs =
+    baseTimeout !== undefined ? relayTimeoutWithGate(baseTimeout, launches && task.expect != null) : undefined;
   const result = await ctx.invokeNode({
     params: { ...task, op: resolved.op, protocol: PROTOCOL_VERSION },
-    timeoutMs: task.timeoutMs,
+    timeoutMs,
   });
   if (!result.ok) return { ok: false, message: result.message ?? "opencode.run failed on node." };
 
