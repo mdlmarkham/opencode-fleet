@@ -24,6 +24,7 @@ import { acceptChunk, assembleChunks, isCanonicalBase64 } from "../xfer.js";
 import { guardCwd, taskUsesCwd, validateTaskIds } from "../guard.js";
 import { runPaths, xferPaths, writePrivate } from "../paths.js";
 import { resolveOp, stampProtocol, type Op } from "../protocol.js";
+import { parseScope, scopeViolations } from "../scope.js";
 import {
   OPCODE_PS_COMMAND,
   abortRunById,
@@ -270,6 +271,15 @@ OPS["run.start"] = async ({ task, io, context }: OpCtx) => {
         return JSON.stringify({ ok: false, error: `refused: ${expectSpec.error}` });
       }
       const expect = expectSpec.expect;
+      // Issue #65 slice 2: advisory file scope. Re-validated here (the node does
+      // not trust the gateway); the HEAD at start lets run.status list what changed.
+      const scopeSpec = parseScope((task as { scope?: unknown }).scope);
+      if (!scopeSpec.ok) return JSON.stringify({ ok: false, error: `refused: ${scopeSpec.error}` });
+      let startHead: string | undefined;
+      if (scopeSpec.scope) {
+        const head = (await runShell(`git -C ${shq(task.cwd)} rev-parse --verify HEAD 2>/dev/null`, 10_000, context?.signal)).trim();
+        if (/^[0-9a-f]{40,64}$/.test(head)) startHead = head;
+      }
       // Completion is written to a SEPARATE file so the manager's JSON
       // state write (below) and the worker's completion write never race.
       const donePath = runPaths(runId).done;
@@ -284,7 +294,7 @@ OPS["run.start"] = async ({ task, io, context }: OpCtx) => {
         // final exit propagates the worker's real status.
         "set -u",
         // The script publishes its own pid/pgid/state first (issues #64, #69).
-        ...selfStateLines(statePath, { runId, harness: task.harness ?? "opencode", ...(task.piModel ? { piModel: task.piModel } : {}) }),
+        ...selfStateLines(statePath, { runId, harness: task.harness ?? "opencode", ...(task.piModel ? { piModel: task.piModel } : {}), ...(scopeSpec.scope ? { scope: scopeSpec.scope, cwd: task.cwd, ...(startHead ? { startHead } : {}) } : {}) }),
         inner,
         `EC=$?`,
         ...(gate?.verifyLines ?? []),
@@ -337,7 +347,7 @@ OPS["run.status"] = async ({ task, io, context }: OpCtx) => {
       const statePath = runStatePath(runId);
       try {
         const raw = await (await import("node:fs/promises")).readFile(statePath, "utf8");
-        const st = JSON.parse(raw) as { pid?: number; state?: string; startedAt?: string; finishedAt?: string; exitCode?: number; verified?: boolean; verifyDetails?: VerifyDetails };
+        const st = JSON.parse(raw) as { pid?: number; state?: string; startedAt?: string; finishedAt?: string; exitCode?: number; verified?: boolean; verifyDetails?: VerifyDetails; scope?: { files: string[] }; cwd?: string; startHead?: string; changedFiles?: string[]; scopeViolations?: string[] | null; scopeError?: string };
         // Merge worker completion record when present (issue #6). Issue #62:
         // the record may also carry the verify-gate outcome.
         try {
@@ -351,6 +361,27 @@ OPS["run.status"] = async ({ task, io, context }: OpCtx) => {
             if (done.verifyDetails) st.verifyDetails = done.verifyDetails;
           }
         } catch { /* still running or not finished */ }
+        // Issue #65 slice 2: once finished, list what changed against the start
+        // commit and flag anything outside the declared scope (advisory).
+        if (st.scope && st.cwd && st.finishedAt) {
+          const sc = parseScope(st.scope);
+          if (sc.ok && sc.scope) {
+            const base = st.startHead && /^[0-9a-f]{40,64}$/.test(st.startHead) ? st.startHead : "HEAD";
+            const out = await runShellDetailed(
+              `git -C ${shq(st.cwd)} -c core.quotePath=false diff --name-only ${base} -- ; git -C ${shq(st.cwd)} -c core.quotePath=false ls-files --others --exclude-standard`,
+              15_000,
+              context?.signal,
+            );
+            if (out.exitCode === 0 && !out.timedOut) {
+              const changed = [...new Set(out.output.split("\n").map((l) => l.trim()).filter(Boolean))];
+              st.changedFiles = changed.slice(0, 200);
+              st.scopeViolations = scopeViolations(changed, sc.scope);
+            } else {
+              st.scopeViolations = null;
+              st.scopeError = "could not list changed files (git failed in the run cwd)";
+            }
+          }
+        }
         // Liveness: is the pid still alive?
         // Alive = the run's script is in the process table (not `kill -0` on a
         // recorded pid, which may be the launcher subshell or a reused pid).

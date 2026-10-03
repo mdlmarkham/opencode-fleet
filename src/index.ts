@@ -189,7 +189,16 @@ export default definePluginEntry({
             description: "Structured task spec (issue #65 slice 1) — the dispatch unit with an explicit goal, acceptance criteria and verify gate. When given, the engine prompt is RENDERED from goal + acceptance (goal on the first line, then an 'Acceptance criteria:' bullet list; the flat `prompt` is ignored) and spec.verify maps onto the SAME post-run verification gate as the flat `expect` param (same parser, same node evaluator, same ledger shape). A prompt-only call behaves exactly as before.",
             properties: {
               goal: { type: "string", description: "The task goal — the first line of the rendered engine prompt." },
-              acceptance: { type: "array", items: { type: "string" }, description: "Acceptance criteria, rendered as a bullet list under 'Acceptance criteria:'." },
+              acceptance: { type: "array", items: { type: "string" }, description: "Acceptance criteria, rendered as a bullet list under 'Acceptance criteria:'. At most 50 items of 1000 characters." },
+              scope: {
+                type: "object",
+                additionalProperties: false,
+                description: "Advisory file scope (issue #65 slice 2). Rendered into the prompt, and on a detached run the node lists the files that changed against the start commit and reports any outside the scope as scopeViolations in fleet_run_status. Not enforced. Also the overlap key for scheduling concurrent tasks.",
+                properties: {
+                  files: { type: "array", items: { type: "string" }, description: "Repo-relative paths or globs (`*`, `**`, `?`); `dir/` means everything below dir. No absolute paths or `..`. At most 100." },
+                },
+                required: ["files"],
+              },
               verify: {
                 type: "object",
                 additionalProperties: false,
@@ -262,7 +271,7 @@ export default definePluginEntry({
           async?: boolean;
           env?: Record<string, string>;
           expect?: { files?: string[]; command?: string };
-          spec?: { goal: string; acceptance?: string[]; verify?: { files?: string[]; command?: string } };
+          spec?: { goal: string; acceptance?: string[]; verify?: { files?: string[]; command?: string }; scope?: { files: string[] } };
           ref?: { branch?: string; commit?: string };
           requires?: {
             gpu?: boolean;
@@ -446,6 +455,7 @@ export default definePluginEntry({
             maxDurationMs: p.maxDurationMs,
             env: p.env,
             expect: expectSpec.expect,
+            ...(specCheck.spec?.scope ? { scope: specCheck.spec.scope } : {}),
             ref: p.ref,
             async: p.async !== false,
           };
@@ -939,6 +949,18 @@ export default definePluginEntry({
           // signal, but a failed gate means the run must not be trusted.
           verified: typeof st.verified === "boolean" ? st.verified : null,
           verifyDetails: st.verifyDetails ?? null,
+          // Issue #65 slice 2: advisory scope check. null = a scope was declared but
+          // the node did not report (older node, still running, or git failed).
+          ...(entry?.spec?.scope
+            ? {
+                scopeViolations: Array.isArray(st.scopeViolations) ? st.scopeViolations : null,
+                ...(Array.isArray(st.changedFiles) ? { changedFiles: st.changedFiles } : {}),
+                ...(st.scopeError ? { scopeNote: st.scopeError } : {}),
+                ...(Array.isArray(st.scopeViolations) && st.scopeViolations.length
+                  ? { scopeWarning: `${st.scopeViolations.length} changed file(s) fall outside the declared scope (advisory; review them).` }
+                  : {}),
+              }
+            : {}),
           ...(st.verified === false
             ? {
                 verifiedNote:

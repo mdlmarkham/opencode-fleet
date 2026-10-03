@@ -18,6 +18,8 @@
  * rendered prompt is reproducible and unit-testable in isolation.
  */
 
+import { parseScope } from "./scope.js";
+
 /**
  * The structured task spec. `verify` is structurally the same gate shape as
  * the flat `expect` param (defined inline so this module stays dependency-
@@ -31,6 +33,8 @@ export interface TaskSpec {
   acceptance?: string[];
   /** Post-run verification gate (same shape + semantics as the flat `expect` param, issue #62). */
   verify?: { files?: string[]; command?: string };
+  /** Advisory file scope (issue #65 slice 2): repo-relative paths/globs the task should stay within. */
+  scope?: { files: string[] };
 }
 
 /**
@@ -45,12 +49,16 @@ export interface TaskSpec {
  */
 export type TaskSpecResult = { ok: true; spec?: TaskSpec } | { ok: false; error: string };
 
+/** Caps so criteria stay a bounded, readable block of the prompt. */
+export const MAX_ACCEPTANCE_ITEMS = 50;
+export const MAX_ACCEPTANCE_LENGTH = 1000;
+
 export function parseTaskSpec(value: unknown): TaskSpecResult {
   if (value === undefined || value === null) return { ok: true, spec: undefined };
   if (typeof value !== "object" || Array.isArray(value)) {
     return { ok: false, error: "spec must be an object {goal, acceptance?, verify?}" };
   }
-  const s = value as { goal?: unknown; acceptance?: unknown; verify?: unknown };
+  const s = value as { goal?: unknown; acceptance?: unknown; verify?: unknown; scope?: unknown };
   if (typeof s.goal !== "string" || s.goal.trim().length === 0) {
     return { ok: false, error: "spec.goal must be a non-empty string" };
   }
@@ -62,6 +70,14 @@ export function parseTaskSpec(value: unknown): TaskSpecResult {
       return { ok: false, error: "spec.acceptance must be an array of non-empty strings" };
     }
   }
+  if (Array.isArray(s.acceptance) && s.acceptance.length > MAX_ACCEPTANCE_ITEMS) {
+    return { ok: false, error: `spec.acceptance has more than ${MAX_ACCEPTANCE_ITEMS} items` };
+  }
+  if (Array.isArray(s.acceptance) && s.acceptance.some((a) => (a as string).length > MAX_ACCEPTANCE_LENGTH)) {
+    return { ok: false, error: `spec.acceptance items must be at most ${MAX_ACCEPTANCE_LENGTH} characters` };
+  }
+  const sc = parseScope(s.scope);
+  if (!sc.ok) return { ok: false, error: `spec.${sc.error}` };
   // verify (if present) is validated by parseExpectSpec where the gate is
   // threaded — one parser, one refusal path (issue #65 slice 1).
   return { ok: true, spec: value as TaskSpec };
@@ -85,9 +101,13 @@ export function parseTaskSpec(value: unknown): TaskSpecResult {
  * meaningless bullets); remaining items are kept verbatim. `verify` shapes
  * the run's gate, not the prompt — it never appears in the rendering.
  */
-export function renderSpec(spec: { goal: string; acceptance?: string[]; verify?: unknown }): string {
+export function renderSpec(spec: { goal: string; acceptance?: string[]; verify?: unknown; scope?: { files: string[] } }): string {
   const goal = spec.goal;
   const items = (spec.acceptance ?? []).filter((a) => typeof a === "string" && a.trim().length > 0);
-  if (items.length === 0) return goal;
-  return [goal, "", "Acceptance criteria:", ...items.map((a) => `- ${a}`)].join("\n");
+  const scope = spec.scope?.files ?? [];
+  if (items.length === 0 && scope.length === 0) return goal;
+  const out = [goal];
+  if (items.length) out.push("", "Acceptance criteria:", ...items.map((a) => `- ${a}`));
+  if (scope.length) out.push("", "Scope (keep your changes within these paths):", ...scope.map((f) => `- ${f}`));
+  return out.join("\n");
 }
