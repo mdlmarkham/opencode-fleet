@@ -24,6 +24,9 @@ The **manager** (Main/Metis) holds GitHub credentials and model routing. **Worke
 - **`fleet_sync`** — pull worker changes back and push to GitHub with manager credentials
 - **`fleet_cleanup`** — keep nodes tidy: git gc, report disk usage, and prune finished runs' scripts/logs/state (older than `pruneOlderThanDays`, default 7; live runs are never touched; needs a protocol-3 node)
 
+### Audit
+- **`fleet_run_report`** — the audit manifest of a finished run: files changed against the start commit, `git diff --stat`, commands the engine ran (opencode reports them; Pi's plain transcript does not, so `commandsRecorded: false`), exit code, duration, token/cost usage, verification and scope results, event-log size, plus the dispatch spec. Raw evidence stays on the node (private state dir); secrets are redacted when it is returned. Fields that could not be captured are `null`, never an implied empty list. Needs a node with the audit trail; an older node is reported as such.
+
 ### Model selection & learning
 - **`fleet_models`** — query the Aperture model catalog (pricing/context) so the agent picks the right model per task
 - **`fleet_recipe_recommend`** — recommend the best (model, thinking, agent, transport) combo for a task + codebase, learned from past outcomes

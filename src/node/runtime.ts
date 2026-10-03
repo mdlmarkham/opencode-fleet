@@ -546,7 +546,7 @@ export async function pruneStateDir(
   const runFiles = new Map<string, string[]>();
   const xfers = new Map<string, string[]>();
   for (const n of names) {
-    let m = n.match(/^run-([A-Za-z0-9_-]{1,64})\.(json|sh|log)$/) ?? n.match(/^done-([A-Za-z0-9_-]{1,64})\.json$/);
+    let m = n.match(/^run-([A-Za-z0-9_-]{1,64})\.(json|sh|log|changes)$/) ?? n.match(/^(?:done|manifest)-([A-Za-z0-9_-]{1,64})\.json$/);
     if (m) {
       (runFiles.get(m[1]) ?? runFiles.set(m[1], []).get(m[1])!).push(n);
       continue;
