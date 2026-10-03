@@ -4,7 +4,7 @@
  * behavior change.
  */
 
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { shq } from "./../shell.js";
 import { abortStateWrite } from "./../recovery.js";
 import { runPaths, writePrivate, xferPaths } from "./../paths.js";
@@ -610,4 +610,153 @@ export function changesCaptureLines(cwd: string, startHead: string | undefined, 
     "# Issue #42: record what changed, for the audit manifest.",
     `{ echo "endHead=$(${g} rev-parse HEAD 2>/dev/null)"; echo "---status"; ${g} diff --name-status ${startHead} -- 2>/dev/null; ${g} ls-files --others --exclude-standard 2>/dev/null | awk '{print "?\t" $0}'; echo "---stat"; ${g} diff --stat ${startHead} -- 2>/dev/null; } > ${shq(changesPath)} 2>/dev/null`,
   ];
+}
+
+// ---------------------------------------------------------------------------
+// Per-run isolation (issue #41): a private git clone per run
+// ---------------------------------------------------------------------------
+
+/** Where a run's clone lives: beside the source, inside the same allowed root. */
+export function runCloneDir(sourceCwd: string, runId: string): string {
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(runId)) throw new Error(`invalid runId: ${JSON.stringify(runId)}`);
+  return `${dirname(resolve(sourceCwd))}/.fleet-runs/${runId}`;
+}
+
+export type CloneResult = { ok: true; cwd: string; branch: string; sourceDirty: boolean } | { ok: false; error: string };
+
+async function git(args: string[], cwd?: string): Promise<{ ok: boolean; out: string }> {
+  const { execFile } = await import("node:child_process");
+  return new Promise((res) => {
+    execFile("git", args, { cwd, timeout: 120_000, maxBuffer: 8 * 1024 * 1024, env: { ...process.env, GIT_TERMINAL_PROMPT: "0" } }, (err, stdout, stderr) => {
+      res({ ok: !err, out: (stdout + (err ? `\n${stderr}` : "")).trim() });
+    });
+  });
+}
+
+/**
+ * Give a run its own clone of `sourceCwd` at `<parent>/.fleet-runs/<runId>/repo`
+ * (0700), on a new branch `fleet/<runId>`. `--no-hardlinks` makes the object store
+ * the run's own, `core.hooksPath=/dev/null` stops any hook from running, and the
+ * run never shares `.git` with the source, so a hook or config written by one run
+ * cannot execute in another's or in the source checkout. Only COMMITTED state is
+ * cloned; uncommitted changes in the source are reported via `sourceDirty`.
+ */
+export async function createRunClone(runId: string, sourceCwd: string): Promise<CloneResult> {
+  const fsp = await import("node:fs/promises");
+  let runDir: string;
+  try {
+    runDir = runCloneDir(sourceCwd, runId);
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
+  const head = await git(["-C", sourceCwd, "rev-parse", "--verify", "HEAD"]);
+  if (!head.ok) return { ok: false, error: `${sourceCwd} is not a git checkout with at least one commit` };
+  const dirty = await git(["-C", sourceCwd, "status", "--porcelain"]);
+  const cwd = `${runDir}/repo`;
+  try {
+    await fsp.mkdir(dirname(runDir), { recursive: true, mode: 0o700 });
+    await fsp.mkdir(runDir, { mode: 0o700 }); // fails if the run already has a directory
+  } catch (e) {
+    return { ok: false, error: `cannot create ${runDir}: ${(e as Error).message}` };
+  }
+  const branch = `fleet/${runId}`;
+  const steps: string[][] = [
+    ["clone", "-q", "--local", "--no-hardlinks", "--", resolve(sourceCwd), cwd],
+    ["-C", cwd, "config", "core.hooksPath", "/dev/null"],
+    ["-C", cwd, "checkout", "-q", "-b", branch],
+  ];
+  for (const a of steps) {
+    const r = await git(a);
+    if (!r.ok) {
+      await fsp.rm(runDir, { recursive: true, force: true }).catch(() => {});
+      return { ok: false, error: `git ${a[0] === "-C" ? a[2] : a[0]} failed: ${r.out.slice(0, 200)}` };
+    }
+  }
+  return { ok: true, cwd, branch, sourceDirty: dirty.ok && dirty.out.length > 0 };
+}
+
+/** The run directory for a clone path, only if it has exactly the shape createRunClone makes. */
+function runDirOfClone(runCwd: string): string | undefined {
+  const m = resolve(runCwd).match(/^(.*\/\.fleet-runs\/[A-Za-z0-9_-]{1,64})\/repo$/);
+  return m ? m[1] : undefined;
+}
+
+/** Remove a run's clone directory. Refuses anything that is not a `.fleet-runs/<id>/repo` clone, and never follows a symlink. */
+export async function removeRunClone(runCwd: string): Promise<boolean> {
+  const dir = runDirOfClone(runCwd);
+  if (!dir) return false;
+  const fsp = await import("node:fs/promises");
+  try {
+    const st = await fsp.lstat(dir);
+    if (st.isSymbolicLink() || !st.isDirectory()) return false;
+    await fsp.rm(dir, { recursive: true, force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export interface CloneVerdict {
+  /** Commits or working-tree changes beyond the start commit (work not yet synced anywhere). */
+  unsynced: boolean;
+  detail: string;
+}
+
+/** Whether a run clone holds work beyond its start commit. Unknown counts as unsynced. */
+export async function cloneHasUnsyncedWork(runCwd: string, startHead: string | undefined): Promise<CloneVerdict> {
+  const status = await git(["-C", runCwd, "status", "--porcelain"]);
+  if (!status.ok) return { unsynced: true, detail: "cannot read the clone's status" };
+  if (status.out) return { unsynced: true, detail: "uncommitted changes" };
+  if (!startHead || !/^[0-9a-f]{40,64}$/.test(startHead)) return { unsynced: true, detail: "start commit unknown" };
+  const ahead = await git(["-C", runCwd, "rev-list", "--count", `${startHead}..HEAD`]);
+  if (!ahead.ok) return { unsynced: true, detail: "cannot compare with the start commit" };
+  return Number(ahead.out) > 0 ? { unsynced: true, detail: `${ahead.out} commit(s) beyond the start` } : { unsynced: false, detail: "no work beyond the start commit" };
+}
+
+export interface CloneSweep {
+  removedClones: string[];
+  keptUnsynced: Array<{ runId: string; detail: string }>;
+  errors: string[];
+}
+
+/**
+ * Remove finished runs' clones older than the cutoff. A clone with work beyond its
+ * start commit is KEPT (listed) unless `discardUnsynced`: unsynced work is never
+ * deleted silently. Runs whose clones are kept (or alive) are returned in `protect`
+ * so the state sweep leaves the pointer to them alone.
+ */
+export async function pruneRunClones(
+  dir: string,
+  olderThanMs: number,
+  aliveRunIds: ReadonlySet<string>,
+  opts: { discardUnsynced?: boolean; now?: number } = {},
+): Promise<CloneSweep & { protect: Set<string> }> {
+  const fsp = await import("node:fs/promises");
+  const out: CloneSweep & { protect: Set<string> } = { removedClones: [], keptUnsynced: [], errors: [], protect: new Set() };
+  const cutoff = (opts.now ?? Date.now()) - olderThanMs;
+  let names: string[];
+  try { names = await fsp.readdir(dir); } catch { return out; }
+  for (const n of names) {
+    const m = n.match(/^run-([A-Za-z0-9_-]{1,64})\.json$/);
+    if (!m) continue;
+    const id = m[1];
+    let st: { isolation?: { cwd?: string }; startHead?: string };
+    try { st = JSON.parse(await fsp.readFile(`${dir}/${n}`, "utf8")); } catch { continue; }
+    const cwd = st.isolation?.cwd;
+    if (!cwd || !runDirOfClone(cwd)) continue;
+    if (aliveRunIds.has(id)) { out.protect.add(id); continue; }
+    let finished = true;
+    try { await fsp.stat(`${dir}/done-${id}.json`); } catch { finished = false; }
+    const newest = Math.max(...(await Promise.all([n, `done-${id}.json`].map((f) => fsp.stat(`${dir}/${f}`).then((s) => s.mtimeMs, () => 0)))));
+    if (!finished || newest >= cutoff) { out.protect.add(id); continue; }
+    const v = await cloneHasUnsyncedWork(cwd, st.startHead);
+    if (v.unsynced && !opts.discardUnsynced) {
+      out.keptUnsynced.push({ runId: id, detail: v.detail });
+      out.protect.add(id);
+      continue;
+    }
+    if (await removeRunClone(cwd)) out.removedClones.push(id);
+    else out.errors.push(`${id}: could not remove ${cwd}`);
+  }
+  return out;
 }
