@@ -17,7 +17,13 @@ import { shq } from "./shell.js";
 import { interpretLiveness } from "./recovery.js";
 import { SSH_ARGS, sshPrefix } from "./ssh.js";
 
-export type RunState = "running" | "completed" | "failed" | "timed-out" | "discarded";
+export type RunState =
+  | "running"
+  | "completed"
+  | "failed"
+  | "failed-verification"
+  | "timed-out"
+  | "discarded";
 
 export interface LedgerEntry {
   runId: string;
@@ -37,6 +43,11 @@ export interface LedgerEntry {
   state: RunState;
   /** Process exit status of the worker, when known (issue #37). */
   exitCode?: number;
+  /** The run's verification-gate outcome (issue #62): false = the `expect` gate FAILED.
+   *  Absent = no gate was configured or the outcome is unknown (backward compatible). */
+  verified?: boolean;
+  /** The node's verify-gate details, persisted so a FAILED gate survives node state cleanup. */
+  verifyDetails?: unknown;
   summary?: string;
   sessionId?: string;
   handRaised?: boolean;
@@ -76,9 +87,9 @@ export async function saveLedger(rootDir: string, runs: LedgerEntry[]): Promise<
  * Terminal states: only these are subject to the retention cap. `timed-out` is
  * deliberately NOT terminal: a relay timeout does not mean the worker stopped
  * (fleet_resume treats it as incomplete), so its recovery record is kept until
- * the run is reconciled to completed/failed/discarded.
+ * the run is reconciled to completed/failed/discarded/failed-verification.
  */
-const TERMINAL: ReadonlySet<RunState> = new Set(["completed", "failed", "discarded"]);
+const TERMINAL: ReadonlySet<RunState> = new Set(["completed", "failed", "failed-verification", "discarded"]);
 
 /** How many terminal runs to keep. In-flight (`running`) entries are never evicted. */
 export const LEDGER_TERMINAL_CAP = 200;
@@ -121,16 +132,43 @@ export interface DispatchOutcome {
   timedOut: boolean;
   /** The silent-death reconcile already recorded this run as failed. */
   reconciledDead: boolean;
-  parsed: { ok?: boolean; summary?: string; sessionId?: string; handRaised?: boolean; question?: string };
+  parsed: {
+    ok?: boolean;
+    summary?: string;
+    sessionId?: string;
+    handRaised?: boolean;
+    question?: string;
+    /** The node's verification-gate outcome (issue #62), when a gate was configured. */
+    verified?: boolean;
+    verifyDetails?: unknown;
+  };
 }
 
 /**
  * Final ledger entry for a synchronous dispatch: the SAME run with its new
  * state (startedAt/engine/pid preserved), never a fresh entry, and never
  * overriding a silent-death failure with timed-out.
+ *
+ * The run's `verified` outcome is recorded on the entry and the state
+ * derivation consults it (issue #62 review). Process-level failures keep
+ * their state ("failed"/"timed-out"); the would-be "completed" branch refuses
+ * to launder a FAILED verification gate: verified === false =>
+ * "failed-verification", so a clean exit that produced nothing is never
+ * persisted as a completed run. verified absent/true keeps "completed"
+ * (backward compatible), and verifyDetails is persisted so the failure
+ * survives node state cleanup.
  */
 export function outcomeEntry(base: LedgerEntry, o: DispatchOutcome, now: string = new Date().toISOString()): LedgerEntry {
-  const state: RunState = o.reconciledDead ? "failed" : o.timedOut ? "timed-out" : o.parsed.ok === false ? "failed" : "completed";
+  const state: RunState =
+    o.reconciledDead
+      ? "failed"
+      : o.timedOut
+        ? "timed-out"
+        : o.parsed.ok === false
+          ? "failed"
+          : o.parsed.verified === false
+            ? "failed-verification"
+            : "completed";
   return {
     ...base,
     updatedAt: now,
@@ -139,6 +177,8 @@ export function outcomeEntry(base: LedgerEntry, o: DispatchOutcome, now: string 
     sessionId: o.parsed.sessionId,
     handRaised: o.parsed.handRaised,
     question: o.parsed.question,
+    verified: o.parsed.verified ?? undefined,
+    verifyDetails: o.parsed.verifyDetails,
   };
 }
 

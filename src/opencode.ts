@@ -58,6 +58,13 @@ export interface OpenCodeTask {
   env?: Record<string, string>;
   /** Git ref to check out before running (dispatch-time environment selection). Refused if the checkout has uncommitted changes. */
   ref?: { branch?: string; commit?: string };
+  /**
+   * Issue #62: optional post-run verification gate. When present the node
+   * evaluates it in the run cwd AFTER the worker finishes and records
+   * `verified` + `verifyDetails` on the run result. Verified is distinct from
+   * `ok` (process exit status); absent spec => verified null, no behavior change.
+   */
+  expect?: FleetExpect;
   /** Fleet run id — enables detached execution + durable completion record. */
   runId?: string;
   /** Detached execution (default true): node returns immediately with a run handle. */
@@ -101,11 +108,21 @@ export interface OpenCodeRunResult {
   handRaised?: boolean;
   /** The worker's clarifying question (when handRaised). */
   question?: string;
+  /**
+   * Issue #62: outcome of the optional `expect` verification gate, evaluated
+   * by the node after the worker finished. null/absent = no gate was given.
+   */
+  verified?: boolean | null;
+  verifyDetails?: VerifyDetails;
 }
 
 import { shq } from "./shell.js";
 import { partitionEnv } from "./policy.js";
 import { redactSecrets, sanitizeQuestion } from "./untrusted.js";
+import type { ExpectCheck, VerifyDetails } from "./verify.js";
+
+/** Issue #62: optional post-run verification gate spec (files must exist, command must exit 0). */
+export type FleetExpect = ExpectCheck;
 
 /**
  * Validate an engine/transport combination BEFORE any command is built or the

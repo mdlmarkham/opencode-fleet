@@ -17,6 +17,8 @@ import {
   validateHarnessTransport,
   type OpenCodeTask,
 } from "../opencode.js";
+import type { VerifyDetails } from "../verify.js";
+import { evaluateExpect, parseExpectSpec } from "../verify.js";
 import { B64_MARKER, MAX_TRANSFER_B64, parseBundleOutput, parseStatusOutput, statusCommand } from "../outputs.js";
 import { acceptChunk, assembleChunks, isCanonicalBase64 } from "../xfer.js";
 import { guardCwd, taskUsesCwd, validateTaskIds } from "../guard.js";
@@ -26,6 +28,7 @@ import {
   OPCODE_PS_COMMAND,
   abortRunById,
   detachedLaunchCommand,
+  doneMarkerLine,
   parseActivity,
   readNodeModels,
   remoteBundlePath,
@@ -33,6 +36,7 @@ import {
   runShell,
   runShellDetailed,
   runStatePath,
+  verifyGateScript,
 } from "./runtime.js";
 
 /** OpenCode task plus the dispatch watchdog knobs (idle/duration guards). */
@@ -250,9 +254,21 @@ OPS["run.start"] = async ({ task, io, context }: OpCtx) => {
         prompt: realPrompt,
         timeoutMs: task.maxDurationMs ?? task.timeoutMs ?? 600_000,
       });
+      // Issue #62: optional post-run verification gate. The node must not
+      // trust the gateway, so the spec is re-validated here; a malformed one
+      // fails the launch instead of silently dropping the gate.
+      const expectSpec = parseExpectSpec(task.expect);
+      if (!expectSpec.ok) {
+        return JSON.stringify({ ok: false, error: `refused: ${expectSpec.error}` });
+      }
+      const expect = expectSpec.expect;
       // Completion is written to a SEPARATE file so the manager's JSON
       // state write (below) and the worker's completion write never race.
       const donePath = runPaths(runId).done;
+      // With an `expect` gate the tail evaluates it in the run cwd AFTER the
+      // worker exits (issue #62) and the done record gains verified +
+      // verifyDetails; without one this is byte-identical to before.
+      const gate = expect ? verifyGateScript(expect, donePath, { cwd: task.cwd }) : undefined;
       const script = [
         "#!/bin/bash",
         // Issue #22 bug 4: no exit-code laundering. `set -o pipefail` is not
@@ -261,7 +277,8 @@ OPS["run.start"] = async ({ task, io, context }: OpCtx) => {
         "set -u",
         inner,
         `EC=$?`,
-        `printf '{"done":1,"exitCode":%s,"finishedAt":"%s"}\\n' "$EC" "$(date -u +%FT%TZ)" > ${shq(donePath)}`,
+        ...(gate?.verifyLines ?? []),
+        gate?.doneLine ?? doneMarkerLine(donePath),
         `exit $EC`,
       ].join("\n");
       await writePrivate(scriptPath, script, 0o700);
@@ -302,14 +319,19 @@ OPS["run.status"] = async ({ task, io, context }: OpCtx) => {
       const statePath = runStatePath(runId);
       try {
         const raw = await (await import("node:fs/promises")).readFile(statePath, "utf8");
-        const st = JSON.parse(raw) as { pid?: number; state?: string; startedAt?: string; finishedAt?: string; exitCode?: number };
-        // Merge worker completion record when present (issue #6).
+        const st = JSON.parse(raw) as { pid?: number; state?: string; startedAt?: string; finishedAt?: string; exitCode?: number; verified?: boolean; verifyDetails?: VerifyDetails };
+        // Merge worker completion record when present (issue #6). Issue #62:
+        // the record may also carry the verify-gate outcome.
         try {
           const doneRaw = await (await import("node:fs/promises")).readFile(runPaths(runId).done, "utf8");
-          const done = JSON.parse(doneRaw) as { exitCode?: number; finishedAt?: string };
+          const done = JSON.parse(doneRaw) as { exitCode?: number; finishedAt?: string; verified?: boolean; verifyDetails?: VerifyDetails };
           st.state = "finished";
           st.exitCode = done.exitCode;
           st.finishedAt = done.finishedAt;
+          if (typeof done.verified === "boolean") {
+            st.verified = done.verified;
+            if (done.verifyDetails) st.verifyDetails = done.verifyDetails;
+          }
         } catch { /* still running or not finished */ }
         // Liveness: is the pid still alive?
         let alive = false;
@@ -317,7 +339,7 @@ OPS["run.status"] = async ({ task, io, context }: OpCtx) => {
           const ps = await runShell(`kill -0 ${st.pid} 2>/dev/null && echo ALIVE || echo DEAD`, 10_000, context?.signal);
           alive = ps.includes("ALIVE");
         }
-        return JSON.stringify({ ok: true, runId, ...st, alive });
+        return JSON.stringify({ ok: true, runId, ...st, alive, verified: typeof st.verified === "boolean" ? st.verified : null, verifyDetails: st.verifyDetails ?? null });
       } catch {
         // Distinguish never-started from cleaned (issue #21): if the
         // launch was never acked, no state file was ever written. We can't
@@ -353,6 +375,9 @@ OPS["run.result"] = async ({ task, io, context }: OpCtx) => {
       const tail = await runShell(`tail -c 64000 ${shq(logPath)} 2>/dev/null || true`, 15_000, context?.signal);
       let harness = "opencode";
       let exitCode: number | undefined;
+      // Issue #62: verify-gate outcome (from the launcher-written done record).
+      let verified: boolean | null = null;
+      let vDetails: VerifyDetails | undefined;
       try {
         const raw = await (await import("node:fs/promises")).readFile(runStatePath(runId), "utf8");
         const st = JSON.parse(raw) as { harness?: string };
@@ -360,12 +385,31 @@ OPS["run.result"] = async ({ task, io, context }: OpCtx) => {
       } catch { /* no state file */ }
       try {
         const doneRaw = await (await import("node:fs/promises")).readFile(runPaths(runId).done, "utf8");
-        const done = JSON.parse(doneRaw) as { exitCode?: number };
+        const done = JSON.parse(doneRaw) as { exitCode?: number; verified?: boolean; verifyDetails?: VerifyDetails };
         if (typeof done.exitCode === "number") exitCode = done.exitCode;
+        // Issue #62: surface the verification gate outcome recorded by the
+        // launcher. The parsed result below stays untouched; verified rides
+        // alongside it (null when no gate was configured).
+        if (typeof done.verified === "boolean") verified = done.verified;
+        if (done.verifyDetails) vDetails = done.verifyDetails;
       } catch { /* still running or no marker */ }
       const parsed =
         harness === "pi" ? parsePiOutput(tail, { exitCode }) : parseOpenCodeOutput(tail, exitCode !== undefined ? { exitCode } : undefined);
-      return JSON.stringify({ ok: true, runId, harness, result: parsed });
+      // Issue #62: attach the gate outcome to the run result (distinct from
+      // `ok`, which remains the process exit status) and alongside it for
+      // control-plane consumers.
+      if (verified !== null) {
+        parsed.verified = verified;
+        if (vDetails) parsed.verifyDetails = vDetails;
+      }
+      return JSON.stringify({
+        ok: true,
+        runId,
+        harness,
+        result: parsed,
+        verified,
+        verifyDetails: vDetails ?? null,
+      });
 };
 
 OPS["xfer.send"] = async ({ task, io, context }: OpCtx) => {
@@ -388,6 +432,12 @@ OPS["xfer.send"] = async ({ task, io, context }: OpCtx) => {
 
 /** The ordinary task: run the engine on the node and parse its result. */
 async function runTask({ task, io, context }: OpCtx): Promise<string> {
+    // Issue #62: the node does not trust the gateway; validate the optional
+    // verification gate FIRST (before the ref checkout or any worker run).
+    const expectSpec = parseExpectSpec(task.expect);
+    if (!expectSpec.ok) {
+      return JSON.stringify({ ok: false, error: `refused: ${expectSpec.error}` });
+    }
     // Per-dispatch environment (issue: agent-specified environment).
     // 1. Git ref selection: refuse when the checkout is dirty, to avoid
     //    clobbering another run's uncommitted work on a shared cwd.
@@ -440,6 +490,13 @@ async function runTask({ task, io, context }: OpCtx): Promise<string> {
         timeoutMs: task.timeoutMs ?? 300_000,
         onChunk,
       });
+      // Issue #62: an `expect` gate applies to this transport too — evaluate
+      // it after the worker (the ACP session) finished.
+      if (expectSpec.expect) {
+        const outcome = await evaluateExpect(expectSpec.expect, task.cwd);
+        acpResult.verified = outcome.verified;
+        acpResult.verifyDetails = outcome.verifyDetails;
+      }
       return JSON.stringify(acpResult);
     }
 
@@ -454,11 +511,20 @@ async function runTask({ task, io, context }: OpCtx): Promise<string> {
       task.maxIdleMs,
       task.maxDurationMs,
     );
-    return JSON.stringify(
+    const parsed =
       task.harness === "pi"
         ? parsePiOutput(run.output, { exitCode: run.exitCode, timedOut: run.timedOut, stuck: run.stuck })
-        : parseOpenCodeOutput(run.output, { exitCode: run.exitCode, timedOut: run.timedOut, stuck: run.stuck }),
-    );
+        : parseOpenCodeOutput(run.output, { exitCode: run.exitCode, timedOut: run.timedOut, stuck: run.stuck });
+    // Issue #62: when the dispatch carries an `expect` gate, evaluate it in
+    // the run cwd AFTER the worker finished. `verified` is independent of the
+    // exit status: a run that exits 0 but produced nothing ends up ok:true
+    // verified:false — visible, not laundered.
+    if (expectSpec.expect) {
+      const outcome = await evaluateExpect(expectSpec.expect, task.cwd);
+      parsed.verified = outcome.verified;
+      parsed.verifyDetails = outcome.verifyDetails;
+    }
+    return JSON.stringify(parsed);
 }
 
 export async function handleOpencodeRun(
