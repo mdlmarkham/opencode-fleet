@@ -362,7 +362,7 @@ export function parsePiOutput(raw: string, exec?: ExecStatus): OpenCodeRunResult
   const handRaised = Boolean(handRaiseMatch);
   const question = handRaiseMatch ? sanitizeQuestion(handRaiseMatch[1]) : undefined;
 
-  const cdError = /FLEET_ERROR:/.test(raw);
+  const cdError = /(^|\n)FLEET_ERROR:/.test(raw);
   const timedOut = exec?.timedOut === true || /(^|\n)\[timeout\]/.test(raw) || exec?.exitCode === 124;
   const stuck = exec?.stuck === true || /(^|\n)\[stuck:/.test(raw);
   const nonzeroExit = typeof exec?.exitCode === "number" && exec.exitCode !== 0;
@@ -371,7 +371,7 @@ export function parsePiOutput(raw: string, exec?: ExecStatus): OpenCodeRunResult
   let error: string | undefined;
   if (failed) {
     if (cdError) {
-      error = raw.match(/FLEET_ERROR:[^\n]*/)?.[0] ?? "worker could not enter cwd";
+      error = raw.match(/(?:^|\n)(FLEET_ERROR:[^\n]*)/)?.[1] ?? "worker could not enter cwd";
     } else if (timedOut) {
       error = `pi run timed out${exec?.exitCode != null ? ` (exit ${exec.exitCode})` : ""}`;
     } else if (stuck) {

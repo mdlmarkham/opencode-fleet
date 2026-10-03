@@ -52,3 +52,17 @@ describe("#63: resolveAbortRunId", () => {
     expect(resolveAbortRunId([], "s1", ["dev2"])).toBeUndefined();
   });
 });
+
+import { parsePiOutput } from "./opencode.js";
+
+describe("#63: Pi FLEET_ERROR is only a marker at the start of a line", () => {
+  it("a worker that merely prints the text mid-line is not a cd failure", () => {
+    const r = parsePiOutput("I will explain: the message FLEET_ERROR: is what the guard prints", { exitCode: 0 } as never);
+    expect(r.ok).toBe(true);
+  });
+  it("a real marker line still fails", () => {
+    const r = parsePiOutput("FLEET_ERROR: cannot enter cwd /x as u (uid 1): 1", { exitCode: 66 } as never);
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/^FLEET_ERROR: cannot enter cwd/);
+  });
+});

@@ -907,6 +907,7 @@ export default definePluginEntry({
             startedAt: entry?.startedAt ?? new Date().toISOString(),
             updatedAt: new Date().toISOString(),
             state,
+            ...(typeof st.exitCode === "number" ? { exitCode: st.exitCode } : {}),
             ...(reconcileVerified !== null ? { verified: reconcileVerified } : {}),
             ...(st.verifyDetails != null ? { verifyDetails: st.verifyDetails } : {}),
             summary:
