@@ -183,14 +183,24 @@ async function runExpectCommand(cmd: string, cwd: string, timeoutMs: number): Pr
 }
 
 /**
- * Merge a verification outcome onto a run-result object. Returns the object
- * unchanged when no gate was evaluated (`verified: null`, no extra keys) so
- * existing consumers see no shape change at all.
+ * Merge a node-side verification outcome (e.g. the parsed run payload) onto a
+ * result object so EVERY gateway tool result carries the same `verified`
+ * shape (issue #62; review finding: the sync path omitted the key entirely
+ * while the detached path returned `verified: null`).
+ *
+ * `verified` is ALWAYS present on the returned object: null when no gate was
+ * evaluated (absent `expect`) or the outcome carries no boolean, boolean
+ * otherwise; `verifyDetails` rides alongside (null when unknown). Consumers
+ * can rely on `verified in result` without probing tool shapes.
  */
 export function withVerified<T extends Record<string, unknown>>(
   target: T,
-  outcome: ExpectOutcome | null,
-): T & { verified: boolean | null; verifyDetails?: VerifyDetails } {
-  if (!outcome) return { ...target, verified: null };
-  return { ...target, verified: outcome.verified, verifyDetails: outcome.verifyDetails };
+  outcome: { verified?: boolean; verifyDetails?: unknown } | null,
+): T & { verified: boolean | null; verifyDetails: unknown } {
+  const verified = typeof outcome?.verified === "boolean" ? outcome.verified : null;
+  return {
+    ...target,
+    verified,
+    verifyDetails: outcome?.verifyDetails ?? null,
+  };
 }

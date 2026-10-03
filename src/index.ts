@@ -316,7 +316,7 @@ export default definePluginEntry({
         }
         // Issue #62: validate the optional verification gate up front so a
         // malformed spec is a clear refusal, never a silently-dropped gate.
-        const { parseExpectSpec } = await import("./verify.js");
+        const { parseExpectSpec, withVerified } = await import("./verify.js");
         const expectSpec = parseExpectSpec(p.expect);
         if (!expectSpec.ok) {
           return jsonResult({ ok: false, error: `invalid expect: ${expectSpec.error}` });
@@ -644,20 +644,33 @@ export default definePluginEntry({
               ? (JSON.parse(payload) as { ok?: boolean; summary?: string; sessionId?: string; handRaised?: boolean; question?: string; verified?: boolean; verifyDetails?: unknown })
               : ((payload as { ok?: boolean; summary?: string; sessionId?: string; handRaised?: boolean; question?: string; verified?: boolean; verifyDetails?: unknown } | undefined) ?? {});
           // Same run, new state (see outcomeEntry): keeps startedAt/engine/pid and a
-          // silent-death failure recorded above.
+          // silent-death failure recorded above. outcomeEntry consults
+          // parsed.verified too: a FAILED gate must not be laundered into a
+          // ledger state "completed" — verifyDetails ride along in the ledger
+          // so the failure survives node state cleanup (issue #40 review).
           await upsertRun(rootDir, outcomeEntry(ledgerEntry, { timedOut, reconciledDead, parsed: parsedResult }));
 
-          results[node.displayName ?? node.nodeId] = {
-            runId,
-            result: dispatchResult,
-            treeState,
-            // Issue #62: hoist the verify-gate outcome so a synchronous
-            // dispatch result is not read as success while unverified.
-            ...(typeof parsedResult.verified === "boolean"
-              ? { verified: parsedResult.verified, verifyDetails: parsedResult.verifyDetails ?? null }
-              : {}),
-            ...(timedOut ? { dispatchTimedOut: true, mayStillBeRunning: true } : {}),
-          };
+          // Issue #62: hoist the verify-gate outcome so a synchronous
+          // dispatch result is not read as success while unverified.
+          // Issue #40 review (finding: shape divergence): withVerified pins the
+          // SAME shape for every outcome — absent expect => verified:null +
+          // verifyDetails:null, identical to the detached / fleet_run_status
+          // shape; no key omission on the no-gate path.
+          results[node.displayName ?? node.nodeId] = withVerified(
+            {
+              runId,
+              result: dispatchResult,
+              treeState,
+              ...(typeof parsedResult.verified === "boolean" && parsedResult.verified === false
+                ? {
+                    verifiedNote:
+                      "VERIFICATION GATE FAILED (issue #62): the worker exited but did not satisfy `expect` (see verifyDetails). Treat this run as unverified — do not report it as successful work.",
+                  }
+                : {}),
+              ...(timedOut ? { dispatchTimedOut: true, mayStillBeRunning: true } : {}),
+            },
+            parsedResult,
+          );
         }
         return jsonResult(results);
       },
@@ -815,7 +828,21 @@ export default definePluginEntry({
         if (entry && (finished || entry.state === "running") && (st.finishedAt || !alive)) {
           // Worker process gone without a completion marker = silent death
           // (the exact issue #6 signature). Record it explicitly.
-          const state = st.finishedAt ? (st.exitCode === 0 ? "completed" : "failed") : "failed";
+          // Issue #62 review (finding: ledger laundering): the gate outcome
+          // rides with the run record — a clean exit whose gate FAILED must
+          // reconcile to "failed-verification", never "completed". Process-
+          // level failures keep "failed" (the gate only reclassifies the
+          // would-be-completed branch); verified/verifyDetails are persisted
+          // so the failure survives node state cleanup.
+          const reconcileVerified = typeof st.verified === "boolean" ? st.verified : null;
+          const state =
+            !st.finishedAt
+              ? "failed"
+              : st.exitCode === 0 && reconcileVerified === false
+                ? "failed-verification"
+                : st.exitCode === 0
+                  ? "completed"
+                  : "failed";
           await upsertRun(rootDir, {
             ...(entry ?? { runId: p.runId, node: p.node, cwd: "", prompt: "", startedAt: new Date().toISOString() }),
             runId: p.runId,
@@ -825,7 +852,14 @@ export default definePluginEntry({
             startedAt: entry?.startedAt ?? new Date().toISOString(),
             updatedAt: new Date().toISOString(),
             state,
-            summary: state === "failed" && !st.finishedAt ? "worker process died without completion record (silent death)" : undefined,
+            ...(reconcileVerified !== null ? { verified: reconcileVerified } : {}),
+            ...(st.verifyDetails != null ? { verifyDetails: st.verifyDetails } : {}),
+            summary:
+              state === "failed" && !st.finishedAt
+                ? "worker process died without completion record (silent death)"
+                : state === "failed-verification"
+                  ? "verification gate failed (issue #62): the worker exited but did not satisfy `expect` (see verifyDetails)"
+                  : undefined,
           });
         }
 
@@ -948,6 +982,15 @@ export default definePluginEntry({
             type: "boolean",
             description: "Escalate (stop + report) when consecutive iterations produce identical output (no progress). Default true.",
           },
+          expect: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              files: { type: "array", items: { type: "string" }, description: "Artifact paths that must exist after each iteration (relative to the run cwd; absolute allowed)." },
+              command: { type: "string", description: "Verification command run via `bash -lc` in the run cwd after the worker exits; must exit 0. Bounded to 120s." },
+            },
+            description: "Optional post-run verification gate (issue #62), identical to fleet_dispatch.expect: after each iteration the node records verified/verifyDetails on the result. An iteration with verified:false is NOT success — the loop keeps iterating (or escalates) instead of stopping there.",
+          },
         },
         required: ["node", "cwd", "prompt"],
       },
@@ -962,16 +1005,28 @@ export default definePluginEntry({
           timeoutMs?: number;
           successMarker?: string;
           noProgressEscalate?: boolean;
+          expect?: { files?: string[]; command?: string };
         };
         const list = await api.runtime.nodes.list();
         const node = (list.nodes ?? []).find((n) => n.displayName === p.node || n.nodeId === p.node);
         if (!node) return jsonResult(`Node "${p.node}" not found.`);
 
+        // Issue #62 review (coverage gap): fleet_iterate accepts the same
+        // optional verification gate as fleet_dispatch, validated up front and
+        // threaded to the node on EVERY iteration.
+        const { parseExpectSpec, withVerified } = await import("./verify.js");
+        const expectSpec = parseExpectSpec(p.expect);
+        if (!expectSpec.ok) {
+          return jsonResult({ ok: false, error: `invalid expect: ${expectSpec.error}` });
+        }
+
         const maxIter = p.maxIterations ?? 5;
         const escalateOnNoProgress = p.noProgressEscalate ?? true;
-        const iterations: Array<{ iter: number; summary?: string; handRaised?: boolean; question?: string; error?: string; progress?: boolean }> = [];
+        const iterations: Array<{ iter: number; summary?: string; handRaised?: boolean; question?: string; error?: string; verified?: boolean | null; progress?: boolean }> = [];
         let currentPrompt = p.prompt;
         let prevFingerprint = "";
+        // Last iteration's parsed outcome, in scope after the loop exits.
+        let lastOutcome: { verified?: boolean; verifyDetails?: unknown } | null = null;
 
         for (let i = 1; i <= maxIter; i++) {
           const inv = await api.runtime.nodes.invoke({
@@ -983,6 +1038,7 @@ export default definePluginEntry({
               transport: p.transport ?? "http",
               model: p.model,
               timeoutMs: p.timeoutMs ?? 300_000,
+              expect: expectSpec.expect,
             },
             timeoutMs: p.timeoutMs ?? 300_000,
             signal,
@@ -990,8 +1046,10 @@ export default definePluginEntry({
           const payload = (inv as { payload?: unknown }).payload;
           const parsed =
             typeof payload === "string"
-              ? (JSON.parse(payload) as { ok?: boolean; summary?: string; handRaised?: boolean; question?: string; error?: string })
-              : ((payload as { ok?: boolean; summary?: string; handRaised?: boolean; question?: string; error?: string } | undefined) ?? {});
+              ? (JSON.parse(payload) as { ok?: boolean; summary?: string; handRaised?: boolean; question?: string; error?: string; verified?: boolean; verifyDetails?: unknown })
+              : ((payload as { ok?: boolean; summary?: string; handRaised?: boolean; question?: string; error?: string; verified?: boolean; verifyDetails?: unknown } | undefined) ?? {});
+          const verified = typeof parsed.verified === "boolean" ? parsed.verified : null;
+          lastOutcome = parsed;
 
           // Fingerprint the output to detect progress (or lack thereof).
           const fingerprint = (parsed.summary ?? "").slice(0, 500) + "|" + (parsed.error ?? "").slice(0, 500);
@@ -1004,6 +1062,7 @@ export default definePluginEntry({
             handRaised: parsed.handRaised,
             question: parsed.question,
             error: parsed.error,
+            verified,
             progress,
           });
 
@@ -1015,12 +1074,16 @@ export default definePluginEntry({
           // Success check.
           // Issue #35: trust the exit-status-derived `ok`; only fall back to the
           // output regex for a node that predates it (ok undefined).
+          // Issue #62 review (coverage gap): a FAILED verification gate is NOT
+          // success even when ok is true — verified === false must never be
+          // reported as done/success.
           const looksFailed = parsed.ok === undefined
             ? /error|failed|timed out|stuck/i.test(parsed.summary ?? "")
             : parsed.ok === false;
-          const success = p.successMarker ? (parsed.summary ?? "").includes(p.successMarker) : !looksFailed;
+          const success =
+            (p.successMarker ? (parsed.summary ?? "").includes(p.successMarker) : !looksFailed) && verified !== false;
           if (success) {
-            return jsonResult({ iterations, done: true, success: true, finalSummary: parsed.summary });
+            return jsonResult(withVerified({ iterations, done: true, success: true, finalSummary: parsed.summary }, parsed));
           }
 
           // NO-PROGRESS escalation: same output as last iteration → stop, don't burn tokens.
@@ -1043,12 +1106,17 @@ export default definePluginEntry({
             `Iteration ${i} did not succeed. The worker reported:`,
             parsed.summary ? quoteUntrusted("output", parsed.summary) : "",
             parsed.error ? quoteUntrusted("error", parsed.error) : "",
+            ...(verified === false
+              ? ["The post-run verification gate FAILED: the run must actually produce the artifacts/commands in `expect` — do not claim completion without them."]
+              : []),
             "",
             "Fix the issues above and try again. Do not repeat the same approach.",
           ].join("\n");
         }
 
-        return jsonResult({ iterations, done: true, success: false, note: `exceeded ${maxIter} iterations` });
+        return jsonResult(
+          withVerified({ iterations, done: true, success: false, note: `exceeded ${maxIter} iterations` }, lastOutcome),
+        );
       },
     });
 
@@ -1068,6 +1136,15 @@ export default definePluginEntry({
           transport: { type: "string", enum: ["http", "acp"], description: "Transport." },
           timeoutMs: { type: "number", description: "Per-run timeout, ms." },
           pollMs: { type: "number", description: "Activity poll interval, ms (default 15000)." },
+          expect: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              files: { type: "array", items: { type: "string" }, description: "Artifact paths that must exist after the run (relative to the run cwd; absolute allowed)." },
+              command: { type: "string", description: "Verification command run via `bash -lc` in the run cwd after the worker exits; must exit 0. Bounded to 120s." },
+            },
+            description: "Optional post-run verification gate (issue #62), identical to fleet_dispatch.expect: after the worker exits the node records verified/verifyDetails on the result. A FAILED gate means the watched run must not be reported as successful work.",
+          },
         },
         required: ["node", "cwd", "prompt"],
       },
@@ -1080,10 +1157,20 @@ export default definePluginEntry({
           transport?: "http" | "acp";
           timeoutMs?: number;
           pollMs?: number;
+          expect?: { files?: string[]; command?: string };
         };
         const list = await api.runtime.nodes.list();
         const node = (list.nodes ?? []).find((n) => n.displayName === p.node || n.nodeId === p.node);
         if (!node) return jsonResult(`Node "${p.node}" not found.`);
+
+        // Issue #62 review (coverage gap): fleet_watch accepts the same
+        // optional verification gate as fleet_dispatch — validated up front
+        // and threaded to the node on every watch.
+        const { parseExpectSpec, withVerified } = await import("./verify.js");
+        const expectSpec = parseExpectSpec(p.expect);
+        if (!expectSpec.ok) {
+          return jsonResult({ ok: false, error: `invalid expect: ${expectSpec.error}` });
+        }
 
         const timeoutMs = p.timeoutMs ?? 300_000;
         const pollMs = p.pollMs ?? 15_000;
@@ -1100,6 +1187,7 @@ export default definePluginEntry({
             transport: p.transport ?? "http",
             model: p.model,
             timeoutMs,
+            expect: expectSpec.expect,
           },
           timeoutMs,
           signal,
@@ -1150,24 +1238,40 @@ export default definePluginEntry({
         const payload = (result as { payload?: unknown }).payload;
         const parsed =
           typeof payload === "string"
-            ? (JSON.parse(payload) as { ok?: boolean; summary?: string; handRaised?: boolean; question?: string; error?: string })
-            : ((payload as { ok?: boolean; summary?: string; handRaised?: boolean; question?: string; error?: string } | undefined) ?? {});
+            ? (JSON.parse(payload) as { ok?: boolean; summary?: string; handRaised?: boolean; question?: string; error?: string; verified?: boolean; verifyDetails?: unknown })
+            : ((payload as { ok?: boolean; summary?: string; handRaised?: boolean; question?: string; error?: string; verified?: boolean; verifyDetails?: unknown } | undefined) ?? {});
+        const watchedVerified = typeof parsed.verified === "boolean" ? parsed.verified : null;
 
         onUpdate?.({
-          content: [{ type: "text", text: `Task complete: ${parsed.summary ?? "(no summary)"}` }],
+          content: [{ type: "text", text: `Task complete: ${parsed.summary ?? "(no summary)"}${watchedVerified === false ? " — VERIFICATION GATE FAILED (issue #62)" : ""}` }],
           details: { progress: "complete" },
           progress: { text: "Task complete", visibility: "channel", privacy: "public" },
         });
 
-        return jsonResult({
-          done: true,
-          ok: parsed.ok,
-          summary: parsed.summary,
-          handRaised: parsed.handRaised,
-          question: parsed.question,
-          error: parsed.error,
-          elapsedMs: Date.now() - startedAt,
-        });
+        // Issue #62 review: surface the gate outcome with the SAME shape as
+        // fleet_run_status / the sync dispatch path (verified always present,
+        // verifyDetails alongside) so a watched run's gate failure is visible
+        // and must not be reported as successful work.
+        return jsonResult(
+          withVerified(
+            {
+              done: true,
+              ok: parsed.ok,
+              summary: parsed.summary,
+              handRaised: parsed.handRaised,
+              question: parsed.question,
+              error: parsed.error,
+              elapsedMs: Date.now() - startedAt,
+              ...(watchedVerified === false
+                ? {
+                    verifiedNote:
+                      "VERIFICATION GATE FAILED (issue #62): the worker exited but did not satisfy `expect` (see verifyDetails). Treat this run as unverified — do not report it as successful work.",
+                  }
+                : {}),
+            },
+            parsed,
+          ),
+        );
       },
     });
 
