@@ -1601,10 +1601,11 @@ export default definePluginEntry({
             description: "Node display names or ids. Omit for all fleet nodes.",
           },
           cwd: { type: "string", description: "Optional checkout dir to GC on each node." },
+          pruneOlderThanDays: { type: "number", description: "Also delete finished runs' scripts/logs/state/done files and stale transfer staging older than this many days from the node's private state dir (default 7; 0 skips). A run whose script is still alive is never touched. Needs a node on protocol 3+." },
         },
       },
       execute: async (toolCallId, params, signal) => {
-        const p = params as { nodes?: string[]; cwd?: string };
+        const p = params as { nodes?: string[]; cwd?: string; pruneOlderThanDays?: number };
         const { cleanupNode } = await import("./provision.js");
         const list = await api.runtime.nodes.list();
         const nodes = list.nodes ?? [];
@@ -1619,6 +1620,23 @@ export default definePluginEntry({
         for (const node of targets) {
           const host = node.remoteIp ?? node.displayName ?? node.nodeId;
           const entry: Record<string, unknown> = await cleanupNode(host, p.cwd);
+          // Issue #63: prune finished runs from the node's private state dir.
+          const pruneDays = p.pruneOlderThanDays ?? 7;
+          if (pruneDays > 0) {
+            try {
+              const pr = await api.runtime.nodes.invoke({
+                nodeId: node.nodeId,
+                command: "opencode.run",
+                params: { prompt: "__PRUNE__", cwd: "/", transport: "http", op: "state.prune", olderThanDays: pruneDays },
+                timeoutMs: 30000,
+                signal,
+              });
+              const pp = (pr as { payload?: unknown }).payload;
+              entry.prune = typeof pp === "string" ? JSON.parse(pp) : pp;
+            } catch (e) {
+              entry.prune = { ok: false, error: (e as Error).message };
+            }
+          }
           // Report (not delete) uncommitted worker changes (issue #4).
           if (p.cwd) {
             try {

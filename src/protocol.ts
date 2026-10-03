@@ -12,9 +12,20 @@
  *   protocol 1  `op` + `protocol` on requests; `protocol` echoed on every response
  *   protocol 2  adds the post-run verification gate (`expect`); a node below 2 would
  *               silently ignore it and report an apparently gated run as ungated
+ *   protocol 3  adds the `state.prune` op; an older node would take its sentinel for
+ *               an ordinary task prompt, so the gateway must not send it below 3
  */
 
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
+
+/** Ops that only a node of at least this protocol understands (absent = any node). */
+export const OP_MIN_PROTOCOL: Readonly<Record<string, number>> = { "state.prune": 3 };
+
+/** Minimum node protocol an op itself needs, with a label for refusal messages. */
+export function requiredProtocolForOp(op: string): { version: number; feature?: string } {
+  const version = OP_MIN_PROTOCOL[op] ?? 0;
+  return version > 0 ? { version, feature: `op ${op}` } : { version: 0 };
+}
 
 /** Minimum node protocol a request feature needs; a node below it would silently ignore the field. */
 export const FEATURE_MIN_PROTOCOL = { harness: 1, expect: 2 } as const;
@@ -52,6 +63,7 @@ export const SENTINEL_OPS = {
   __RUN_START__: "run.start",
   __RUN_STATUS__: "run.status",
   __RUN_RESULT__: "run.result",
+  __PRUNE__: "state.prune",
 } as const;
 
 export type SentinelPrompt = keyof typeof SENTINEL_OPS;

@@ -22,7 +22,7 @@ The **manager** (Main/Metis) holds GitHub credentials and model routing. **Worke
 - **`fleet_provision`** — provision a repo to workers **without giving them GitHub credentials** (git bundle transport)
 - **`fleet_provision_config`** — ship OpenCode agent definitions, global rules (AGENTS.md), skills, and opencode.json to workers
 - **`fleet_sync`** — pull worker changes back and push to GitHub with manager credentials
-- **`fleet_cleanup`** — keep nodes tidy: remove stale bundles, git gc, report disk usage
+- **`fleet_cleanup`** — keep nodes tidy: git gc, report disk usage, and prune finished runs' scripts/logs/state (older than `pruneOlderThanDays`, default 7; live runs are never touched; needs a protocol-3 node)
 
 ### Model selection & learning
 - **`fleet_models`** — query the Aperture model catalog (pricing/context) so the agent picks the right model per task

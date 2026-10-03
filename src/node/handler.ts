@@ -22,7 +22,7 @@ import { evaluateExpect, parseExpectSpec } from "../verify.js";
 import { B64_MARKER, MAX_TRANSFER_B64, parseBundleOutput, parseStatusOutput, statusCommand } from "../outputs.js";
 import { acceptChunk, assembleChunks, isCanonicalBase64 } from "../xfer.js";
 import { guardCwd, taskUsesCwd, validateTaskIds } from "../guard.js";
-import { runPaths, xferPaths, writePrivate } from "../paths.js";
+import { ensureStateDir, runPaths, xferPaths, writePrivate } from "../paths.js";
 import { resolveOp, stampProtocol, type Op } from "../protocol.js";
 import {
   OPCODE_PS_COMMAND,
@@ -37,6 +37,7 @@ import {
   runShellDetailed,
   runStatePath,
   listProcessTable,
+  pruneStateDir,
   parseProcessTable,
   runScriptRows,
   selfStateLines,
@@ -88,6 +89,27 @@ OPS["abort"] = async ({ task, io, context }: OpCtx) => {
         sessionId: task.sessionId,
         error: "abort requires a runId; refusing to kill workers by name pattern (use fleet_abort with runId, or a sessionId that fleet_dispatch recorded)",
       });
+};
+
+OPS["state.prune"] = async ({ task }: OpCtx) => {
+  // Issue #63: drop finished runs' files and stale transfer staging from the
+  // private state dir. Never touches a run whose script is still in the process
+  // table, and (if `ps` fails) refuses rather than guessing.
+  const days = (task as { olderThanDays?: unknown }).olderThanDays;
+  const d = typeof days === "number" && Number.isFinite(days) ? days : 7;
+  if (d < 1 || d > 3650) return JSON.stringify({ ok: false, error: "olderThanDays must be between 1 and 3650" });
+  let alive = new Set<string>();
+  try {
+    const rows = parseProcessTable(await listProcessTable());
+    for (const r of rows) {
+      const m = r.args.match(/(?:^|\/)bash(?:\s+-\S+)*\s+\S*\/run-([A-Za-z0-9_-]{1,64})\.sh\s*$/);
+      if (m) alive.add(m[1]);
+    }
+  } catch (e) {
+    return JSON.stringify({ ok: false, error: `cannot list processes, not pruning: ${(e as Error).message}` });
+  }
+  const res = await pruneStateDir(ensureStateDir(), d * 86_400_000, alive);
+  return JSON.stringify({ ok: true, olderThanDays: d, ...res });
 };
 
 OPS["diff"] = async ({ task, io, context }: OpCtx) => {
