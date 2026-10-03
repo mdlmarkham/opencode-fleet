@@ -97,6 +97,7 @@ The plugin bundles a **skill** (`skills/opencode-fleet/SKILL.md`) that teaches a
 | `apertureUrl` | `https://ai.tailf9480.ts.net/v1/models` | Aperture model catalog URL |
 | `allowAutoApprove` | `true` | Whether `fleet_dispatch` may pass `autoApprove` (`opencode run --auto`, auto-approves every non-denied permission). Set `false` to forbid it fleet-wide. |
 | `allowSetupCommands` | `false` | Whether `fleet_provision`'s `setup` may be an arbitrary shell command. By default it must be a repo-relative script path with plain arguments (e.g. `scripts/setup.sh`). |
+| `ssh` | `{strictHostKeyChecking: "accept-new"}` | SSH client policy; set `"yes"` once host keys are pinned. See "SSH access". |
 | `sync` | see below | `fleet_sync` publish policy: `protectedBranches` (default `["main","master"]`), `allowDirectPush` (default `[]`), `allowSensitivePaths` (default `false`), `sensitivePaths` (extra path globs, e.g. `ci/**`, added to the built-in list). |
 | `nodes[].user` | _(unset)_ | SSH login user for a node (defaults to SSH config default, usually `root`) |
 | `nodes[].serviceUser` | _(unset)_ | Principal the node's OpenClaw service runs as, when it differs from the login user. Install/verify target this principal's plugin root. |
@@ -118,6 +119,19 @@ Worker work is pushed with the manager's credentials, so `fleet_sync` applies a 
 - **CI/CODEOWNERS paths** (`.github/workflows/**`, `.github/actions/**`, `CODEOWNERS`, `.gitlab-ci.yml`, `.circleci/**`, `Jenkinsfile`, …) in the worker's changes are refused unless `sync.allowSensitivePaths` is set; add your own with `sync.sensitivePaths`.
 - **Credential-shaped text** in added lines (tokens, keys, private keys, password assignments) is refused; nothing is pushed and the secret is never echoed.
 - Branch names that could be read as git options (leading `-`, `..`, …) are refused, and the repo argument is passed after `--`.
+
+## SSH access
+
+The manager reaches nodes with `ssh`/`scp` (provisioning, sync, deploy). Every call passes `--` before the host and validates the host string, so a node record cannot smuggle in an ssh option.
+
+- **Use an unprivileged login user** (`nodes[].user`), not root, with a narrow sudoers entry for the two things deploy needs. Example for login user `fleetmgr`, service user `svcuser`:
+  ```
+  fleetmgr ALL=(svcuser) NOPASSWD: ALL
+  fleetmgr ALL=(root) NOPASSWD: /usr/bin/systemctl restart openclaw-node.service, /usr/bin/systemctl is-active openclaw-node.service
+  ```
+  (`fleet_deploy` warns when it manages a node as root. `sudo -u svcuser` is only needed for deploy/install-record work; day-to-day sync needs no sudo.)
+- **Host keys:** the default `ssh.strictHostKeyChecking: "accept-new"` trusts a key on first contact and refuses changes. For production fleets pin keys when you provision nodes (`ssh-keyscan` into the manager's `known_hosts`) and set `"yes"`.
+- **Deploy** stages the tarball in a private `mktemp -d` directory on the node and verifies its sha256 before `openclaw plugins install`.
 
 ## Development
 

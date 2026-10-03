@@ -18,7 +18,7 @@ import { promisify } from "node:util";
 import { readdir, readFile, mkdir, stat } from "node:fs/promises";
 import { statSync } from "node:fs";
 import { join, basename } from "node:path";
-import { SSH_ARGS } from "./ssh.js";
+import { SSH_ARGS, scpPrefix, scpRemote, sshPrefix } from "./ssh.js";
 
 const execFileP = promisify(execFile);
 
@@ -54,7 +54,7 @@ export async function provisionConfigToNode(
     // Ensure remote config dirs exist.
     await execFileP(
       "ssh",
-      [...SSH_ARGS, nodeHost, `mkdir -p ~/.config/opencode/agents ~/.claude/skills`],
+      [...sshPrefix(nodeHost, SSH_ARGS), `mkdir -p ~/.config/opencode/agents ~/.claude/skills`],
       { timeout: 30_000 },
     );
 
@@ -66,7 +66,7 @@ export async function provisionConfigToNode(
       for (const f of mdFiles) {
         const local = join(req.agentsDir, f);
         const remote = `~/.config/opencode/agents/${f}`;
-        await execFileP("scp", [...SSH_ARGS, local, `${nodeHost}:${remote}`], {
+        await execFileP("scp", [...scpPrefix(), local, scpRemote(nodeHost, remote)], {
           timeout: 30_000,
         });
         result.agents.push(f);
@@ -77,7 +77,7 @@ export async function provisionConfigToNode(
     if (req.globalRulesFile) {
       await execFileP(
         "scp",
-        [...SSH_ARGS, req.globalRulesFile, `${nodeHost}:~/.config/opencode/AGENTS.md`],
+        [...scpPrefix(), req.globalRulesFile, scpRemote(nodeHost, "~/.config/opencode/AGENTS.md")],
         { timeout: 30_000 },
       );
       result.globalRules = true;
@@ -94,7 +94,7 @@ export async function provisionConfigToNode(
           // Ship the whole skill dir.
           await execFileP(
             "scp",
-            [...SSH_ARGS, "-r", local, `${nodeHost}:~/.claude/skills/`],
+            [...SSH_ARGS, "-r", "--", local, scpRemote(nodeHost, "~/.claude/skills/")],
             { timeout: 60_000 },
           );
           result.skills.push(skill);
@@ -106,7 +106,7 @@ export async function provisionConfigToNode(
     if (req.opencodeConfigFile) {
       await execFileP(
         "scp",
-        [...SSH_ARGS, req.opencodeConfigFile, `${nodeHost}:~/.config/opencode/opencode.json`],
+        [...scpPrefix(), req.opencodeConfigFile, scpRemote(nodeHost, "~/.config/opencode/opencode.json")],
         { timeout: 30_000 },
       );
       result.opencodeConfig = true;

@@ -13,9 +13,10 @@
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { SSH_ARGS } from "./ssh.js";
+import { SSH_ARGS, scpPrefix, scpRemote, sshPrefix } from "./ssh.js";
 import {
   inspectRemoteInstallRecord,
   repairRemoteInstallRecord,
@@ -124,6 +125,13 @@ export async function deployPlugin(req: DeployRequest): Promise<DeployResult> {
       const serviceUser = req.nodeUsers?.[host];
       const loginUser = req.nodeLoginUsers?.[host];
       const sshHost = loginUser ? `${loginUser}@${host}` : host;
+      if (!loginUser || loginUser === "root") {
+        add(
+          `ssh-user-${host}`,
+          true,
+          "WARNING: managing this node over SSH as root. Prefer an unprivileged login user (nodes[].user) with a narrow sudoers entry; see README 'SSH access'.",
+        );
+      }
       const tarballName = tarball.split("/").pop() ?? "";
       try {
         // Issue #20: defuse the stale-root-install-record footgun BEFORE
@@ -140,7 +148,7 @@ export async function deployPlugin(req: DeployRequest): Promise<DeployResult> {
           try {
             const { stdout: homeOut } = await execFileP(
               "ssh",
-              [...SSH_ARGS, sshHost, `sudo -n -u ${shq(serviceUser)} -H bash -c 'printf %s "$HOME"'`],
+              [...sshPrefix(sshHost, SSH_ARGS), `sudo -n -u ${shq(serviceUser)} -H bash -c 'printf %s "$HOME"'`],
               { timeout: 30_000 },
             );
             serviceHome = homeOut.trim().split("\n").map((l) => l.trim()).filter(Boolean).pop() ?? "";
@@ -184,9 +192,31 @@ export async function deployPlugin(req: DeployRequest): Promise<DeployResult> {
           );
         }
 
-        await execFileP("scp", [...SSH_ARGS, tarball, `${sshHost}:/tmp/`], {
+        // Stage the tarball in a fresh directory only we can write (mktemp -d is
+        // 0700; 711 lets the service user traverse to the 0644 file but nobody
+        // else can replace it between the checksum and the install), then verify
+        // its sha256 on the node BEFORE installing anything.
+        const tarballSha = createHash("sha256").update(await readFile(tarball)).digest("hex");
+        const { stdout: stageOut } = await execFileP(
+          "ssh",
+          [...sshPrefix(sshHost, SSH_ARGS), `d=$(mktemp -d /tmp/fleet-deploy.XXXXXX) && chmod 711 "$d" && echo "FLEET_STAGE=$d"`],
+          { timeout: 30_000 },
+        );
+        const stage = stageOut.match(/FLEET_STAGE=(\/tmp\/fleet-deploy\.[A-Za-z0-9]+)\s*$/m)?.[1];
+        if (!stage) throw new Error(`could not create a private staging directory on the node: ${stageOut.trim().slice(0, 200)}`);
+        await execFileP("scp", [...scpPrefix(), tarball, scpRemote(sshHost, `${stage}/${tarballName}`)], {
           timeout: 120_000,
         });
+        const { stdout: remoteShaOut } = await execFileP(
+          "ssh",
+          [...sshPrefix(sshHost, SSH_ARGS), `chmod 644 -- ${shq(`${stage}/${tarballName}`)} && sha256sum -- ${shq(`${stage}/${tarballName}`)} | cut -d' ' -f1`],
+          { timeout: 30_000 },
+        );
+        const remoteSha = remoteShaOut.trim().split("\n").pop()?.trim() ?? "";
+        if (remoteSha !== tarballSha) {
+          await execFileP("ssh", [...sshPrefix(sshHost, SSH_ARGS), `rm -rf -- ${shq(stage)}`], { timeout: 30_000 }).catch(() => {});
+          throw new Error(`tarball checksum mismatch on the node (expected ${tarballSha.slice(0, 12)}, got ${remoteSha.slice(0, 12) || "none"}); refusing to install`);
+        }
 
         // Issue #18 defect 1: install as the SERVICE principal, not the SSH
         // login user. When the caller names one, install into that user's
@@ -196,7 +226,7 @@ export async function deployPlugin(req: DeployRequest): Promise<DeployResult> {
         // exit code must gate the step; we capture output and require an
         // explicit success sentinel.
         const installInner =
-          `cd /tmp && openclaw plugins install ${shq(tarballName)} --force --accept-capabilities 2>&1; ` +
+          `cd ${shq(stage)} && openclaw plugins install ${shq(tarballName)} --force --accept-capabilities 2>&1; ` +
           `rc=$?; echo "FLEET_INSTALL_RC=$rc"; exit $rc`;
         // Use a NON-login shell (`bash -c`): a login shell (`bash -lc`) sources
         // the user's profile and can print MOTD/banner text on stdout, which
@@ -204,11 +234,16 @@ export async function deployPlugin(req: DeployRequest): Promise<DeployResult> {
         const installCmd = serviceUser
           ? `sudo -n -u ${shq(serviceUser)} -H bash -c ${shq(installInner)}`
           : installInner;
-        const { stdout: installOut } = await execFileP(
-          "ssh",
-          [...SSH_ARGS, sshHost, installCmd],
-          { timeout: 120_000 },
-        );
+        let installOut: string;
+        try {
+          ({ stdout: installOut } = await execFileP(
+            "ssh",
+            [...sshPrefix(sshHost, SSH_ARGS), installCmd],
+            { timeout: 120_000 },
+          ));
+        } finally {
+          await execFileP("ssh", [...sshPrefix(sshHost, SSH_ARGS), `rm -rf -- ${shq(stage)}`], { timeout: 30_000 }).catch(() => {});
+        }
         const rcMatch = installOut.match(/FLEET_INSTALL_RC=(-?\d+)/);
         const irc = rcMatch ? parseInt(rcMatch[1], 10) : NaN;
         if (!Number.isFinite(irc) || irc !== 0) {
@@ -235,7 +270,7 @@ export async function deployPlugin(req: DeployRequest): Promise<DeployResult> {
           : verifyScript;
         const { stdout: verifyOut } = await execFileP(
           "ssh",
-          [...SSH_ARGS, sshHost, verifyCmd],
+          [...sshPrefix(sshHost, SSH_ARGS), verifyCmd],
           { timeout: 60_000 },
         );
         // Take the last non-empty line, not the first token of the whole
@@ -282,14 +317,14 @@ export async function deployPlugin(req: DeployRequest): Promise<DeployResult> {
           // (root) may need sudo. Do NOT use `systemctl --user` here — it
           // targets a unit that does not exist and silently does nothing.
           const restartCmd = `sudo -n systemctl restart openclaw-node.service`;
-          await execFileP("ssh", [...SSH_ARGS, sshHost, restartCmd], {
+          await execFileP("ssh", [...sshPrefix(sshHost, SSH_ARGS), restartCmd], {
             timeout: 60_000,
           });
           // Confirm the unit actually came back, rather than trusting the
           // restart command's exit code (it can succeed while the service
           // fails to start). Fail the step otherwise.
           const checkCmd = `systemctl is-active openclaw-node.service`;
-          const { stdout: stateOut } = await execFileP("ssh", [...SSH_ARGS, sshHost, checkCmd], {
+          const { stdout: stateOut } = await execFileP("ssh", [...sshPrefix(sshHost, SSH_ARGS), checkCmd], {
             timeout: 30_000,
           });
           const state = stateOut.trim().split("\n").pop() ?? "";
@@ -323,7 +358,7 @@ export async function deployPlugin(req: DeployRequest): Promise<DeployResult> {
         try {
           const { stdout } = await execFileP(
             "ssh",
-            [...SSH_ARGS, sshHost, `sudo -n -u ${shq(serviceUser ?? "root")} -H bash -c 'printf %s "$HOME"'`],
+            [...sshPrefix(sshHost, SSH_ARGS), `sudo -n -u ${shq(serviceUser ?? "root")} -H bash -c 'printf %s "$HOME"'`],
             { timeout: 30_000 },
           );
           const h = stdout.trim().split("\n").map((l) => l.trim()).filter(Boolean).pop() ?? "";

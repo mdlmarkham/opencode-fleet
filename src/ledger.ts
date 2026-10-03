@@ -15,7 +15,7 @@ import { readFile, writeFile, rename, mkdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { shq } from "./shell.js";
 import { interpretLiveness } from "./recovery.js";
-import { SSH_ARGS } from "./ssh.js";
+import { SSH_ARGS, sshPrefix } from "./ssh.js";
 
 export type RunState = "running" | "completed" | "failed" | "timed-out" | "discarded";
 
@@ -174,7 +174,7 @@ export async function probeRun(
       `echo "---UNCOMMITTED---"`,
       `cd ${shq(cwd)} 2>/dev/null && git status --porcelain 2>/dev/null | wc -l || echo "-1"`,
     ].join(";");
-    const { stdout } = await execFileP("ssh", [...SSH_ARGS, nodeHost, cmd], { timeout: 30_000 });
+    const { stdout } = await execFileP("ssh", [...sshPrefix(nodeHost, SSH_ARGS), cmd], { timeout: 30_000 });
     const [procPartRaw, uncommittedPart] = stdout.split("---UNCOMMITTED---\n");
     const procPart = procPartRaw ?? "";
     // Issue #30 finding I: engine-independent liveness (recorded pid OR any

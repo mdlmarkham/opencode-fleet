@@ -132,6 +132,22 @@
             "description": "Extra path globs treated as sensitive (e.g. ci/**), added to the built-in list."
           }
         }
+      },
+      "ssh": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "SSH client policy for manager-to-node commands.",
+        "properties": {
+          "strictHostKeyChecking": {
+            "type": "string",
+            "enum": [
+              "accept-new",
+              "yes"
+            ],
+            "default": "accept-new",
+            "description": "accept-new trusts a host key on first contact (TOFU) and refuses changes; yes requires the key to already be in known_hosts (pin keys when you provision nodes)."
+          }
+        }
       }
     }
   },

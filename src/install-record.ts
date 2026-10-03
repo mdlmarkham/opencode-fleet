@@ -1,3 +1,4 @@
+import { sshPrefix } from "./ssh.js";
 /**
  * Stale plugin-install-record repair (issue #20).
  *
@@ -272,7 +273,7 @@ export async function inspectRemoteInstallRecord(
   const cmd = `sudo -n -u ${shq(serviceUser)} -H bash -c ${shq(script)}`;
   let stdout = "";
   try {
-    const r = await execFileP("ssh", [...sshArgs, sshHost, cmd], { timeout: 60_000 });
+    const r = await execFileP("ssh", [...sshPrefix(sshHost, sshArgs), cmd], { timeout: 60_000 });
     stdout = r.stdout;
   } catch (e) {
     // Even on non-zero we may have JSON on stdout; try to use it.
@@ -321,7 +322,7 @@ export async function repairRemoteInstallRecord(
   const script = repairScript(serviceHome);
   const cmd = `sudo -n -u ${shq(serviceUser)} -H bash -c ${shq(script)}`;
   try {
-    const { stdout } = await execFileP("ssh", [...sshArgs, sshHost, cmd], { timeout: 60_000 });
+    const { stdout } = await execFileP("ssh", [...sshPrefix(sshHost, sshArgs), cmd], { timeout: 60_000 });
     const lastLine = stdout.trim().split("\n").map((l) => l.trim()).filter(Boolean).pop() ?? "";
     const parsed = JSON.parse(lastLine) as RepairResult;
     return parsed;

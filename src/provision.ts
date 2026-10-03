@@ -21,7 +21,7 @@ import { mkdtemp, rm, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { shq } from "./shell.js";
-import { SSH_ARGS } from "./ssh.js";
+import { SSH_ARGS, scpPrefix, scpRemote, sshPrefix } from "./ssh.js";
 import { checkSetup } from "./policy.js";
 import { evaluateChange, isSafeBranchName, resolveDestination, resolvePolicy, type SyncPolicy } from "./syncpolicy.js";
 
@@ -161,7 +161,7 @@ export async function cleanupNode(nodeHost: string, cwd?: string): Promise<{ ok:
     ]
       .filter(Boolean)
       .join(" && ");
-    const { stdout } = await execFileP("ssh", [...SSH_ARGS, nodeHost, cmds], {
+    const { stdout } = await execFileP("ssh", [...sshPrefix(nodeHost, SSH_ARGS), cmds], {
       timeout: 300_000,
     });
     return { ok: true, detail: stdout.trim() };
@@ -204,7 +204,7 @@ export async function provisionToNode(
         if (!channelInvoke) throw new Error("ssh unavailable and no channel invoke provided");
         throw new Error("use-channel"); // routed below via catch
       }
-      await execFileP("scp", [...SSH_ARGS, bundlePath, `${nodeHost}:${remoteBundle}`], {
+      await execFileP("scp", [...scpPrefix(), bundlePath, scpRemote(nodeHost, remoteBundle)], {
         timeout: 120_000,
       });
     } catch (sshErr) {
@@ -284,7 +284,7 @@ export async function provisionToNode(
       if (!pl.ok) throw new Error(pl.error ?? "channel unpack failed");
       unpackOut = String(pl.commit ?? "");
     } else {
-      const { stdout } = await execFileP("ssh", [...SSH_ARGS, nodeHost, unpackCmd], {
+      const { stdout } = await execFileP("ssh", [...sshPrefix(nodeHost, SSH_ARGS), unpackCmd], {
         timeout: 120_000,
       });
       unpackOut = stdout.trim();
@@ -315,7 +315,7 @@ export async function provisionToNode(
           const rc = rcMatch ? parseInt(rcMatch[1], 10) : (pl.ok === false ? 1 : 0);
           setupResult = { ran: true, command: req.setup, ok: rc === 0, output: out.slice(-2000) };
         } else {
-          const { stdout } = await execFileP("ssh", [...SSH_ARGS, nodeHost, setupCmd], {
+          const { stdout } = await execFileP("ssh", [...sshPrefix(nodeHost, SSH_ARGS), setupCmd], {
             timeout: 300_000,
           });
           out = stdout.trim();
@@ -347,7 +347,7 @@ export async function provisionToNode(
           30_000,
         );
       } else {
-        await execFileP("ssh", [...SSH_ARGS, nodeHost, `rm -f "${remoteBundle}"`], {
+        await execFileP("ssh", [...sshPrefix(nodeHost, SSH_ARGS), `rm -f "${remoteBundle}"`], {
           timeout: 30_000,
         });
       }
@@ -555,7 +555,7 @@ export async function syncFromNode(
     let uncommitted = 0;
     let dirtyErr: string | undefined;
     {
-      const { stdout } = await execFileP("ssh", [...SSH_ARGS, nodeHost, statusCmd], {
+      const { stdout } = await execFileP("ssh", [...sshPrefix(nodeHost, SSH_ARGS), statusCmd], {
         timeout: 30_000,
       });
       const m = stdout.match(/---FLEET_STATUS_RC=(-?\d+)/);
@@ -598,7 +598,7 @@ export async function syncFromNode(
         `git add -A`,
         `git -c user.email=fleet-worker@${nodeHost} -c user.name="fleet-worker (${nodeHost})" commit -m "fleet_sync: auto-commit worker working-tree changes before sync"`,
       ].join(" && ");
-      await execFileP("ssh", [...SSH_ARGS, nodeHost, commitCmd], {
+      await execFileP("ssh", [...sshPrefix(nodeHost, SSH_ARGS), commitCmd], {
         timeout: 60_000,
       });
     }
@@ -624,7 +624,7 @@ export async function syncFromNode(
     ].join("; ");
     const { stdout: aheadOut } = await execFileP(
       "ssh",
-      [...SSH_ARGS, nodeHost, resolveBaseCmd],
+      [...sshPrefix(nodeHost, SSH_ARGS), resolveBaseCmd],
       { timeout: 30_000 },
     );
     const baseMatch = aheadOut.match(/---FLEET_BASE=(\S+)/);
@@ -649,13 +649,13 @@ export async function syncFromNode(
     // Step 3: worker creates a bundle of its current state.
     const remoteBundle = `/tmp/fleet-sync-${Date.now()}.bundle`;
     const workerCmd = `cd ${shq(cwd)} && git bundle create ${shq(remoteBundle)} --all 2>/dev/null; echo "BUNDLE_READY"`;
-    await execFileP("ssh", [...SSH_ARGS, nodeHost, workerCmd], {
+    await execFileP("ssh", [...sshPrefix(nodeHost, SSH_ARGS), workerCmd], {
       timeout: 120_000,
     });
 
     // Step 4: pull the bundle back to the manager.
     const localBundle = join(work, "worker.bundle");
-    await execFileP("scp", [...SSH_ARGS, `${nodeHost}:${remoteBundle}`, localBundle], {
+    await execFileP("scp", [...scpPrefix(), scpRemote(nodeHost, remoteBundle), localBundle], {
       timeout: 120_000,
     });
 
@@ -671,7 +671,7 @@ export async function syncFromNode(
     // detached or unavailable.
     let workerBranch = branch;
     try {
-      const { stdout: curOut } = await execFileP("ssh", [...SSH_ARGS, nodeHost,
+      const { stdout: curOut } = await execFileP("ssh", [...sshPrefix(nodeHost, SSH_ARGS),
           `cd ${shq(cwd)} && git rev-parse --abbrev-ref HEAD 2>/dev/null || echo ""`], { timeout: 30_000 });
       const cur = curOut.trim();
       if (cur && cur !== "HEAD") workerBranch = cur;
@@ -687,7 +687,7 @@ export async function syncFromNode(
     }
     catch {
       // Clean up the remote bundle before failing closed.
-      await execFileP("ssh", [...SSH_ARGS, nodeHost, `rm -f ${shq(remoteBundle)}`], { timeout: 30_000 });
+      await execFileP("ssh", [...sshPrefix(nodeHost, SSH_ARGS), `rm -f ${shq(remoteBundle)}`], { timeout: 30_000 });
       return {
         ok: false,
         cwd,
@@ -706,7 +706,7 @@ export async function syncFromNode(
     {
       const applied = await applyPolicy(cloneDir, workerBranch, destBranch, bundleRef, branch);
       if ("refused" in applied) {
-        await execFileP("ssh", [...SSH_ARGS, nodeHost, `rm -f ${shq(remoteBundle)}`], { timeout: 30_000 }).catch(() => {});
+        await execFileP("ssh", [...sshPrefix(nodeHost, SSH_ARGS), `rm -f ${shq(remoteBundle)}`], { timeout: 30_000 }).catch(() => {});
         return applied.refused;
       }
       destBranch = applied.dest;
@@ -772,7 +772,7 @@ export async function syncFromNode(
     const hasNewWork = bundleTip.trim() !== baseTip.trim();
 
     // Clean up the remote bundle.
-    await execFileP("ssh", [...SSH_ARGS, nodeHost, `rm -f ${shq(remoteBundle)}`], {
+    await execFileP("ssh", [...sshPrefix(nodeHost, SSH_ARGS), `rm -f ${shq(remoteBundle)}`], {
       timeout: 30_000,
     });
 

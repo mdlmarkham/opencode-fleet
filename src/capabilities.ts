@@ -11,7 +11,7 @@ import { promisify } from "node:util";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { SSH_ARGS } from "./ssh.js";
+import { SSH_ARGS, sshPrefix } from "./ssh.js";
 
 const execFileP = promisify(execFile);
 
@@ -74,7 +74,7 @@ export async function detectNodeCapabilities(nodeHost: string, nodeName: string)
       `echo "PYPEP668=$(python3 -c 'import sysconfig,os; p=sysconfig.get_path("stdlib"); f=os.path.join(p,"EXTERNALLY-MANAGED"); print("yes" if os.path.exists(f) else "no")' 2>/dev/null || echo unknown)"`,
       `echo "PIPUSER=$(python3 -m pip --version >/dev/null 2>&1 && echo yes || echo no)"`,
     ].join(" && ");
-    const { stdout } = await execFileP("ssh", [...SSH_ARGS, nodeHost, cmd], {
+    const { stdout } = await execFileP("ssh", [...sshPrefix(nodeHost, SSH_ARGS), cmd], {
       timeout: 30_000,
     });
 
