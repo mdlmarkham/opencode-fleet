@@ -76,11 +76,9 @@ export function resolveDestination(
   const isProtected = policy.protectedBranches.includes(requested);
   if (!isProtected || policy.allowDirectPush.includes(requested)) return { branch: requested };
   // Issue #68: the seed is the WORKER's branch. When that already lives under
-  // `fleet/` we publish it AS-IS (just normalized) instead of re-prefixing,
-  // and we do NOT fall back to the `sync-<ts>` label when it normalizes to
-  // something usable — otherwise `fleet/verify-gate` became
-  // `fleet/fleet/verify-gate` and a missing worker branch silently got a
-  // random name. Only truly-empty seeds fall back to the label.
+  // `fleet/` we publish it AS-IS (just normalized) instead of re-prefixing
+  // (otherwise `fleet/verify-gate` became `fleet/fleet/verify-gate`). Only an
+  // empty/unusable seed falls back to the label.
   const seed = workerBranch && !policy.protectedBranches.includes(workerBranch) ? workerBranch : label;
   const safe = seed
     .replace(/[^A-Za-z0-9._/-]/g, "-")

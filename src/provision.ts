@@ -78,6 +78,46 @@ export interface ProvisionRequest {
   setup?: string;
   /** Operator opt-in: `setup` may be an arbitrary shell command (issue #34). */
   allowSetupCommands?: boolean;
+  /**
+   * The node's worker principal (issue #71). The checkout is handed to this
+   * user and provisioning FAILS if it cannot be. Defaults to the owner of the
+   * target's parent directory.
+   */
+  serviceUser?: string;
+}
+
+
+const USER_RE = /^[A-Za-z_][A-Za-z0-9_.-]{0,31}$/;
+
+/**
+ * Shell fragment (issue #71) that leaves `cwd` owned by the worker principal
+ * and FAILS (exit 68) otherwise, instead of reading as success while the worker
+ * cannot write. The SSH principal is often root, so the clone lands root-owned.
+ *
+ * Expected owner: `serviceUser`, else the owner of cwd's parent directory (a
+ * root-owned parent means there is nothing to compare, so no check). When run
+ * as root it chowns; when not root it only verifies. If the expected owner is
+ * the current user it also proves the directory is writable.
+ */
+export function ownershipCommand(cwd: string, serviceUser?: string): string {
+  if (serviceUser !== undefined && !USER_RE.test(serviceUser)) {
+    throw new Error(`invalid serviceUser: ${JSON.stringify(serviceUser)}`);
+  }
+  const owner = serviceUser
+    ? shq(serviceUser)
+    : `"$(stat -c %U "$(dirname ${shq(cwd)})" 2>/dev/null || stat -f %Su "$(dirname ${shq(cwd)})")"`;
+  const fail = (msg: string) => `{ echo "FLEET_ERROR: ${msg}" >&2; exit 68; }`;
+  return [
+    "(",
+    `__OWN=${owner};`,
+    `if [ "$__OWN" != root ]; then`,
+    `id -u "$__OWN" >/dev/null 2>&1 || ${fail("worker user $__OWN does not exist on this node")};`,
+    `if [ "$(id -u)" = 0 ]; then chown -R "$__OWN": ${shq(cwd)} || ${fail("could not hand the checkout to $__OWN")}; fi;`,
+    `[ "$(stat -c %U ${shq(cwd)} 2>/dev/null || stat -f %Su ${shq(cwd)})" = "$__OWN" ] || ${fail("checkout is not owned by the worker user $__OWN")};`,
+    `if [ "$(id -un)" = "$__OWN" ]; then touch ${shq(cwd)}/.fleet-write-test && rm -f ${shq(cwd)}/.fleet-write-test || ${fail("checkout is not writable by $__OWN")}; fi;`,
+    "fi",
+    ")",
+  ].join(" ");
 }
 
 export interface ProvisionResult {
@@ -268,13 +308,8 @@ export async function provisionToNode(
       `git clone -q ${shq(remoteBundle)} ${shq(req.cwd)}`,
       req.commit ? `cd ${shq(req.cwd)} && git checkout -q ${shq(req.commit)}` : "",
       `cd ${shq(req.cwd)} && git gc --prune=now 2>/dev/null`,
-      // Issue #71: the manager lands as the SSH principal (root by default),
-      // so the clone would be root-owned and the worker principal could not
-      // write it (mkdir/edit/branch all fail — a silent no-op). Hand the
-      // checkout to the node's service user. `id -u svcuser` is used when the
-      // user exists; otherwise fall back to the SSH principal's uid (so an
-      // already-correct owner is not broken).
-      `if id -u svcuser >/dev/null 2>&1; then chown -R svcuser:svcuser ${shq(req.cwd)}; fi`,
+      // Issue #71: hand the checkout to the worker principal and verify it.
+      ownershipCommand(req.cwd, req.serviceUser),
       // Issue #14: set safe.directory for the landing principal right after
       // the clone, before any later operation can trip over dubious ownership.
       safeDirCmd,

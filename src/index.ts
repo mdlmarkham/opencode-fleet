@@ -1439,6 +1439,8 @@ export default definePluginEntry({
               commit: p.commit,
               setup: p.setup,
               allowSetupCommands: cfg.allowSetupCommands === true,
+              serviceUser: (node as { member?: { serviceUser?: string; user?: string } }).member?.serviceUser
+                ?? (node as { member?: { user?: string } }).member?.user,
             },
             channelInvoke,
           );
