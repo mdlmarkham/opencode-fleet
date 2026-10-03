@@ -107,7 +107,6 @@ const CWD_FREE_OPS = new Set([
   "__SEND_CHUNK__",
   "__RUN_STATUS__",
   "__RUN_RESULT__",
-  "__RUN_ABORT__",
 ]);
 
 /** Whether the node will actually use `cwd` for this message (and so must confine it). */
@@ -116,7 +115,7 @@ export function taskUsesCwd(prompt: string): boolean {
 }
 
 /** Control messages that address a run and therefore require a valid runId. */
-const RUN_OPS = new Set(["__RUN_START__", "__RUN_STATUS__", "__RUN_RESULT__", "__RUN_ABORT__"]);
+const RUN_OPS = new Set(["__RUN_START__", "__RUN_STATUS__", "__RUN_RESULT__"]);
 
 /**
  * Validate runId/transferId; returns an error string or undefined. Absent

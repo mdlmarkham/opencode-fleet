@@ -2,7 +2,7 @@ import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { buildJsonPluginConfigSchema, jsonResult } from "openclaw/plugin-sdk/core";
 import { join } from "node:path";
 import { shq } from "./shell.js";
-import { buildOpenCodeCommand, parseOpenCodeOutput, parsePiOutput, type OpenCodeTask } from "./opencode.js";
+import { buildOpenCodeCommand, parseOpenCodeOutput, parsePiOutput, validateHarnessTransport, type OpenCodeTask } from "./opencode.js";
 import {
   probeAckRecovery,
   abortStateWrite,
@@ -399,31 +399,6 @@ export default definePluginEntry({
             harness === "pi" ? parsePiOutput(tail, { exitCode }) : parseOpenCodeOutput(tail, exitCode !== undefined ? { exitCode } : undefined);
           return JSON.stringify({ ok: true, runId, harness, result: parsed });
         }
-        if (task.prompt === "__RUN_ABORT__") {
-          const runId = String(task.runId ?? "");
-          try {
-            const raw = await (await import("node:fs/promises")).readFile(runStatePath(runId), "utf8");
-            const st = JSON.parse(raw) as Record<string, unknown> & { pid?: number };
-            let confirmed = false;
-            if (st.pid) {
-              const out = await runShell(
-                `kill -TERM -- -${st.pid} 2>/dev/null; sleep 1; ` +
-                  `if kill -0 -- -${st.pid} 2>/dev/null; then kill -9 -- -${st.pid} 2>/dev/null; sleep 1; fi; ` +
-                  `if kill -0 -- -${st.pid} 2>/dev/null; then echo ALIVE; else echo DEAD; fi`,
-                15_000,
-                context?.signal,
-              );
-              confirmed = out.includes("DEAD");
-            }
-            // Issue #30 finding H: mark aborted ONLY on confirmed termination;
-            // preserve existing state fields so later reads still parse.
-            const next = abortStateWrite(st, confirmed, new Date().toISOString());
-            if (next) await writePrivate(runStatePath(runId), JSON.stringify(next));
-            return JSON.stringify({ ok: confirmed, aborted: confirmed, pid: st.pid, confirmed });
-          } catch {
-            return JSON.stringify({ ok: false, error: "no run state" });
-          }
-        }
         if (task.prompt === "__SEND_CHUNK__") {
           // Manager pulls staged base64 back in ~64KB pieces.
           const transferId = String(task.transferId ?? "t");
@@ -479,12 +454,9 @@ export default definePluginEntry({
         // Issue #30 finding G: harness=pi + transport=acp silently routed to the
         // opencode ACP client, ignoring Pi and piModel. Pi has no ACP transport;
         // reject the combination explicitly rather than run something else.
-        if (task.transport === "acp" && task.harness === "pi") {
-          return JSON.stringify({
-            ok: false,
-            harness: "pi",
-            error: "harness=pi requires transport=http (opencode acp has no Pi transport; Pi would be silently ignored)",
-          });
+        const harnessCheck = validateHarnessTransport(task);
+        if (!harnessCheck.ok) {
+          return JSON.stringify({ ok: false, harness: harnessCheck.harness, error: harnessCheck.error });
         }
         if (task.transport === "acp") {
           const { runAcpPrompt } = await import("./acp-client.js");
@@ -658,6 +630,10 @@ export default definePluginEntry({
         }
 
         const transport = p.transport ?? cfg.defaultTransport ?? "http";
+        // Issue #48: refuse an unsupported engine/transport pair before any node
+        // is invoked (the node handler re-checks with the same helper).
+        const harnessCheck = validateHarnessTransport({ harness: p.harness, transport });
+        if (!harnessCheck.ok) return jsonResult({ ok: false, harness: harnessCheck.harness, error: harnessCheck.error });
         // Issue #34: refuse (never silently drop) env names that execute code or
         // redirect config, and honor the operator's autoApprove ceiling.
         const envPartition = partitionEnv(p.env);
