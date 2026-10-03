@@ -11,14 +11,20 @@
  * DECISION LOGIC ONLY:
  *   - no network here: the S1 client is injected as `decideFn` (same
  *     signature as decision.ts `decide`) so tests stub it with no server;
- *   - no wiring: nothing is hooked into tool dispatch or schemas yet —
- *     slice 3 decides that.
+ *   - no wiring here: the dispatch integration lives in s1-wire.ts
+ *     (issue #87, slice 3) — opt-in `route` / `autoTriage` on fleet_dispatch.
+ *
+ * HARDENING (slice 3): every hook asks S1 through `askS1`, which treats a
+ * decideFn that THROWS (or is not a function at all) exactly like a
+ * structured { ok: false } — the hook's safe fallback applies and the error
+ * names why, instead of a rejection propagating into the manager.
  *
  * Calibration rule (from live S1 testing): every hook asks a SPECIFIC typed
  * question with the concrete artifact in `state`, and `instructions` is a
  * genuine question over those specifics — never a vague "is this safe?".
  *
- * Safe fallbacks on unavailable/malformed decisions (never assume success):
+ * Safe fallbacks on unavailable/malformed decisions (never assume success) —
+ * including a decideFn that throws:
  *   - adjudicateCompletion -> satisfied: null
  *   - triageHandRaise      -> action: "escalate"
  *   - routeEngine          -> engine: null
@@ -111,7 +117,7 @@ export async function adjudicateCompletion(
     .filter((part): part is string => part !== undefined)
     .join("; ");
 
-  const decision = await decideFn({
+  const decision = await askS1(decideFn, {
     // Concrete artifact travels in state (calibration rule).
     state: { acceptance, diffSummary, verifyDetails },
     questions: {
@@ -172,7 +178,7 @@ export async function triageHandRaise(input: TriageInput, decideFn: DecideFn): P
     };
   }
 
-  const decision = await decideFn({
+  const decision = await askS1(decideFn, {
     state: { question, context },
     questions: {
       [Q_HAND_RAISE]: {
@@ -237,7 +243,7 @@ export async function routeEngine(input: RouteEngineInput, decideFn: DecideFn): 
   if (spec === "") return { engine: null, reason: "task spec is empty" };
   if (candidates.length === 0) return { engine: null, reason: "no candidate engines supplied" };
 
-  const decision = await decideFn({
+  const decision = await askS1(decideFn, {
     state: { spec, candidates },
     questions: {
       [Q_ENGINE]: {
@@ -283,6 +289,21 @@ export async function routeEngine(input: RouteEngineInput, decideFn: DecideFn): 
 // Helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * A decideFn that THROWS (buggy client, unexpected transport failure, or is
+ * not a function at all) is treated exactly like a structured { ok: false }:
+ * the hook's safe fallback applies and the returned error says the client
+ * threw, instead of the rejection propagating into the manager (issue #87,
+ * slice 3 hardening).
+ */
+async function askS1(decideFn: DecideFn, input: DecideInput): Promise<DecideResult> {
+  try {
+    return await decideFn(input);
+  } catch (e) {
+    return { ok: false, error: `decideFn threw: ${errorMessage(e)}` };
+  }
+}
+
 /** Keep non-empty strings, trimmed, order preserved. */
 function cleanStrings(v: unknown): string[] {
   if (!Array.isArray(v)) return [];
@@ -312,4 +333,9 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 
 function isFiniteNumber(v: unknown): v is number {
   return typeof v === "number" && Number.isFinite(v);
+}
+
+function errorMessage(e: unknown): string {
+  if (e instanceof Error) return e.message;
+  return String(e);
 }
