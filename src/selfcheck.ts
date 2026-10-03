@@ -1,3 +1,4 @@
+import { sshPrefix } from "./ssh.js";
 /**
  * Post-install self-check for fleet_deploy (issue #24).
  *
@@ -139,7 +140,7 @@ export async function runSelfCheck(
     const cmd = serviceUser ? heredoc : script;
     let raw = "";
     try {
-      const { stdout } = await execFileP("ssh", [...sshArgs, sshHost, cmd], { timeout: timeoutSec * 1000 });
+      const { stdout } = await execFileP("ssh", [...sshPrefix(sshHost, sshArgs), cmd], { timeout: timeoutSec * 1000 });
       raw = stdout;
     } catch (e) {
       const anyErr = e as { stdout?: string; message?: string };

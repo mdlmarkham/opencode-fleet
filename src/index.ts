@@ -10,7 +10,7 @@ import {
   ACK_PROBE_TIMEOUT_MS,
   type AckRecoveryOutcome,
 } from "./recovery.js";
-import { SSH_ARGS } from "./ssh.js";
+import { SSH_ARGS, setSshOptions, sshPrefix } from "./ssh.js";
 import { createHash } from "node:crypto";
 import { B64_MARKER, MAX_TRANSFER_B64, parseBundleOutput, parseStatusOutput, statusCommand } from "./outputs.js";
 import { acceptChunk, assembleChunks, isCanonicalBase64 } from "./xfer.js";
@@ -66,6 +66,8 @@ interface FleetConfig {
   sync?: { protectedBranches?: string[]; allowDirectPush?: string[]; allowSensitivePaths?: boolean; sensitivePaths?: string[] };
   /** Dispatch env refinements: allowOnly makes injection allowlist-only; extraDeny adds refused names. */
   env?: { allowOnly?: string[]; extraDeny?: string[] };
+  /** SSH client policy for manager-to-node commands. */
+  ssh?: { strictHostKeyChecking?: "accept-new" | "yes" };
 }
 
 export default definePluginEntry({
@@ -117,6 +119,19 @@ export default definePluginEntry({
           allowDirectPush: { type: "array", items: { type: "string" }, default: [] },
           allowSensitivePaths: { type: "boolean", default: false, description: "Allow worker changes to CI/CODEOWNERS paths." },
           sensitivePaths: { type: "array", items: { type: "string" }, default: [], description: "Extra path globs treated as sensitive (e.g. ci/**), added to the built-in list." },
+        },
+      },
+      ssh: {
+        type: "object",
+        additionalProperties: false,
+        description: "SSH client policy for manager-to-node commands.",
+        properties: {
+          strictHostKeyChecking: {
+            type: "string",
+            enum: ["accept-new", "yes"],
+            default: "accept-new",
+            description: "accept-new trusts a host key on first contact (TOFU) and refuses changes; yes requires the key to already be in known_hosts (pin keys when you provision nodes).",
+          },
         },
       },
       allowSetupCommands: {
@@ -542,6 +557,7 @@ export default definePluginEntry({
 
   register(api) {
     const cfg = (api.pluginConfig ?? {}) as FleetConfig;
+    setSshOptions(cfg.ssh);
 
     // ------------------------------------------------------------------
     // Node invoke policy: `opencode.run` (gateway-side permission boundary)
@@ -725,7 +741,7 @@ export default definePluginEntry({
         const execFileProbe = promisifyCb(execFileCb);
         const sshProbe = async (hostArg: string, command: string, timeoutMs = 30_000): Promise<string> => {
           try {
-            const { stdout } = await execFileProbe("ssh", [...SSH_ARGS, hostArg, command], { timeout: timeoutMs });
+            const { stdout } = await execFileProbe("ssh", [...sshPrefix(hostArg, SSH_ARGS), command], { timeout: timeoutMs });
             return stdout;
           } catch (e) {
             return (e as { stdout?: string }).stdout ?? "";
@@ -2298,7 +2314,7 @@ async function getNodeActivity(
   try {
     const { stdout } = await execFileP(
       "ssh",
-      [...SSH_ARGS, host, OPCODE_PS_COMMAND],
+      [...sshPrefix(host, SSH_ARGS), OPCODE_PS_COMMAND],
       { timeout: 20_000 },
     );
     return parseActivity(stdout);

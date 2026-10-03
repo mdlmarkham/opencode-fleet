@@ -142,6 +142,22 @@
       "piDefaultModel": {
         "type": "string",
         "description": "Pi model ref (provider/id) used when harness=pi and the dispatch names no piModel. No built-in default."
+      },
+      "ssh": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "SSH client policy for manager-to-node commands.",
+        "properties": {
+          "strictHostKeyChecking": {
+            "type": "string",
+            "enum": [
+              "accept-new",
+              "yes"
+            ],
+            "default": "accept-new",
+            "description": "accept-new trusts a host key on first contact (TOFU) and refuses changes; yes requires the key to already be in known_hosts (pin keys when you provision nodes)."
+          }
+        }
       }
     }
   },
