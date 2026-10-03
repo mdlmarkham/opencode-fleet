@@ -4,7 +4,8 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { B64_MARKER, nextChunkAction, parseBundleOutput, parseStatusOutput, statusCommand } from "./outputs.js";
+import { B64_MARKER, parseBundleOutput, parseStatusOutput, statusCommand } from "./outputs.js";
+import { acceptChunk, assembleChunks, isBase64Chunk, isCanonicalBase64, receivedCount } from "./xfer.js";
 import { chunkBuffer } from "./ledger.js";
 
 const sh = (cmd: string, cwd?: string) => execFileSync("bash", ["-c", cmd], { cwd, encoding: "utf8" });
@@ -22,6 +23,8 @@ describe("issue #38: __STATUS__ parsing against real command output", () => {
     const d = repo(3);
     try {
       const r = parseStatusOutput(sh(statusCommand(q(d))));
+      expect(r.ok).toBe(true);
+      if (!r.ok) return;
       expect(r.uncommittedCount).toBe(3);
       expect(r.files.split("\n")).toHaveLength(3);
       expect(r.files).toContain("f0.txt");
@@ -30,12 +33,22 @@ describe("issue #38: __STATUS__ parsing against real command output", () => {
   it("clean tree: count 0, no files", () => {
     const d = repo(0);
     try {
-      expect(parseStatusOutput(sh(statusCommand(q(d))))).toEqual({ files: "", uncommittedCount: 0 });
+      expect(parseStatusOutput(sh(statusCommand(q(d))))).toEqual({ ok: true, files: "", uncommittedCount: 0 });
     } finally { rmSync(d, { recursive: true, force: true }); }
   });
-  it("missing marker or garbage count falls back safely", () => {
-    expect(parseStatusOutput("?? a\n")).toEqual({ files: "?? a", uncommittedCount: 0 });
-    expect(parseStatusOutput("?? a\n---COUNT---\nnope\n").uncommittedCount).toBe(0);
+  it("a file named like the marker does not confuse the parser", () => {
+    const d = repo(0);
+    try {
+      writeFileSync(join(d, "---COUNT---"), "x");
+      writeFileSync(join(d, "other.txt"), "x");
+      const r = parseStatusOutput(sh(statusCommand(q(d))));
+      expect(r).toMatchObject({ ok: true, uncommittedCount: 2 });
+    } finally { rmSync(d, { recursive: true, force: true }); }
+  });
+  it("missing marker or a non-numeric count is a failure, not a clean tree", () => {
+    expect(parseStatusOutput("?? a\n").ok).toBe(false);
+    expect(parseStatusOutput("").ok).toBe(false);
+    expect(parseStatusOutput("?? a\n---COUNT---\nnope\n").ok).toBe(false);
   });
 });
 
@@ -57,25 +70,61 @@ describe("issue #38: __BUNDLE__ parsing against a real bundle", () => {
   });
 });
 
-describe("issue #38: chunked transfer integrity", () => {
-  it("accepts in-order, skips retries of accepted chunks, rejects gaps and bad indexes", () => {
-    expect(nextChunkAction(0, 0)).toEqual({ action: "append" });
-    expect(nextChunkAction(3, 3)).toEqual({ action: "append" });
-    expect(nextChunkAction(3, 2)).toEqual({ action: "skip" });
-    expect(nextChunkAction(3, 5)).toMatchObject({ action: "error" });
-    for (const bad of [-1, 1.5, NaN]) expect(nextChunkAction(0, bad)).toMatchObject({ action: "error" });
+describe("issue #38: chunked transfer integrity (per-chunk files)", () => {
+  const withDir = async <T>(fn: (dir: string) => Promise<T>) => {
+    const d = mkdtempSync(join(tmpdir(), "fleet38x-"));
+    try { return await fn(join(d, "xfer")); } finally { rmSync(d, { recursive: true, force: true }); }
+  };
+  it("accepts in order, treats an identical retry as a no-op, rejects gaps and conflicting retries", async () => {
+    await withDir(async (dir) => {
+      expect(await acceptChunk(dir, 0, "AAAA", 1e6)).toEqual({ ok: true, received: 1 });
+      expect(await acceptChunk(dir, 0, "AAAA", 1e6)).toEqual({ ok: true, received: 1 });
+      expect(await acceptChunk(dir, 0, "BBBB", 1e6)).toMatchObject({ ok: false, error: expect.stringMatching(/different content/) });
+      expect(await acceptChunk(dir, 2, "CCCC", 1e6)).toMatchObject({ ok: false, error: expect.stringMatching(/out of order/) });
+      expect(await acceptChunk(dir, 1, "BBBB", 1e6)).toEqual({ ok: true, received: 2 });
+      expect(await receivedCount(dir)).toBe(2);
+      expect(await assembleChunks(dir)).toBe("AAAABBBB");
+    });
   });
-  it("simulated receiver with a duplicated (retried) chunk reassembles the exact bytes", () => {
-    const data = Buffer.alloc(300_000, 7);
-    const chunks = chunkBuffer(data, 48 * 1024);
-    let received = 0;
-    let acc = "";
-    const send = (i: number) => {
-      const act = nextChunkAction(received, chunks[i].index);
-      if (act.action === "append") { acc += chunks[i].data; received++; }
-    };
-    chunks.forEach((_, i) => { send(i); if (i === 2) send(i); }); // chunk 2 delivered twice
-    expect(createHash("sha256").update(Buffer.from(acc, "base64")).digest("hex"))
-      .toBe(createHash("sha256").update(data).digest("hex"));
+  it("rejects bad indexes, non-base64, oversize, and anything after a padded final chunk", async () => {
+    await withDir(async (dir) => {
+      for (const bad of [-1, 1.5, NaN]) expect((await acceptChunk(dir, bad, "AAAA", 1e6)).ok).toBe(false);
+      expect((await acceptChunk(dir, 0, "AA!A", 1e6)).ok).toBe(false);
+      expect((await acceptChunk(dir, 0, "AAAA", 2)).ok).toBe(false);
+      expect((await acceptChunk(dir, 0, "QQ==", 1e6)).ok).toBe(true);
+      expect((await acceptChunk(dir, 1, "AAAA", 1e6)).ok).toBe(false);
+    });
+  });
+  it("base64 grammar: stray '=', wrong length and non-canonical forms are not accepted", () => {
+    for (const bad of ["=", "A", "AA=A", "A=A=", "AAAA\n", "AA A"]) {
+      expect(isBase64Chunk(bad) && isCanonicalBase64(bad), JSON.stringify(bad)).toBe(false);
+    }
+    for (const good of ["", "AAAA", "QQ==", "QUI=", "QUJD"]) expect(isBase64Chunk(good)).toBe(true);
+    expect(isCanonicalBase64("QUJD")).toBe(true);
+    expect(isCanonicalBase64("QQ==")).toBe(true);
+    expect(isCanonicalBase64("QR==")).toBe(false); // non-zero trailing bits
+  });
+  it("a duplicated (retried) chunk reassembles the exact bytes, verified by sha256", async () => {
+    await withDir(async (dir) => {
+      const data = Buffer.alloc(300_000, 7);
+      const chunks = chunkBuffer(data, 48 * 1024);
+      for (let i = 0; i < chunks.length; i++) {
+        expect((await acceptChunk(dir, chunks[i].index, chunks[i].data, 1e9)).ok).toBe(true);
+        if (i === 2) expect((await acceptChunk(dir, chunks[i].index, chunks[i].data, 1e9)).ok).toBe(true);
+      }
+      const b64 = await assembleChunks(dir);
+      expect(isCanonicalBase64(b64)).toBe(true);
+      expect(createHash("sha256").update(Buffer.from(b64, "base64")).digest("hex")).toBe(createHash("sha256").update(data).digest("hex"));
+    });
+  });
+  it("a crash between chunks leaves a consistent count (no separate counter to desync)", async () => {
+    await withDir(async (dir) => {
+      await acceptChunk(dir, 0, "AAAA", 1e6);
+      await acceptChunk(dir, 1, "BBBB", 1e6);
+      // The receiver is stateless: a fresh call derives the same count from disk.
+      expect(await receivedCount(dir)).toBe(2);
+      expect((await acceptChunk(dir, 1, "BBBB", 1e6)).ok).toBe(true);
+      expect(await assembleChunks(dir)).toBe("AAAABBBB");
+    });
   });
 });

@@ -12,7 +12,8 @@ import {
 } from "./recovery.js";
 import { SSH_ARGS } from "./ssh.js";
 import { createHash } from "node:crypto";
-import { B64_MARKER, MAX_TRANSFER_B64, nextChunkAction, parseBundleOutput, parseStatusOutput, statusCommand } from "./outputs.js";
+import { B64_MARKER, MAX_TRANSFER_B64, parseBundleOutput, parseStatusOutput, statusCommand } from "./outputs.js";
+import { acceptChunk, assembleChunks, isCanonicalBase64 } from "./xfer.js";
 import { guardCwd, taskUsesCwd, validateTaskIds } from "./guard.js";
 import { quoteUntrusted, sanitizeQuestion } from "./untrusted.js";
 import { runPaths, xferPaths, ensureStateDir, writePrivate } from "./paths.js";
@@ -156,6 +157,7 @@ export default definePluginEntry({
           // Working-tree state of the checkout (issue #4: manager visibility).
           const st = await runShell(statusCommand(shq(task.cwd)), 20_000, context?.signal);
           const status = parseStatusOutput(st);
+          if (!status.ok) return JSON.stringify({ ok: false, cwd: task.cwd, error: status.error });
           return JSON.stringify({ ok: true, cwd: task.cwd, uncommittedCount: status.uncommittedCount, files: status.files });
         }
         if (task.prompt === "__RECEIVE__") {
@@ -165,44 +167,34 @@ export default definePluginEntry({
           const transferId = String(task.transferId ?? "t");
           const accDir = xferPaths(transferId).dir;
           await (await import("node:fs/promises")).mkdir(accDir, { recursive: true });
-          const target = join(accDir, "bundle.b64");
-          const metaPath = join(accDir, "received.json");
-          const fsp = await import("node:fs/promises");
-          let received = 0;
-          try {
-            received = (JSON.parse(await fsp.readFile(metaPath, "utf8")) as { received?: number }).received ?? 0;
-          } catch { /* first chunk */ }
-          let size = 0;
-          try { size = (await fsp.stat(target)).size; } catch { /* none yet */ }
-          for (const c of (task.chunks ?? [])) {
-            const act = nextChunkAction(received, c.index);
-            if (act.action === "error") return JSON.stringify({ ok: false, error: act.error, received });
-            if (act.action === "skip") continue;
-            if (typeof c.data !== "string" || !/^[A-Za-z0-9+/=\r\n]*$/.test(c.data)) {
-              return JSON.stringify({ ok: false, error: "chunk is not base64", received });
-            }
-            size += c.data.length;
-            if (size > MAX_TRANSFER_B64) return JSON.stringify({ ok: false, error: "transfer exceeds size limit", received });
-            await fsp.appendFile(target, c.data);
-            received++;
-            await fsp.writeFile(metaPath, JSON.stringify({ received }));
+          const first = (task.chunks ?? [])[0];
+          if (!first) return JSON.stringify({ ok: false, error: "no chunk supplied" });
+          let last: Awaited<ReturnType<typeof acceptChunk>> = { ok: true, received: 0 };
+          for (const c of task.chunks ?? []) {
+            last = await acceptChunk(accDir, c.index, c.data, MAX_TRANSFER_B64);
+            if (!last.ok) return JSON.stringify(last);
           }
-          return JSON.stringify({ ok: true, transferId, received });
+          return JSON.stringify({ ok: true, transferId, received: last.received });
         }
         if (task.prompt === "__UNPACK__") {
           // Decode accumulated base64 and clone into cwd (SSH-free path).
           const transferId = String(task.transferId ?? "t");
           const accDir = xferPaths(transferId).dir;
-          const accFile = join(accDir, "bundle.b64");
           try {
-            const b64 = await (await import("node:fs/promises")).readFile(accFile, "utf8");
+            // Integrity is mandatory: a direct or malformed request without a
+            // digest must not reach `git clone`.
+            if (typeof task.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(task.sha256)) {
+              return JSON.stringify({ ok: false, error: "sha256 (64 hex chars) required for __UNPACK__" });
+            }
+            const b64 = await assembleChunks(accDir);
+            if (!b64 || !isCanonicalBase64(b64)) {
+              return JSON.stringify({ ok: false, error: "assembled transfer is empty or not canonical base64" });
+            }
             const bundlePath = remoteBundlePath(transferId);
             const decoded = Buffer.from(b64, "base64");
-            if (task.sha256) {
-              const got = createHash("sha256").update(decoded).digest("hex");
-              if (got !== task.sha256) {
-                return JSON.stringify({ ok: false, error: `bundle checksum mismatch (expected ${task.sha256.slice(0, 12)}…, got ${got.slice(0, 12)}…); refusing to unpack a corrupted transfer` });
-              }
+            const got = createHash("sha256").update(decoded).digest("hex");
+            if (got !== task.sha256) {
+              return JSON.stringify({ ok: false, error: `bundle checksum mismatch (expected ${task.sha256.slice(0, 12)}…, got ${got.slice(0, 12)}…); refusing to unpack a corrupted transfer` });
             }
             await (await import("node:fs/promises")).writeFile(bundlePath, decoded);
             const unpackCmd = [
@@ -1676,11 +1668,17 @@ export default definePluginEntry({
             parts.push(c.data);
           }
           const assembled = parts.join("");
-          if (typeof bundlePl.sha256 === "string") {
-            const got = createHash("sha256").update(Buffer.from(assembled, "base64")).digest("hex");
-            if (got !== bundlePl.sha256) {
-              return jsonResult({ ok: false, error: "worker bundle checksum mismatch after transfer; refusing to push a corrupted bundle" });
-            }
+          // Fail closed: node responses are not trusted, so a missing or
+          // malformed digest is as bad as a mismatch (node predating #38?).
+          if (typeof bundlePl.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(bundlePl.sha256)) {
+            return jsonResult({ ok: false, error: "worker did not return a bundle sha256; upgrade the node (opencode-fleet with checksum support) before syncing over the node channel" });
+          }
+          if (!isCanonicalBase64(assembled)) {
+            return jsonResult({ ok: false, error: "reassembled worker bundle is not canonical base64" });
+          }
+          const got = createHash("sha256").update(Buffer.from(assembled, "base64")).digest("hex");
+          if (got !== bundlePl.sha256) {
+            return jsonResult({ ok: false, error: "worker bundle checksum mismatch after transfer; refusing to push a corrupted bundle" });
           }
           const { syncFromNode } = await import("./provision.js");
           const r = await syncFromNode("local", p.cwd, p.repo, p.branch ?? "main", {

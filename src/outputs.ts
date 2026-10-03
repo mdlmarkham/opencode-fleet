@@ -17,17 +17,21 @@ export function statusCommand(quotedCwd: string): string {
   );
 }
 
-export interface StatusResult {
-  files: string;
-  uncommittedCount: number;
-}
+export type StatusResult =
+  | { ok: true; files: string; uncommittedCount: number }
+  | { ok: false; error: string };
 
+/**
+ * Parse `statusCommand` output. The separator is the LAST marker line (a
+ * tracked file may itself be named like the marker); a missing marker or a
+ * non-numeric count is a failure, never "clean".
+ */
 export function parseStatusOutput(out: string): StatusResult {
-  const i = out.indexOf(COUNT_MARKER);
-  if (i < 0) return { files: out.trim(), uncommittedCount: 0 };
-  const files = out.slice(0, i).trim();
-  const n = parseInt(out.slice(i + COUNT_MARKER.length).trim(), 10);
-  return { files, uncommittedCount: Number.isFinite(n) ? n : 0 };
+  const i = out.lastIndexOf(COUNT_MARKER);
+  if (i < 0) return { ok: false, error: `status failed: ${out.trim().slice(0, 200) || "no output"}` };
+  const tail = out.slice(i + COUNT_MARKER.length).trim();
+  if (!/^\d+$/.test(tail)) return { ok: false, error: `status failed: unexpected count ${JSON.stringify(tail.slice(0, 40))}` };
+  return { ok: true, files: out.slice(0, i).trim(), uncommittedCount: parseInt(tail, 10) };
 }
 
 export type BundleParse = { ok: true; head: string; base64: string } | { ok: false; error: string };
@@ -46,20 +50,6 @@ export function parseBundleOutput(out: string): BundleParse {
   const lines = meta.trim().split("\n");
   const head = (lines[lines.length - 1] ?? "").trim().slice(-40);
   return { ok: true, head, base64 };
-}
-
-export type ChunkAction = { action: "append" } | { action: "skip" } | { action: "error"; error: string };
-
-/**
- * Decide what to do with an incoming transfer chunk given how many have been
- * accepted so far. A retried invoke (index already accepted) is acknowledged
- * without appending again; a gap is an error.
- */
-export function nextChunkAction(received: number, index: number): ChunkAction {
-  if (!Number.isInteger(index) || index < 0) return { action: "error", error: `invalid chunk index: ${index}` };
-  if (index < received) return { action: "skip" };
-  if (index > received) return { action: "error", error: `chunk out of order: expected ${received}, got ${index}` };
-  return { action: "append" };
 }
 
 /** Maximum base64 characters accepted for a single transferred bundle (~256 MiB decoded). */
