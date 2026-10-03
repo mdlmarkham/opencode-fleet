@@ -513,3 +513,85 @@ export function verifyGateScript(
 export function doneMarkerLine(donePath: string): string {
   return `printf '{"done":1,"exitCode":%s,"finishedAt":"%s"}\\n' "$EC" "$(date -u +%FT%TZ)" > ${shq(donePath)}`;
 }
+
+export interface PruneResult {
+  removedRuns: string[];
+  removedTransfers: string[];
+  keptAlive: string[];
+  errors: string[];
+}
+
+/**
+ * Remove finished runs' files (script, log, state, done marker) and stale
+ * transfer staging from the private state dir (issue #63). Only entries whose
+ * names match the exact fleet patterns are considered; a run whose script is in
+ * `aliveRunIds` is never touched; an entry is pruned only when EVERY file of it
+ * is older than the cutoff. Symlinks are never followed.
+ */
+export async function pruneStateDir(
+  dir: string,
+  olderThanMs: number,
+  aliveRunIds: ReadonlySet<string>,
+  now: number = Date.now(),
+): Promise<PruneResult> {
+  const fsp = await import("node:fs/promises");
+  const out: PruneResult = { removedRuns: [], removedTransfers: [], keptAlive: [], errors: [] };
+  let names: string[];
+  try {
+    names = await fsp.readdir(dir);
+  } catch {
+    return out;
+  }
+  const cutoff = now - olderThanMs;
+  const runFiles = new Map<string, string[]>();
+  const xfers = new Map<string, string[]>();
+  for (const n of names) {
+    let m = n.match(/^run-([A-Za-z0-9_-]{1,64})\.(json|sh|log)$/) ?? n.match(/^done-([A-Za-z0-9_-]{1,64})\.json$/);
+    if (m) {
+      (runFiles.get(m[1]) ?? runFiles.set(m[1], []).get(m[1])!).push(n);
+      continue;
+    }
+    m = n.match(/^xfer-([A-Za-z0-9_-]{1,64})(?:\.bundle)?$/);
+    if (m) (xfers.get(m[1]) ?? xfers.set(m[1], []).get(m[1])!).push(n);
+  }
+  const newest = async (files: string[]): Promise<number | undefined> => {
+    let max = 0;
+    for (const f of files) {
+      try {
+        max = Math.max(max, (await fsp.lstat(`${dir}/${f}`)).mtimeMs);
+      } catch {
+        /* vanished */
+      }
+    }
+    return max || undefined;
+  };
+  const remove = async (files: string[]) => {
+    for (const f of files) {
+      const full = `${dir}/${f}`;
+      try {
+        const st = await fsp.lstat(full);
+        // a plain file, or a real directory (never a symlink target)
+        if (st.isSymbolicLink() || st.isFile()) await fsp.unlink(full);
+        else if (st.isDirectory()) await fsp.rm(full, { recursive: true, force: true });
+      } catch (e) {
+        out.errors.push(`${f}: ${(e as Error).message}`);
+      }
+    }
+  };
+  for (const [id, files] of runFiles) {
+    if (aliveRunIds.has(id)) { out.keptAlive.push(id); continue; }
+    const t = await newest(files);
+    if (t !== undefined && t < cutoff) {
+      await remove(files);
+      out.removedRuns.push(id);
+    }
+  }
+  for (const [id, files] of xfers) {
+    const t = await newest(files);
+    if (t !== undefined && t < cutoff) {
+      await remove(files);
+      out.removedTransfers.push(id);
+    }
+  }
+  return out;
+}

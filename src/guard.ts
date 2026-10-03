@@ -116,6 +116,7 @@ const CWD_FREE_OPS = new Set([
   "__SEND_CHUNK__",
   "__RUN_STATUS__",
   "__RUN_RESULT__",
+  "__PRUNE__",
 ]);
 
 /** Whether the node will actually use `cwd` for this message (and so must confine it). */

@@ -9,7 +9,7 @@
  * engine we therefore verify the node first instead of running the wrong engine.
  */
 
-import { nodeProtocolOf, requiredProtocol, resolveOp } from "./protocol.js";
+import { nodeProtocolOf, requiredProtocol, requiredProtocolForOp, resolveOp } from "./protocol.js";
 import { relayTimeoutWithGate } from "./verify.js";
 import { checkSetup } from "./policy.js";
 
@@ -101,7 +101,7 @@ export async function handleOpencodeRunPolicy(
     const check = typeof cmd === "string" ? checkSetup(cmd, opts.allowExpectCommands === true) : { ok: false as const, error: "expect.command must be a string" };
     if (!check.ok) return { ok: false, message: `invalid expect.command: ${check.error}` };
   }
-  const need = launches ? requiredProtocol(task as { harness?: unknown; expect?: unknown }) : { version: 0 };
+  const need = launches ? requiredProtocol(task as { harness?: unknown; expect?: unknown }) : requiredProtocolForOp(resolved.op);
   if (need.version > 0) {
     // A node below the needed protocol would silently ignore the field (run the
     // wrong engine, or skip the verification gate and report an ungated run).
@@ -119,7 +119,7 @@ export async function handleOpencodeRunPolicy(
     if (cached.version < need.version) {
       return {
         ok: false,
-        message: `node speaks protocol ${cached.version} (< ${need.version}) and would silently ignore ${need.feature}; upgrade opencode-fleet on the node first`,
+        message: `node speaks protocol ${cached.version} (< ${need.version}) and cannot honor ${need.feature}; upgrade opencode-fleet on the node first`,
       };
     }
   }
