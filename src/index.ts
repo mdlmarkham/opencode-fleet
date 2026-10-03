@@ -20,6 +20,11 @@ import { isSentinelPrompt } from "./protocol.js";
 import { OPCODE_PS_COMMAND, abortRunById, parseActivity, runStatePath, type NodeActivityEntry } from "./node/runtime.js";
 import { isCanonicalBase64 } from "./xfer.js";
 import { runPaths, xferPaths, ensureStateDir, writePrivate } from "./paths.js";
+// Issue #87, slice 3: S1 dispatch wiring. TYPE-ONLY imports here — the S1
+// client/hook modules are loaded (dynamically) only when the caller opts in,
+// so the default dispatch path imports nothing from S1 and never calls it.
+import type { TriageResult } from "./s1-hooks.js";
+import type { S1RouteDecision, S1RouteHarnessResult } from "./s1-wire.js";
 
 
 
@@ -219,10 +224,19 @@ export default definePluginEntry({
           node: { type: "string", description: "Singular alias for nodes: [node]. Convenience for single-node dispatch." },
           transport: { type: "string", enum: ["http", "acp"], description: "OpenCode transport." },
           harness: { type: "string", enum: ["opencode", "pi"], description: "Worker engine harness." },
+          route: {
+            type: "object",
+            additionalProperties: false,
+            description: "OPT-IN S1 engine routing (issue #87, default OFF): when present, the candidate engine names are ranked by the S1 routeEngine hook for this task text and the dispatch uses the pick as its `harness` — applied only when the pick is a valid harness (opencode|pi). S1 unavailable, no decision, or a non-harness pick keeps the caller's `harness` (today's behaviour). Omitted => no S1 call, dispatch unchanged byte for byte.",
+            properties: {
+              candidates: { type: "array", items: { type: "string" }, description: "Candidate engine names, e.g. ['opencode','pi'], in criteria/tie-break order." },
+            },
+          },
           piModel: { type: "string", description: "Pi model override (harness=pi); `provider/id` ref, e.g. myprovider/some-model. Falls back to the operator's piDefaultModel config." },
           model: { type: "string", description: "Optional model override (must exist on node)." },
           agent: { type: "string", description: "Optional OpenCode agent (build/plan)." },
           autoApprove: { type: "boolean", description: "Opt-in: append --auto to `opencode run` to auto-approve all non-denied permissions for this run. Default false — this widens the trust posture." },
+          autoTriage: { type: "boolean", description: "OPT-IN S1 triage (issue #87, default false): when a run hand-raises a question, also ask the S1 triageHandRaise hook and surface a recommendation on the result as s1.triage ({action, reason}). Advisory only — it never auto-answers or changes the run; unavailable decisions escalate. Default false => no S1 call, no added fields." },
           timeoutMs: { type: "number", description: "Per-node timeout, ms." },
           maxIdleMs: { type: "number", description: "Kill the run if no output for this long, ms (stuck-loop guard). Default 120000." },
           maxDurationMs: { type: "number", description: "Kill the run if total runtime exceeds this, ms (stuck-loop guard). Default 600000." },
@@ -261,10 +275,12 @@ export default definePluginEntry({
           node?: string;
           transport?: "http" | "acp";
           harness?: "opencode" | "pi";
+          route?: { candidates: string[] };
           piModel?: string;
           model?: string;
           agent?: string;
           autoApprove?: boolean;
+          autoTriage?: boolean;
           timeoutMs?: number;
           maxIdleMs?: number;
           maxDurationMs?: number;
@@ -341,13 +357,29 @@ export default definePluginEntry({
         if (isSentinelPrompt(p.prompt?.trim())) {
           return jsonResult({ ok: false, error: `prompt ${JSON.stringify(p.prompt.trim())} is reserved for node control messages; write a real task description` });
         }
-        const harnessCheck = validateHarnessTransport({ harness: p.harness, transport });
+        // Issue #87, slice 3: OPT-IN S1 engine routing. Default OFF: with no
+        // `route` param nothing runs here — no S1 call, no field added, and
+        // the dispatch is byte-identical to routing being absent. When set,
+        // the candidate list is ranked by the S1 routeEngine hook for this
+        // task text; a pick that is a valid harness (opencode|pi) REPLACES
+        // the dispatch harness. Every fallback (S1 unavailable, no pick, pick
+        // that is not a valid harness) keeps the caller's `harness` unchanged.
+        let routed: S1RouteHarnessResult = { harness: p.harness, changed: false };
+        let s1RouteDecision: S1RouteDecision | undefined;
+        if (p.route !== undefined) {
+          const { parseRouteOptIn, s1RouteHarness } = await import("./s1-wire.js");
+          const routeCheck = parseRouteOptIn(p.route);
+          if (!routeCheck.ok) return jsonResult({ ok: false, error: `invalid route: ${routeCheck.error}` });
+          routed = await s1RouteHarness({ harness: p.harness, route: routeCheck.route, specText: p.prompt ?? "" });
+          s1RouteDecision = routed.decision;
+        }
+        const harnessCheck = validateHarnessTransport({ harness: routed.harness, transport });
         if (!harnessCheck.ok) return jsonResult({ ok: false, harness: harnessCheck.harness, error: harnessCheck.error });
         // No built-in Pi model: a dispatch must name one, or the operator must configure a default.
         // Whitespace-only counts as missing, so a blank per-call value falls back to the configured default.
         const clean = (v?: string) => v?.trim() || undefined;
-        const piModel = p.harness === "pi" ? (clean(p.piModel) ?? clean(cfg.piDefaultModel)) : clean(p.piModel);
-        if (p.harness === "pi" && !piModel) {
+        const piModel = routed.harness === "pi" ? (clean(p.piModel) ?? clean(cfg.piDefaultModel)) : clean(p.piModel);
+        if (routed.harness === "pi" && !piModel) {
           return jsonResult({ ok: false, harness: "pi", error: "harness=pi needs a model: pass piModel (provider/id) or set piDefaultModel in the plugin config" });
         }
         // Issue #34: refuse (never silently drop) env names that execute code or
@@ -396,6 +428,9 @@ export default definePluginEntry({
         });
         const results: Record<string, unknown> = {};
         if (skippedNodes.length) results.skipped = skippedNodes;
+        // Issue #87, slice 3: surface the opt-in routing decision — only when
+        // `route` was requested; the default path adds no field at all.
+        if (s1RouteDecision) results.s1 = { route: s1RouteDecision };
         // Issue #26: validate the cwd AS THE WORKER PRINCIPAL before dispatch.
         // A /root path is unreachable by a non-root service user, so the run
         // cannot start — refuse with an actionable error instead of sending it
@@ -445,7 +480,7 @@ export default definePluginEntry({
             prompt: p.prompt,
             cwd: p.cwd,
             transport,
-            harness: p.harness,
+            harness: routed.harness,
             piModel,
             model: p.model,
             agent: p.agent,
@@ -468,7 +503,7 @@ export default definePluginEntry({
             prompt: p.prompt,
             model: p.model,
             transport,
-            harness: p.harness,
+            harness: routed.harness,
             piModel,
             startedAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),
@@ -721,11 +756,30 @@ export default definePluginEntry({
           // SAME shape for every outcome — absent expect => verified:null +
           // verifyDetails:null, identical to the detached / fleet_run_status
           // shape; no key omission on the no-gate path.
+          // Issue #87, slice 3: OPT-IN S1 triage of a hand-raised question.
+          // Default OFF: no `autoTriage` => no S1 call and no field added (the
+          // per-node result stays byte-identical). With autoTriage the result
+          // gains ONLY an s1.triage RECOMMENDATION — the run itself is never
+          // answered or changed, and an unavailable decision escalates.
+          let s1Triage: TriageResult | undefined;
+          if (p.autoTriage === true && parsedResult.handRaised === true) {
+            const { s1TriageIfRequested, triageContextFromRun } = await import("./s1-wire.js");
+            s1Triage = await s1TriageIfRequested({
+              autoTriage: true,
+              question: parsedResult.question,
+              context: triageContextFromRun({
+                summary: parsedResult.summary,
+                verifyDetails: parsedResult.verifyDetails,
+                treeState,
+              }),
+            });
+          }
           results[node.displayName ?? node.nodeId] = withVerified(
             {
               runId,
               result: dispatchResult,
               treeState,
+              ...(s1Triage ? { s1: { triage: s1Triage } } : {}),
               ...(typeof parsedResult.verified === "boolean" && parsedResult.verified === false
                 ? {
                     verifiedNote:
