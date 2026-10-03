@@ -2,9 +2,9 @@
  * OpenCode driver — runs OpenCode on a node via the `opencode.run` node command.
  *
  * Two transports:
- *  - "http":  `opencode serve` (headless HTTP server) + `opencode run --attach`
- *             Best for fire-and-forget batch dispatch. Mirrors the legacy
- *             OpenCodeFleet HTTP approach.
+ *  - "http":  `opencode run --format json` (one-shot, detached by the dispatcher).
+ *             Best for fire-and-forget batch dispatch. (Historically named for the
+ *             `opencode serve` + `--attach` design; the code never used `serve`.)
  *  - "acp":   `opencode acp` (ACP stdio server). Mirrors the Codex
  *             paired-device placement pattern. Best for interactive/steerable
  *             sessions.
@@ -70,6 +70,8 @@ export interface OpenCodeTask {
   chunks?: Array<{ index: number; data: string }>;
   /** Expected chunk index for ordered node-channel transfer. */
   chunkIndex?: number;
+  /** Expected sha256 (hex) of the decoded bundle for __UNPACK__ (channel path). */
+  sha256?: string;
   /** Commit SHA for __UNPACK__ (channel path). */
   commit?: string;
   /** Internal control flag: abort a running session. */

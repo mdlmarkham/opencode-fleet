@@ -191,6 +191,7 @@ export async function provisionToNode(
   const transferId = `${Date.now()}`;
   const remoteBundle = `/tmp/fleet-${transferId}.bundle`;
   let shippedViaChannel = false;
+  let bundleSha256: string | undefined;
   try {
     // Ship the bundle via SSH when available; fall back to the node channel
     // (chunked base64 through opencode.run) when SSH is not reachable.
@@ -209,13 +210,29 @@ export async function provisionToNode(
       if (!channelInvoke) throw new Error("channel invoke required for SSH-free provisioning");
       const { chunkBuffer } = await import("./ledger.js");
       const fs = await import("node:fs/promises");
-      const chunks = chunkBuffer(await fs.readFile(bundlePath));
+      const bundleBytes = await fs.readFile(bundlePath);
+      bundleSha256 = (await import("node:crypto")).createHash("sha256").update(bundleBytes).digest("hex");
+      const chunks = chunkBuffer(bundleBytes);
       // One invoke per chunk keeps each message small; the node accumulates.
       for (let i = 0; i < chunks.length; i++) {
-        await channelInvoke(
-          { prompt: "__RECEIVE__", cwd: "/", transport: "http", transferId, chunkIndex: i, chunks: [chunks[i]] },
-          60_000,
-        );
+        // The node accepts each index once (a retry of an accepted chunk is a
+        // no-op), so one retry on a transport error cannot double-append.
+        let lastErr = "";
+        let accepted = false;
+        for (let attempt = 0; attempt < 2 && !accepted; attempt++) {
+          try {
+            const res = (await channelInvoke(
+              { prompt: "__RECEIVE__", cwd: "/", transport: "http", transferId, chunkIndex: i, chunks: [chunks[i]] },
+              60_000,
+            )) as { payload?: unknown };
+            const pl = typeof res?.payload === "string" ? JSON.parse(res.payload) : (res?.payload ?? {});
+            if ((pl as { ok?: boolean }).ok) accepted = true;
+            else lastErr = String((pl as { error?: string }).error ?? "chunk rejected");
+          } catch (e) {
+            lastErr = (e as Error).message;
+          }
+        }
+        if (!accepted) throw new Error(`bundle transfer failed at chunk ${i}/${chunks.length}: ${lastErr}`);
       }
     }
 
@@ -258,7 +275,7 @@ export async function provisionToNode(
     let unpackOut = "";
     if (shippedViaChannel && channelInvoke) {
       const res = (await channelInvoke(
-        { prompt: "__UNPACK__", cwd: req.cwd, transport: "http", transferId, commit: req.commit },
+        { prompt: "__UNPACK__", cwd: req.cwd, transport: "http", transferId, commit: req.commit, sha256: bundleSha256 },
         180_000,
       )) as { payload?: unknown };
       const pl = typeof res?.payload === "string" ? JSON.parse(res.payload) : (res?.payload ?? {});
