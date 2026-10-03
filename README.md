@@ -69,6 +69,25 @@ Workers can "raise their hand" when they hit high uncertainty: they emit `HAND_R
 - **Watchdog** — `fleet_dispatch` accepts `maxIdleMs` (kill if no output) and `maxDurationMs` (kill if too long)
 - **No-progress escalation** — `fleet_iterate` fingerprints each iteration's output; identical consecutive output triggers escalation (heavier model / change approach / human handoff) instead of a token-burning retry loop
 
+## Verification gate (optional)
+
+A worker that exits 0 but produced nothing is not a success — but an exit code alone can't tell. `fleet_dispatch` accepts an optional `expect` gate:
+
+```jsonc
+{
+  "prompt": "build the docs",
+  "cwd": "...",
+  "expect": { "files": ["docs/api.md"], "command": "test -s docs/api.md" }
+}
+```
+
+After the worker exits, the node evaluates the gate in the run's cwd and records it on the run result:
+
+- every path in `expect.files` must exist (relative to cwd; absolute allowed)
+- `expect.command`, when given, is run via `bash -lc` in cwd (bounded to 120s) and must exit 0
+
+The outcome is recorded as `verified: boolean` with per-check `verifyDetails`, and is surfaced by `fleet_run_status`. **`verified` is separate from `ok`** (`ok` remains the raw process exit status): `ok: true, verified: false` means the worker exited cleanly but the expected artifacts were not produced — treat the run as unverified, not successful. Omitting `expect` changes nothing (`verified: null`).
+
 ## Install
 
 ```bash

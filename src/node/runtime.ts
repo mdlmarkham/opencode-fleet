@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { shq } from "./../shell.js";
 import { abortStateWrite } from "./../recovery.js";
 import { runPaths, writePrivate, xferPaths } from "./../paths.js";
+import { DEFAULT_EXPECT_COMMAND_TIMEOUT_MS, type ExpectCheck } from "./../verify.js";
 
 /** One running OpenCode process on a node (from `ps`). */
 export interface NodeActivityEntry {
@@ -292,4 +293,86 @@ export function detachedLaunchCommand(runId: string, scriptPath: string, statePa
     // the LAUNCHED_PID line as a separate statement.
     `setsid nohup /bin/bash ${shq(scriptPath)} > ${shq(runPaths(runId).log)} 2>&1`,
   ].join(" && ") + ` &\necho "LAUNCHED_PID=$!"`;
+}
+
+/** Options for the verification-gate section of the generated launcher. */
+export interface VerifyGateOptions {
+  /** The run's cwd — the gate is evaluated there. */
+  cwd: string;
+  /** Wall-clock bound for `expect.command` (default 120s) so a hanging check cannot wedge the run record. */
+  commandTimeoutMs?: number;
+}
+
+/**
+ * Issue #62: the bash fragment that evaluates the optional `expect` gate in
+ * the run's cwd AFTER the worker exits, plus the done-marker write.
+ *
+ * By the time these lines run, the launcher's `inner` command has already
+ * cd'd into the workspace (or exited), so cwd is the run cwd; we re-cd
+ * defensively and fail closed (verification cannot be satisfied) if that
+ * somehow fails.
+ *
+ * All values are pre-escaped in TypeScript (shq for bash, JSON.stringify for
+ * the recorded strings), so bash only moves literals around — no expansion of
+ * untrusted content happens on the node.
+ */
+export function verifyGateScript(
+  expect: ExpectCheck,
+  donePath: string,
+  opts: VerifyGateOptions,
+): { verifyLines: string[]; doneLine: string } {
+  const files = (expect.files ?? []).filter((p) => typeof p === "string" && p.length > 0);
+  const command = typeof expect.command === "string" && expect.command.trim().length > 0 ? expect.command : undefined;
+  const timeoutSec = Math.max(1, Math.round((opts.commandTimeoutMs ?? DEFAULT_EXPECT_COMMAND_TIMEOUT_MS) / 1000));
+
+  const lines: string[] = [
+    "# Issue #62: post-run verification gate, evaluated in the run's cwd after the worker exits.",
+    "__V_ALL_OK=true",
+    "__V_FILES_JSON=''",
+    `if cd ${shq(opts.cwd)} 2>/dev/null; then __V_CDW=true; else __V_CDW=false; __V_ALL_OK=false; fi`,
+  ];
+  if (files.length) {
+    // Paths are shell-quoted for the existence check; the recorded JSON path
+    // strings are pre-rendered with JSON.stringify (then shq-wrapped) so no
+    // escaping happens in bash — bash only moves literals around.
+    lines.push(`__V_PATHS=( ${files.map(shq).join(" ")} )`);
+    lines.push(`__V_JPATHS=( ${files.map((p) => shq(JSON.stringify(p))).join(" ")} )`);
+    lines.push("__V_SEP=''");
+    lines.push('for __i in "${!__V_PATHS[@]}"; do');
+    lines.push('  if [ "$__V_CDW" = true ] && [ -e "${__V_PATHS[$__i]}" ]; then __ok=true; else __ok=false; __V_ALL_OK=false; fi');
+    lines.push('  __V_FILES_JSON="${__V_FILES_JSON}${__V_SEP}{\\\"path\\\":${__V_JPATHS[$__i]},\\\"ok\\\":$__ok}"');
+    lines.push("__V_SEP=','");
+    lines.push("done");
+  }
+  if (command) {
+    lines.push("__V_JCMD=" + shq(JSON.stringify(command)));
+    lines.push('if [ "$__V_CDW" = true ]; then');
+    lines.push(
+      `  if timeout ${timeoutSec} bash -lc ${shq(command)} >/dev/null 2>&1; then __V_CMD_OK=true; __V_CMD_EXIT=0; else __V_CMD_EXIT=$?; __V_CMD_OK=false; __V_ALL_OK=false; fi`,
+    );
+    lines.push('  __V_CMD_JSON="{\\\"cmd\\\":$__V_JCMD,\\\"exitCode\\\":$__V_CMD_EXIT,\\\"ok\\\":$__V_CMD_OK}"');
+    lines.push("else");
+    lines.push("  __V_CMD_OK=false; __V_ALL_OK=false");
+    lines.push('  __V_CMD_JSON="{\\\"cmd\\\":$__V_JCMD,\\\"exitCode\\\":null,\\\"ok\\\":false}"');
+    lines.push("fi");
+  }
+  // verifyDetails is fully assembled by the generator: the accumulated JSON
+  // file array, plus the command object only when one was given.
+  lines.push(
+    command
+      ? '__V_DETAILS="{\\\"files\\\":[$__V_FILES_JSON],\\\"command\\\":$__V_CMD_JSON}"'
+      : '__V_DETAILS="{\\\"files\\\":[$__V_FILES_JSON]}"',
+  );
+  const doneLine =
+    `printf '{"done":1,"exitCode":%s,"finishedAt":"%s","verified":%s,"verifyDetails":%s}\\n' "$EC" "$(date -u +%FT%TZ)" "$__V_ALL_OK" "$__V_DETAILS" > ${shq(donePath)}`;
+  return { verifyLines: lines, doneLine };
+}
+
+/**
+ * The done-marker write for a run without an `expect` gate: the exact
+ * historical line (issue #6). With a gate (issue #62), `verifyGateScript`
+ * returns the verifying done line instead.
+ */
+export function doneMarkerLine(donePath: string): string {
+  return `printf '{"done":1,"exitCode":%s,"finishedAt":"%s"}\\n' "$EC" "$(date -u +%FT%TZ)" > ${shq(donePath)}`;
 }

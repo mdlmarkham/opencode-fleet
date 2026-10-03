@@ -9,6 +9,7 @@
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { Writable, Readable } from "node:stream";
+import type { VerifyDetails } from "./verify.js";
 import * as acp from "@agentclientprotocol/sdk";
 
 export interface AcpRunOptions {
@@ -25,6 +26,9 @@ export interface AcpRunResult {
   sessionId?: string;
   summary?: string;
   error?: string;
+  /** Issue #62: outcome of the optional `expect` verification gate (absent = no gate). */
+  verified?: boolean | null;
+  verifyDetails?: VerifyDetails;
 }
 
 /**

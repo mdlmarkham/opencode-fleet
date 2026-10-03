@@ -201,6 +201,15 @@ export default definePluginEntry({
           maxDurationMs: { type: "number", description: "Kill the run if total runtime exceeds this, ms (stuck-loop guard). Default 600000." },
           async: { type: "boolean", description: "Run detached: returns a run handle immediately (runId + pid); the worker survives relay timeouts and its completion is recorded. Poll with fleet_watch or fleet_run_status. Default true." },
           env: { type: "object", additionalProperties: { type: "string" }, description: "Environment variables for the worker process (per-dispatch environment). Names that execute code or redirect configuration (PATH, HOME, BASH_ENV, NODE_OPTIONS, LD_*, GIT_SSH*, OPENCODE_CONFIG*, ...) are REFUSED: the dispatch fails and names them. Operators can narrow this further (config env.allowOnly / env.extraDeny)." },
+          expect: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              files: { type: "array", items: { type: "string" }, description: "Artifact paths that must exist after the run (relative to the run cwd; absolute allowed), e.g. ['dist/index.js', 'docs/api.md']." },
+              command: { type: "string", description: "Verification command run via `bash -lc` in the run cwd after the worker exits (e.g. `npm test -- --silent`); must exit 0. Bounded to 120s." },
+            },
+            description: "Optional post-run verification gate (issue #62). After the worker exits, the node checks that every listed file exists and — when given — that the command exits 0, recording verified/verifyDetails on the run result. verified is separate from ok (which stays the process exit status): use it so a run that exits 0 but produced nothing is not trusted as success. Poll it with fleet_run_status.",
+          },
           ref: { type: "object", additionalProperties: false, properties: { branch: { type: "string", description: "Branch to check out before running." }, commit: { type: "string", description: "Commit SHA to check out before running." } }, description: "Git ref to check out before running. Refused if the checkout has uncommitted changes." },
           requires: {
             type: "object",
@@ -234,6 +243,7 @@ export default definePluginEntry({
           maxDurationMs?: number;
           async?: boolean;
           env?: Record<string, string>;
+          expect?: { files?: string[]; command?: string };
           ref?: { branch?: string; commit?: string };
           requires?: {
             gpu?: boolean;
@@ -303,6 +313,13 @@ export default definePluginEntry({
         }
         if (p.autoApprove === true && cfg.allowAutoApprove === false) {
           return jsonResult({ ok: false, error: "autoApprove is disabled by the operator (allowAutoApprove=false)" });
+        }
+        // Issue #62: validate the optional verification gate up front so a
+        // malformed spec is a clear refusal, never a silently-dropped gate.
+        const { parseExpectSpec } = await import("./verify.js");
+        const expectSpec = parseExpectSpec(p.expect);
+        if (!expectSpec.ok) {
+          return jsonResult({ ok: false, error: `invalid expect: ${expectSpec.error}` });
         }
         const { upsertRun, newRunId, probeRun, loadLedger, outcomeEntry } = await import("./ledger.js");
         const rootDir = api.rootDir ?? process.cwd();
@@ -377,6 +394,7 @@ export default definePluginEntry({
             maxIdleMs: p.maxIdleMs,
             maxDurationMs: p.maxDurationMs,
             env: p.env,
+            expect: expectSpec.expect,
             ref: p.ref,
             async: p.async !== false,
           };
@@ -623,8 +641,8 @@ export default definePluginEntry({
           const payload = (dispatchResult as { payload?: unknown }).payload;
           const parsedResult =
             typeof payload === "string"
-              ? (JSON.parse(payload) as { ok?: boolean; summary?: string; sessionId?: string; handRaised?: boolean; question?: string })
-              : ((payload as { ok?: boolean; summary?: string; sessionId?: string; handRaised?: boolean; question?: string } | undefined) ?? {});
+              ? (JSON.parse(payload) as { ok?: boolean; summary?: string; sessionId?: string; handRaised?: boolean; question?: string; verified?: boolean; verifyDetails?: unknown })
+              : ((payload as { ok?: boolean; summary?: string; sessionId?: string; handRaised?: boolean; question?: string; verified?: boolean; verifyDetails?: unknown } | undefined) ?? {});
           // Same run, new state (see outcomeEntry): keeps startedAt/engine/pid and a
           // silent-death failure recorded above.
           await upsertRun(rootDir, outcomeEntry(ledgerEntry, { timedOut, reconciledDead, parsed: parsedResult }));
@@ -633,6 +651,11 @@ export default definePluginEntry({
             runId,
             result: dispatchResult,
             treeState,
+            // Issue #62: hoist the verify-gate outcome so a synchronous
+            // dispatch result is not read as success while unverified.
+            ...(typeof parsedResult.verified === "boolean"
+              ? { verified: parsedResult.verified, verifyDetails: parsedResult.verifyDetails ?? null }
+              : {}),
             ...(timedOut ? { dispatchTimedOut: true, mayStillBeRunning: true } : {}),
           };
         }
@@ -821,6 +844,17 @@ export default definePluginEntry({
           startedAt: st.startedAt,
           finishedAt: st.finishedAt,
           exitCode: st.exitCode,
+          // Issue #62: the verification gate outcome (null = no gate was
+          // configured). Do NOT fold it into ok/exitCode — it is a separate
+          // signal, but a failed gate means the run must not be trusted.
+          verified: typeof st.verified === "boolean" ? st.verified : null,
+          verifyDetails: st.verifyDetails ?? null,
+          ...(st.verified === false
+            ? {
+                verifiedNote:
+                  "VERIFICATION GATE FAILED (issue #62): the worker exited but did not satisfy `expect` (see verifyDetails). Treat this run as unverified — do not report it as successful work.",
+              }
+            : {}),
           output,
         });
       },
