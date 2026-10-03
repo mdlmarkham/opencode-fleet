@@ -122,6 +122,53 @@ export function resolveAbortRunId(runs: LedgerEntry[], sessionId: string, nodeNa
   return (hits.find((r) => !TERMINAL.has(r.state)) ?? hits[0])?.runId;
 }
 
+/** The newest run recorded for this node + checkout directory (ledger order independent), if any. */
+export function latestRunFor(runs: LedgerEntry[], nodeNames: string[], cwd: string): LedgerEntry | undefined {
+  return runs
+    .filter((r) => nodeNames.includes(r.node) && r.cwd === cwd && r.state !== "discarded")
+    .sort((a, b) => (a.startedAt < b.startedAt ? 1 : a.startedAt > b.startedAt ? -1 : 0))[0];
+}
+
+export interface SyncGate {
+  allow: boolean;
+  /** Why the sync is refused, or a caution to surface alongside an allowed one. */
+  reason?: string;
+  runId?: string;
+  verified: boolean | null;
+}
+
+/**
+ * Whether the work on a node may be published (issue #65): a run whose
+ * verification gate FAILED (`verified === false`, state failed-verification) is
+ * refused unless the operator overrides; an unknown outcome (`null`: no gate was
+ * configured, or no run is recorded) is allowed with a caution, or refused when
+ * the operator requires verified work. Never silently treats null as true.
+ */
+export function syncGate(entry: LedgerEntry | undefined, opts: { allowUnverified?: boolean; requireVerified?: boolean }): SyncGate {
+  if (!entry) {
+    return opts.requireVerified && !opts.allowUnverified
+      ? { allow: false, verified: null, reason: "sync.requireVerified is set and no fleet run is recorded for this node and checkout, so there is no verification to rely on (pass allowUnverified to override)" }
+      : { allow: true, verified: null, reason: "no fleet run is recorded for this node and checkout; the work is unverified" };
+  }
+  const failed = entry.verified === false || entry.state === "failed-verification";
+  if (failed) {
+    return opts.allowUnverified
+      ? { allow: true, verified: false, runId: entry.runId, reason: `overridden: run ${entry.runId} FAILED its verification gate` }
+      : { allow: false, verified: false, runId: entry.runId, reason: `run ${entry.runId} failed its verification gate (see fleet_run_status verifyDetails); refusing to publish unverified work. Fix it, or pass allowUnverified: true to override` };
+  }
+  if (entry.verified === true) return { allow: true, verified: true, runId: entry.runId };
+  return opts.requireVerified && !opts.allowUnverified
+    ? { allow: false, verified: null, runId: entry.runId, reason: `sync.requireVerified is set and run ${entry.runId} has no verification result (dispatch with expect/spec.verify, or pass allowUnverified)` }
+    : { allow: true, verified: null, runId: entry.runId, reason: `run ${entry.runId} has no verification result; the work is unverified` };
+}
+
+/** A recipe outcome never reports success for a run whose gate failed or whose process failed. */
+export function recipeSuccess(reported: boolean, entry: LedgerEntry | undefined): { success: boolean; overridden: boolean } {
+  if (!reported || !entry) return { success: reported, overridden: false };
+  const bad = entry.verified === false || entry.state === "failed-verification" || entry.state === "failed";
+  return bad ? { success: false, overridden: true } : { success: true, overridden: false };
+}
+
 // Writers to the same ledger file are serialized in-process: fan-out dispatch
 // upserts concurrently, and an unserialized read-modify-write loses updates
 // (and raced on a shared temp file name).
