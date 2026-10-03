@@ -182,7 +182,25 @@ export default definePluginEntry({
         type: "object",
         additionalProperties: false,
         properties: {
-          prompt: { type: "string", description: "The coding task / goal for OpenCode." },
+          prompt: { type: "string", description: "The coding task / goal for OpenCode. Optional when `spec` is given (issue #65): a spec-rendered prompt replaces it and this field is ignored." },
+          spec: {
+            type: "object",
+            additionalProperties: false,
+            description: "Structured task spec (issue #65 slice 1) — the dispatch unit with an explicit goal, acceptance criteria and verify gate. When given, the engine prompt is RENDERED from goal + acceptance (goal on the first line, then an 'Acceptance criteria:' bullet list; the flat `prompt` is ignored) and spec.verify maps onto the SAME post-run verification gate as the flat `expect` param (same parser, same node evaluator, same ledger shape). A prompt-only call behaves exactly as before.",
+            properties: {
+              goal: { type: "string", description: "The task goal — the first line of the rendered engine prompt." },
+              acceptance: { type: "array", items: { type: "string" }, description: "Acceptance criteria, rendered as a bullet list under 'Acceptance criteria:'." },
+              verify: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+        //  paths are treated as relative to the run cwd.
+                  command: { type: "string", description: "Verification command run in the run cwd after the worker exits; must exit 0 — same semantics as expect.command. Bounded to 120s." },
+                },
+                description: "Post-run verification gate — mapped onto the existing `expect` gate (issue #62/#40). Absent => no gate, nothing extra is emitted.",
+              },
+            },
+          },
           cwd: { type: "string", description: "Working directory on the target node(s)." },
           nodes: {
             type: "array",
@@ -224,11 +242,11 @@ export default definePluginEntry({
             },
           },
         },
-        required: ["prompt", "cwd"],
+        required: ["cwd"],
       },
-      execute: async (toolCallId, params, signal) => {
-        const p = params as {
-          prompt: string;
+      execute: async (toolCallId, rawParams, signal) => {
+        const raw = rawParams as {
+          prompt?: string;
           cwd: string;
           nodes?: string[];
           node?: string;
@@ -244,6 +262,7 @@ export default definePluginEntry({
           async?: boolean;
           env?: Record<string, string>;
           expect?: { files?: string[]; command?: string };
+          spec?: { goal: string; acceptance?: string[]; verify?: { files?: string[]; command?: string } };
           ref?: { branch?: string; commit?: string };
           requires?: {
             gpu?: boolean;
@@ -253,6 +272,23 @@ export default definePluginEntry({
             models?: string[];
           };
         };
+        // Issue #65 slice 1: a structured task spec (goal / acceptance / verify) is
+        // the dispatch unit. When given, `prompt` is optional and IGNORED — the
+        // engine prompt is RENDERED from goal + acceptance (renderSpec), and the
+        // spec rides the ledger entry. When only `prompt` is given, this whole
+        // block reduces to today's behavior: raw.prompt passes through verbatim
+        // (renderSpec({ goal: prompt }) === prompt) and every emitted string is
+        // byte-identical. Neither prompt nor spec => refuse; a dispatch without a
+        // task is exactly the empty-session failure mode #22 closed.
+        const { parseTaskSpec, renderSpec } = await import("./spec.js");
+        const specCheck = parseTaskSpec(raw.spec);
+        if (!specCheck.ok) {
+          return jsonResult({ ok: false, error: specCheck.error });
+        }
+        if (!specCheck.spec && typeof raw.prompt !== "string") {
+          return jsonResult({ ok: false, error: "no task given: pass `prompt`, or a structured `spec` with at least a goal (issue #65)" });
+        }
+        const p = { ...raw, prompt: specCheck.spec ? renderSpec(specCheck.spec) : (raw.prompt as string) };
         const list = await api.runtime.nodes.list();
         const nodes = list.nodes ?? [];
         const fleet = (await import("./membership.js")).resolveFleetNodes(nodes, cfg);
@@ -317,7 +353,15 @@ export default definePluginEntry({
         // Issue #62: validate the optional verification gate up front so a
         // malformed spec is a clear refusal, never a silently-dropped gate.
         const { parseExpectSpec, withVerified, relayTimeoutWithGate } = await import("./verify.js");
-        const expectSpec = parseExpectSpec(p.expect);
+        // Issue #65: with a structured spec the gate comes from spec.verify,
+        // mapped onto the SAME machinery: same parser here, same node-side
+        // evaluator (evaluateExpect / the launcher gate script), same ledger
+        // shape. No verify (and no expect) => expect stays undefined and
+        // nothing extra is emitted anywhere. When spec is given it is the
+        // dispatch unit, so its verify supersedes a flat `expect`.
+        const expectSpec = specCheck.spec
+          ? parseExpectSpec(specCheck.spec.verify)
+          : parseExpectSpec(p.expect);
         if (!expectSpec.ok) {
           return jsonResult({ ok: false, error: `invalid expect: ${expectSpec.error}` });
         }
@@ -419,6 +463,10 @@ export default definePluginEntry({
             startedAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),
             state: "running" as const,
+            // Issue #65: record the run's spec on the ledger. Absent (key not
+            // materialized) for prompt-only dispatches — the entry is
+            // byte-identical to today's when no spec was given.
+            ...(specCheck.spec ? { spec: specCheck.spec } : {}),
           };
           await upsertRun(rootDir, ledgerEntry);
           // Issue #6: default to DETACHED execution. The node returns a run

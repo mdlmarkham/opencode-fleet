@@ -13,6 +13,7 @@
 import { randomUUID } from "node:crypto";
 import { readFile, writeFile, rename, mkdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import type { TaskSpec } from "./spec.js";
 import { shq } from "./shell.js";
 import { interpretLiveness } from "./recovery.js";
 import { SSH_ARGS, sshPrefix } from "./ssh.js";
@@ -55,6 +56,10 @@ export interface LedgerEntry {
   /** Env var NAMES dispatched with (values never stored in the ledger). */
   env?: string[];
   ref?: { branch?: string; commit?: string };
+  /** The structured task spec the run was dispatched with (issue #65 slice 1).
+   *  Absent for prompt-only dispatches (backward compatible: the key is not
+   *  materialized when no spec was given). */
+  spec?: TaskSpec;
 }
 
 const LEDGER_FILE = "fleet-runs.json";
