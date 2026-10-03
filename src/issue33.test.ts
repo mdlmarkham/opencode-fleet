@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { syncFromNode } from "./provision.js";
 import {
-  countSecretLines, evaluateChange, isSafeBranchName, resolveDestination, resolvePolicy, sensitivePaths,
+  countSecretLines, evaluateChange, globToRegex, isSafeBranchName, resolveDestination, resolvePolicy, sensitivePaths,
 } from "./syncpolicy.js";
 
 const git = (cwd: string, ...args: string[]) =>
@@ -44,10 +44,10 @@ describe("issue #33: pure policy", () => {
     ]);
   });
   it("secret scan looks at added lines only and never echoes the secret", () => {
-    const diff = ["--- a/f", "+++ b/f", "-token=ghp_abcdefghijklmnopqrstuvwxyz0123456789", "+const ok = 1;"].join("\n");
+    const diff = ["diff --git a/f b/f", "--- a/f", "+++ b/f", "@@ -1 +1 @@", "-token=ghp_abcdefghijklmnopqrstuvwxyz0123456789", "+const ok = 1;"].join("\n");
     expect(countSecretLines(diff)).toBe(0);
     expect(countSecretLines(diff + "\n+key = ghp_abcdefghijklmnopqrstuvwxyz0123456789")).toBe(1);
-    const r = evaluateChange(["f"], "+x = ghp_abcdefghijklmnopqrstuvwxyz0123456789", pol);
+    const r = evaluateChange(["f"], "@@ -0,0 +1 @@\n+x = ghp_abcdefghijklmnopqrstuvwxyz0123456789", pol);
     expect(r.ok).toBe(false);
     expect(JSON.stringify(r)).not.toContain("ghp_abcdef");
   });
@@ -147,6 +147,50 @@ describe("issue #33: end-to-end against real git repos", () => {
       const r = await h.run(undefined, "--upload-pack=evil");
       expect(r.ok).toBe(false);
       expect(r.error).toMatch(/unsafe/);
+    } finally { h.cleanup(); }
+  });
+});
+
+describe("issue #33: review follow-ups", () => {
+  it("the redirect target is never itself a protected branch", () => {
+    const pol = resolvePolicy({ protectedBranches: ["main", "fleet/feature/x"] });
+    const d = resolveDestination("main", "feature/x", "sync-1", pol);
+    expect(d.redirectedFrom).toBe("main");
+    expect(pol.protectedBranches.includes(d.branch)).toBe(false);
+    expect(isSafeBranchName(d.branch)).toBe(true);
+    // an explicitly allowed fleet/* name is fine to use
+    const allowed = resolvePolicy({ protectedBranches: ["main", "fleet/feature/x"], allowDirectPush: ["fleet/feature/x"] });
+    expect(resolveDestination("main", "feature/x", "sync-1", allowed).branch).toBe("fleet/feature/x");
+  });
+  it("an added line starting with '++' is scanned (it is not a '+++' file header)", () => {
+    const diff = ["diff --git a/f b/f", "--- a/f", "+++ b/f", "@@ -0,0 +1 @@", "+++ghp_abcdefghijklmnopqrstuvwxyz0123456789"].join("\n");
+    expect(countSecretLines(diff)).toBe(1);
+  });
+  it("a PEM private key is caught line by line (header alone is enough)", () => {
+    const diff = ["diff --git a/k b/k", "@@ -0,0 +3 @@", "+-----BEGIN RSA PRIVATE KEY-----", "+MIIBOgIBAAJBAK", "+-----END RSA PRIVATE KEY-----"].join("\n");
+    expect(countSecretLines(diff)).toBeGreaterThanOrEqual(1);
+  });
+  it("file headers and removed lines never count", () => {
+    const diff = ["diff --git a/f b/f", "--- a/ghp_abcdefghijklmnopqrstuvwxyz0123456789", "+++ b/f", "@@ -1 +1 @@", "-ghp_abcdefghijklmnopqrstuvwxyz0123456789", "+ok"].join("\n");
+    expect(countSecretLines(diff)).toBe(0);
+  });
+  it("operator-configured sensitive globs extend the built-ins", () => {
+    const pol = resolvePolicy({ sensitivePaths: ["ci/**", "deploy/*.sh", "Makefile"] });
+    const files = ["ci/a/b.yml", "deploy/x.sh", "deploy/sub/x.sh", "Makefile", "src/a.ts", ".github/workflows/w.yml"];
+    expect(sensitivePaths(files, pol.sensitivePaths)).toEqual(["ci/a/b.yml", "deploy/x.sh", "Makefile", ".github/workflows/w.yml"]);
+    expect(evaluateChange(["ci/a.yml"], "", pol).ok).toBe(false);
+    expect(globToRegex("a.b").test("aXb")).toBe(false);
+  });
+});
+
+describe("issue #33: binary files do not hide secrets (real git)", () => {
+  it("a token inside a file git treats as binary is still caught", async () => {
+    const h = harness({ workerBranch: "feature/bin", files: { "blob.dat": "ghp_abcdefghijklmnopqrstuvwxyz0123456789\u0000\u0001binary" } });
+    try {
+      const r = await h.run();
+      expect(r.ok).toBe(false);
+      expect(r.commit).toBe("policy-refused");
+      expect(h.originRef("feature/bin")).toBe("");
     } finally { h.cleanup(); }
   });
 });

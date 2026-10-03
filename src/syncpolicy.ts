@@ -23,12 +23,15 @@ export interface SyncPolicy {
   allowDirectPush: string[];
   /** Allow changes to CI/CODEOWNERS paths. Default false. */
   allowSensitivePaths: boolean;
+  /** Extra path globs treated as sensitive, in addition to the built-in list (`*` within a segment, `**` across). */
+  sensitivePaths: string[];
 }
 
 export const DEFAULT_SYNC_POLICY: SyncPolicy = {
   protectedBranches: ["main", "master"],
   allowDirectPush: [],
   allowSensitivePaths: false,
+  sensitivePaths: [],
 };
 
 export function resolvePolicy(cfg?: Partial<SyncPolicy>): SyncPolicy {
@@ -36,6 +39,7 @@ export function resolvePolicy(cfg?: Partial<SyncPolicy>): SyncPolicy {
     protectedBranches: cfg?.protectedBranches ?? DEFAULT_SYNC_POLICY.protectedBranches,
     allowDirectPush: cfg?.allowDirectPush ?? DEFAULT_SYNC_POLICY.allowDirectPush,
     allowSensitivePaths: cfg?.allowSensitivePaths === true,
+    sensitivePaths: cfg?.sensitivePaths ?? [],
   };
 }
 
@@ -79,7 +83,12 @@ export function resolveDestination(
     .map((seg) => seg.replace(/^[-.]+/, "").replace(/\.+$/, ""))
     .filter(Boolean)
     .join("/");
-  const branch = `fleet/${safe || label}`.replace(/\.lock$/, "-lock");
+  // The redirect target must itself be unprotected (an operator may list
+  // fleet/* names), unless that exact name is explicitly allowed.
+  const open = (b: string) => !policy.protectedBranches.includes(b) || policy.allowDirectPush.includes(b);
+  const candidates = [`fleet/${safe || label}`, `fleet/sync/${safe || label}`, `fleet/redirect/${label}`].map((b) => b.replace(/\.lock$/, "-lock"));
+  const branch = candidates.find(open);
+  if (!branch) return { branch: `fleet/redirect/${label}-${Date.now()}`, redirectedFrom: requested };
   return { branch, redirectedFrom: requested };
 }
 
@@ -95,15 +104,38 @@ const SENSITIVE_PATHS: RegExp[] = [
   /^azure-pipelines\.ya?ml$/,
 ];
 
-export function sensitivePaths(files: string[]): string[] {
-  return files.filter((f) => SENSITIVE_PATHS.some((re) => re.test(f)));
+/** Convert a path glob (`*` within a segment, `**` across segments, `?` one char) to an anchored regex. */
+export function globToRegex(glob: string): RegExp {
+  let re = "";
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i];
+    if (c === "*") {
+      if (glob[i + 1] === "*") { re += ".*"; i++; if (glob[i + 1] === "/") i++; }
+      else re += "[^/]*";
+    } else if (c === "?") re += "[^/]";
+    else re += c.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+  }
+  return new RegExp(`^${re}$`);
 }
 
-/** Added lines (from a unified diff) that contain credential-shaped text. Returns count only — never the secret. */
+export function sensitivePaths(files: string[], extra: string[] = []): string[] {
+  const extraRe = extra.map(globToRegex);
+  return files.filter((f) => SENSITIVE_PATHS.some((re) => re.test(f)) || extraRe.some((re) => re.test(f)));
+}
+
+/**
+ * Added lines (from a unified diff) that contain credential-shaped text.
+ * Returns the count only, never the secret. Lines are only counted inside a
+ * hunk, so added content that itself begins with "++" (a `+++` diff line) is
+ * not mistaken for a file header.
+ */
 export function countSecretLines(diff: string): number {
   let n = 0;
+  let inHunk = false;
   for (const line of diff.split("\n")) {
-    if (!line.startsWith("+") || line.startsWith("+++")) continue;
+    if (line.startsWith("diff --git ")) { inHunk = false; continue; }
+    if (line.startsWith("@@")) { inHunk = true; continue; }
+    if (!inHunk || !line.startsWith("+")) continue;
     if (redactSecrets(line) !== line) n++;
   }
   return n;
@@ -114,7 +146,7 @@ export type PushCheck = { ok: true } | { ok: false; error: string; detail: strin
 /** Evaluate the changed files and added lines against the policy. */
 export function evaluateChange(files: string[], diff: string, policy: SyncPolicy): PushCheck {
   if (!policy.allowSensitivePaths) {
-    const hits = sensitivePaths(files);
+    const hits = sensitivePaths(files, policy.sensitivePaths);
     if (hits.length) {
       return {
         ok: false,

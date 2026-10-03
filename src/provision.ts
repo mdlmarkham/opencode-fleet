@@ -373,8 +373,8 @@ export async function syncFromNode(
     }
     const d = resolveDestination(requested, workerBranch, `sync-${Date.now()}`, policy);
     const range = `origin/${base}...${bundleRef}`;
-    const { stdout: names } = await execFileP("git", ["-C", cloneDir, "diff", "--name-only", range], { timeout: 60_000, maxBuffer: 16 * 1024 * 1024 });
-    const { stdout: diff } = await execFileP("git", ["-C", cloneDir, "diff", "--unified=0", range], { timeout: 60_000, maxBuffer: 64 * 1024 * 1024 });
+    const { stdout: names } = await execFileP("git", ["-C", cloneDir, "diff", "--no-ext-diff", "--name-only", range], { timeout: 60_000, maxBuffer: 16 * 1024 * 1024 });
+    const { stdout: diff } = await execFileP("git", ["-C", cloneDir, "diff", "--text", "--no-textconv", "--no-ext-diff", "--unified=0", range], { timeout: 60_000, maxBuffer: 64 * 1024 * 1024 });
     const check = evaluateChange(names.split("\n").filter(Boolean), diff, policy);
     if (!check.ok) {
       return { refused: { ok: false, cwd, branch: d.branch, workerBranch, commit: "policy-refused", synced: false, error: check.error, detail: check.detail } };

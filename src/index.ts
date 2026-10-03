@@ -56,7 +56,7 @@ interface FleetConfig {
   /** Operator switch: let fleet_provision `setup` be an arbitrary shell command, not just a repo script (default false). */
   allowSetupCommands?: boolean;
   /** fleet_sync publish policy (issue #33). */
-  sync?: { protectedBranches?: string[]; allowDirectPush?: string[]; allowSensitivePaths?: boolean };
+  sync?: { protectedBranches?: string[]; allowDirectPush?: string[]; allowSensitivePaths?: boolean; sensitivePaths?: string[] };
   /** Dispatch env refinements: allowOnly makes injection allowlist-only; extraDeny adds refused names. */
   env?: { allowOnly?: string[]; extraDeny?: string[] };
 }
@@ -109,6 +109,7 @@ export default definePluginEntry({
           protectedBranches: { type: "array", items: { type: "string" }, default: ["main", "master"] },
           allowDirectPush: { type: "array", items: { type: "string" }, default: [] },
           allowSensitivePaths: { type: "boolean", default: false, description: "Allow worker changes to CI/CODEOWNERS paths." },
+          sensitivePaths: { type: "array", items: { type: "string" }, default: [], description: "Extra path globs treated as sensitive (e.g. ci/**), added to the built-in list." },
         },
       },
       allowSetupCommands: {

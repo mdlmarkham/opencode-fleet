@@ -122,6 +122,14 @@
             "type": "boolean",
             "default": false,
             "description": "Allow worker changes to CI/CODEOWNERS paths."
+          },
+          "sensitivePaths": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [],
+            "description": "Extra path globs treated as sensitive (e.g. ci/**), added to the built-in list."
           }
         }
       }
