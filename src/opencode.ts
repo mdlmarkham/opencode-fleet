@@ -187,7 +187,7 @@ export function buildOpenCodeCommand(task: OpenCodeTask): string {
   if (task.harness === "pi") {
     // Issue #30 finding B: the opencode `model` value must NEVER be forwarded
     // to Pi (different ref format). Issue #44: and there is no built-in model.
-    const piModel = task.piModel;
+    const piModel = task.piModel?.trim();
     if (!piModel) throw new Error("harness=pi requires piModel (provider/id); there is no built-in default");
     // Issue #30 finding C (VALIDATED LIVE on dev2, pi 0.73.1 as svcuser):
     // pi does NOT support `--` (`Error: Unknown option: --`), and a positional

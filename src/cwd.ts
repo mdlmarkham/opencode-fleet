@@ -32,10 +32,25 @@ export function resolveFleetRoot(
   cfg: { fleetRoot?: string },
   serviceUsers: Array<string | undefined> = [],
 ): string | undefined {
-  if (cfg.fleetRoot?.trim()) return cfg.fleetRoot.trim();
+  const configured = cfg.fleetRoot?.trim();
+  if (configured) {
+    const bad = invalidFleetRoot(configured);
+    if (bad) throw new Error(`invalid fleetRoot ${JSON.stringify(configured)}: ${bad}`);
+    return configured.replace(/\/+$/, "");
+  }
   const users = new Set(serviceUsers);
   const only = users.size === 1 ? [...users][0] : undefined;
-  return only && only !== "root" ? `/home/${only}/${FLEET_DIRNAME}` : undefined;
+  return only && only !== "root" && /^[A-Za-z_][A-Za-z0-9._-]*$/.test(only) ? `/home/${only}/${FLEET_DIRNAME}` : undefined;
+}
+
+/** Why a configured fleet root is unusable, or undefined when it is fine. */
+export function invalidFleetRoot(root: string): string | undefined {
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x1f\x7f]/.test(root)) return "contains control characters";
+  if (!root.startsWith("/")) return "must be an absolute path (a relative root would resolve against the SSH login directory)";
+  if (root.replace(/\/+$/, "") === "") return "must not be the filesystem root";
+  if (root.split("/").includes("..")) return "must not contain '..' segments";
+  return undefined;
 }
 
 /** Quote a string for safe use as a single POSIX shell argument. */

@@ -684,7 +684,9 @@ export default definePluginEntry({
         const harnessCheck = validateHarnessTransport({ harness: p.harness, transport });
         if (!harnessCheck.ok) return jsonResult({ ok: false, harness: harnessCheck.harness, error: harnessCheck.error });
         // No built-in Pi model: a dispatch must name one, or the operator must configure a default.
-        const piModel = p.harness === "pi" ? (p.piModel ?? cfg.piDefaultModel) : p.piModel;
+        // Whitespace-only counts as missing, so a blank per-call value falls back to the configured default.
+        const clean = (v?: string) => v?.trim() || undefined;
+        const piModel = p.harness === "pi" ? (clean(p.piModel) ?? clean(cfg.piDefaultModel)) : clean(p.piModel);
         if (p.harness === "pi" && !piModel) {
           return jsonResult({ ok: false, harness: "pi", error: "harness=pi needs a model: pass piModel (provider/id) or set piDefaultModel in the plugin config" });
         }
@@ -739,13 +741,15 @@ export default definePluginEntry({
             ?? (node as { member?: { user?: string } }).member?.user;
           const loginUser = (node as { member?: { user?: string } }).member?.user;
           const sshHost = loginUser ? `${loginUser}@${nodeKey}` : nodeKey;
+          let exampleRoot: string | undefined;
+          try { exampleRoot = resolveFleetRoot(cfg, [svcUser]); } catch { /* a bad fleetRoot is reported by provisioning */ }
           if (looksWorkerInaccessible(p.cwd, svcUser)) {
             results[nodeKey] = {
               ok: false,
               error:
                 `refusing to dispatch: cwd ${p.cwd} is unusable — it is not traversable by the worker principal` +
                 `${svcUser ? ` (${svcUser})` : ""} (a /root path is mode 0700 and cannot be entered by a non-root service user). ` +
-                `Provision/dispatch under a workspace both principals share${resolveFleetRoot(cfg, [svcUser]) ? `, e.g. ${defaultFleetCwd("your-repo", resolveFleetRoot(cfg, [svcUser])!)}` : ""}.`,
+                `Provision/dispatch under a workspace both principals share${exampleRoot ? `, e.g. ${defaultFleetCwd("your-repo", exampleRoot)}` : ""}.`,
             };
             continue;
           }
@@ -1578,7 +1582,16 @@ export default definePluginEntry({
         if (!targets.length) {
           return jsonResult(`No fleet nodes found. Paired nodes: ${nodes.map((n) => n.displayName ?? n.nodeId).join(", ") || "none"}. Configure \`nodes\` (or \`nodePrefixes\`) in the plugin config.`);
         }
-        const fleetRoot = resolveFleetRoot(cfg, targets.map((n) => (n as { member?: { serviceUser?: string } }).member?.serviceUser));
+        // The worker principal is serviceUser, defaulting to the login user (same rule as dispatch/deploy).
+        let fleetRoot: string | undefined;
+        try {
+          fleetRoot = resolveFleetRoot(cfg, targets.map((n) => {
+            const m = (n as { member?: { serviceUser?: string; user?: string } }).member;
+            return m?.serviceUser ?? m?.user;
+          }));
+        } catch (e) {
+          return jsonResult({ ok: false, error: (e as Error).message });
+        }
         const targetCwd = p.cwd ?? (fleetRoot ? defaultFleetCwd(p.repo, fleetRoot) : undefined);
         if (!targetCwd) {
           return jsonResult({ ok: false, error: "no cwd given and no fleet root known: pass cwd, set fleetRoot in the plugin config, or give every target node the same serviceUser" });
