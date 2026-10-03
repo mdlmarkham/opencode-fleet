@@ -65,6 +65,8 @@ export interface OpenCodeTask {
    * `ok` (process exit status); absent spec => verified null, no behavior change.
    */
   expect?: FleetExpect;
+  /** Issue #65 slice 2: advisory file scope; the node reports changed files outside it. */
+  scope?: { files: string[] };
   /** Fleet run id — enables detached execution + durable completion record. */
   runId?: string;
   /** Detached execution (default true): node returns immediately with a run handle. */
