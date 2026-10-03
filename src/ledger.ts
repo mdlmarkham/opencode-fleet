@@ -35,6 +35,8 @@ export interface LedgerEntry {
   startedAt: string;
   updatedAt: string;
   state: RunState;
+  /** Process exit status of the worker, when known (issue #37). */
+  exitCode?: number;
   summary?: string;
   sessionId?: string;
   handRaised?: boolean;
@@ -70,14 +72,74 @@ export async function saveLedger(rootDir: string, runs: LedgerEntry[]): Promise<
   await rename(tmp, p);
 }
 
-export async function upsertRun(rootDir: string, entry: LedgerEntry): Promise<void> {
-  const runs = await loadLedger(rootDir);
-  const i = runs.findIndex((r) => r.runId === entry.runId);
-  if (i >= 0) runs[i] = entry;
-  else runs.push(entry);
-  // Cap the ledger at 200 most recent runs.
-  const capped = runs.sort((a, b) => (a.startedAt < b.startedAt ? 1 : -1)).slice(0, 200);
-  await saveLedger(rootDir, capped);
+/**
+ * Terminal states: only these are subject to the retention cap. `timed-out` is
+ * deliberately NOT terminal: a relay timeout does not mean the worker stopped
+ * (fleet_resume treats it as incomplete), so its recovery record is kept until
+ * the run is reconciled to completed/failed/discarded.
+ */
+const TERMINAL: ReadonlySet<RunState> = new Set(["completed", "failed", "discarded"]);
+
+/** How many terminal runs to keep. In-flight (`running`) entries are never evicted. */
+export const LEDGER_TERMINAL_CAP = 200;
+
+/** Apply the retention policy: keep every non-terminal run plus the most recent terminal ones. */
+export function capLedger(runs: LedgerEntry[], cap = LEDGER_TERMINAL_CAP): LedgerEntry[] {
+  const newestFirst = [...runs].sort((a, b) => (a.startedAt < b.startedAt ? 1 : -1));
+  let terminalSeen = 0;
+  return newestFirst.filter((r) => {
+    if (!TERMINAL.has(r.state)) return true;
+    return ++terminalSeen <= cap;
+  });
+}
+
+// Writers to the same ledger file are serialized in-process: fan-out dispatch
+// upserts concurrently, and an unserialized read-modify-write loses updates
+// (and raced on a shared temp file name).
+const locks = new Map<string, Promise<unknown>>();
+
+function withLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
+  const prev = locks.get(path) ?? Promise.resolve();
+  const next = prev.catch(() => undefined).then(fn);
+  locks.set(path, next);
+  const clear = () => { if (locks.get(path) === next) locks.delete(path); };
+  next.then(clear, clear);
+  return next;
+}
+
+export function upsertRun(rootDir: string, entry: LedgerEntry): Promise<void> {
+  return withLock(ledgerPath(rootDir), async () => {
+    const runs = await loadLedger(rootDir);
+    const i = runs.findIndex((r) => r.runId === entry.runId);
+    if (i >= 0) runs[i] = entry;
+    else runs.push(entry);
+    await saveLedger(rootDir, capLedger(runs));
+  });
+}
+
+export interface DispatchOutcome {
+  timedOut: boolean;
+  /** The silent-death reconcile already recorded this run as failed. */
+  reconciledDead: boolean;
+  parsed: { ok?: boolean; summary?: string; sessionId?: string; handRaised?: boolean; question?: string };
+}
+
+/**
+ * Final ledger entry for a synchronous dispatch: the SAME run with its new
+ * state (startedAt/engine/pid preserved), never a fresh entry, and never
+ * overriding a silent-death failure with timed-out.
+ */
+export function outcomeEntry(base: LedgerEntry, o: DispatchOutcome, now: string = new Date().toISOString()): LedgerEntry {
+  const state: RunState = o.reconciledDead ? "failed" : o.timedOut ? "timed-out" : o.parsed.ok === false ? "failed" : "completed";
+  return {
+    ...base,
+    updatedAt: now,
+    state,
+    summary: o.reconciledDead ? "run died without completion record (silent death)" : o.parsed.summary,
+    sessionId: o.parsed.sessionId,
+    handRaised: o.parsed.handRaised,
+    question: o.parsed.question,
+  };
 }
 
 export function newRunId(): string {

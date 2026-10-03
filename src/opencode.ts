@@ -2,9 +2,9 @@
  * OpenCode driver — runs OpenCode on a node via the `opencode.run` node command.
  *
  * Two transports:
- *  - "http":  `opencode serve` (headless HTTP server) + `opencode run --attach`
- *             Best for fire-and-forget batch dispatch. Mirrors the legacy
- *             OpenCodeFleet HTTP approach.
+ *  - "http":  `opencode run --format json` (one-shot, detached by the dispatcher).
+ *             Best for fire-and-forget batch dispatch. (Historically named for the
+ *             `opencode serve` + `--attach` design; the code never used `serve`.)
  *  - "acp":   `opencode acp` (ACP stdio server). Mirrors the Codex
  *             paired-device placement pattern. Best for interactive/steerable
  *             sessions.
@@ -70,6 +70,8 @@ export interface OpenCodeTask {
   chunks?: Array<{ index: number; data: string }>;
   /** Expected chunk index for ordered node-channel transfer. */
   chunkIndex?: number;
+  /** Expected sha256 (hex) of the decoded bundle for __UNPACK__ (channel path). */
+  sha256?: string;
   /** Commit SHA for __UNPACK__ (channel path). */
   commit?: string;
   /** Internal control flag: abort a running session. */
@@ -102,6 +104,7 @@ export interface OpenCodeRunResult {
 }
 
 import { shq } from "./shell.js";
+import { partitionEnv } from "./policy.js";
 import { redactSecrets, sanitizeQuestion } from "./untrusted.js";
 
 /**
@@ -164,10 +167,11 @@ export function buildOpenCodeCommand(task: OpenCodeTask): string {
   // process (and anything it spawns) sees them. Keys/values are shell-escaped.
   // PATH/HOME/LD_* are deliberately excluded — overriding those on a remote
   // node is a footgun; use the node's own service config for that.
-  const envExports = Object.entries(task.env ?? {})
-    .filter(([k]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(k))
-    .filter(([k]) => !/^(PATH|HOME|LD_PRELOAD|LD_LIBRARY_PATH|SHELL|USER|LOGNAME|PWD|OLDPWD)$/i.test(k))
-    .map(([k, v]) => `export ${k}=${shq(String(v))}`)
+  // Names that execute code or redirect config are filtered by policy.ts; the
+  // gateway refuses a dispatch that names any (see partitionEnv), so reaching
+  // this filter with one means a caller bypassed it — drop, never export.
+  const envExports = Object.entries(partitionEnv(task.env).allowed)
+    .map(([k, v]) => `export ${k}=${shq(v)}`)
     .join("\n");
 
   // Issue #22 bug 1/4: fail closed if we cannot enter the checkout. `cd X || {

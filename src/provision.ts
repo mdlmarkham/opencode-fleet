@@ -22,6 +22,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { shq } from "./shell.js";
 import { SSH_ARGS } from "./ssh.js";
+import { checkSetup } from "./policy.js";
+import { evaluateChange, isSafeBranchName, resolveDestination, resolvePolicy, type SyncPolicy } from "./syncpolicy.js";
 
 const execFileP = promisify(execFile);
 
@@ -74,6 +76,8 @@ export interface ProvisionRequest {
    * environment (e.g. "scripts/setup.sh"). Runs as the node's checkout user.
    */
   setup?: string;
+  /** Operator opt-in: `setup` may be an arbitrary shell command (issue #34). */
+  allowSetupCommands?: boolean;
 }
 
 export interface ProvisionResult {
@@ -105,11 +109,12 @@ export async function createRepoBundle(req: ProvisionRequest): Promise<{
   try {
     const cloneDir = join(work, "repo");
     const branch = req.branch ?? "main";
+    if (!isSafeBranchName(branch)) throw new Error(`unsafe branch name: ${JSON.stringify(branch)}`);
 
     // Clone with manager credentials (uses ambient gh/git auth).
     // Full clone (no --depth) so the bundle carries complete history the
     // worker can traverse.
-    await execFileP("git", ["clone", "--branch", branch, normalizeRepo(req.repo), cloneDir], {
+    await execFileP("git", ["clone", "--branch", branch, "--", normalizeRepo(req.repo), cloneDir], {
       timeout: 300_000,
     });
 
@@ -188,6 +193,7 @@ export async function provisionToNode(
   const transferId = `${Date.now()}`;
   const remoteBundle = `/tmp/fleet-${transferId}.bundle`;
   let shippedViaChannel = false;
+  let bundleSha256: string | undefined;
   try {
     // Ship the bundle via SSH when available; fall back to the node channel
     // (chunked base64 through opencode.run) when SSH is not reachable.
@@ -206,13 +212,29 @@ export async function provisionToNode(
       if (!channelInvoke) throw new Error("channel invoke required for SSH-free provisioning");
       const { chunkBuffer } = await import("./ledger.js");
       const fs = await import("node:fs/promises");
-      const chunks = chunkBuffer(await fs.readFile(bundlePath));
+      const bundleBytes = await fs.readFile(bundlePath);
+      bundleSha256 = (await import("node:crypto")).createHash("sha256").update(bundleBytes).digest("hex");
+      const chunks = chunkBuffer(bundleBytes);
       // One invoke per chunk keeps each message small; the node accumulates.
       for (let i = 0; i < chunks.length; i++) {
-        await channelInvoke(
-          { prompt: "__RECEIVE__", cwd: "/", transport: "http", transferId, chunkIndex: i, chunks: [chunks[i]] },
-          60_000,
-        );
+        // The node accepts each index once (a retry of an accepted chunk is a
+        // no-op), so one retry on a transport error cannot double-append.
+        let lastErr = "";
+        let accepted = false;
+        for (let attempt = 0; attempt < 2 && !accepted; attempt++) {
+          try {
+            const res = (await channelInvoke(
+              { prompt: "__RECEIVE__", cwd: "/", transport: "http", transferId, chunkIndex: i, chunks: [chunks[i]] },
+              60_000,
+            )) as { payload?: unknown };
+            const pl = typeof res?.payload === "string" ? JSON.parse(res.payload) : (res?.payload ?? {});
+            if ((pl as { ok?: boolean }).ok) accepted = true;
+            else lastErr = String((pl as { error?: string }).error ?? "chunk rejected");
+          } catch (e) {
+            lastErr = (e as Error).message;
+          }
+        }
+        if (!accepted) throw new Error(`bundle transfer failed at chunk ${i}/${chunks.length}: ${lastErr}`);
       }
     }
 
@@ -255,7 +277,7 @@ export async function provisionToNode(
     let unpackOut = "";
     if (shippedViaChannel && channelInvoke) {
       const res = (await channelInvoke(
-        { prompt: "__UNPACK__", cwd: req.cwd, transport: "http", transferId, commit: req.commit },
+        { prompt: "__UNPACK__", cwd: req.cwd, transport: "http", transferId, commit: req.commit, sha256: bundleSha256 },
         180_000,
       )) as { payload?: unknown };
       const pl = typeof res?.payload === "string" ? JSON.parse(res.payload) : (res?.payload ?? {});
@@ -275,6 +297,10 @@ export async function provisionToNode(
     // hardcoded. Failures are reported, not swallowed.
     let setupResult: ProvisionResult["setup"];
     if (req.setup && req.setup.trim()) {
+      const setupPolicy = checkSetup(req.setup, req.allowSetupCommands === true);
+      if (!setupPolicy.ok) {
+        return { ok: false, cwd: req.cwd, error: setupPolicy.error, setup: { ran: false, command: req.setup, ok: false, error: setupPolicy.error } };
+      }
       const setupCmd = `cd ${shq(req.cwd)} && (${req.setup}) && echo "---FLEET_SETUP_RC=$?"`;
       try {
         let out = "";
@@ -342,7 +368,37 @@ export async function syncFromNode(
   branch: string,
   prebuilt?: { mode: "from-base64"; base64: string; branch?: string; base?: string; workerBranch?: string; destBranch?: string },
   destBranchPinned?: string,
-): Promise<ProvisionResult & { synced?: boolean; uncommittedFiles?: number; detail?: string }> {
+  syncPolicy?: Partial<SyncPolicy>,
+): Promise<ProvisionResult & { synced?: boolean; uncommittedFiles?: number; detail?: string; redirectedFrom?: string }> {
+  const policy = resolvePolicy(syncPolicy);
+  for (const [kind, v] of [["branch", branch], ["destination branch", destBranchPinned]] as const) {
+    if (v !== undefined && !isSafeBranchName(v)) {
+      return { ok: false, cwd, branch, commit: "refused", synced: false, error: `unsafe ${kind} name: ${JSON.stringify(v)}` };
+    }
+  }
+  // Issue #33: protected destinations are redirected, CI/secret changes refused.
+  // Returns a refusal result, or the destination actually used.
+  const applyPolicy = async (
+    cloneDir: string,
+    workerBranch: string,
+    requested: string,
+    bundleRef: string,
+    base: string,
+  ): Promise<{ refused: ProvisionResult & { synced: boolean; detail?: string } } | { dest: string; redirectedFrom?: string }> => {
+    if (!isSafeBranchName(workerBranch)) {
+      return { refused: { ok: false, cwd, branch: requested, commit: "refused", synced: false, error: `unsafe worker branch name: ${JSON.stringify(workerBranch)}` } };
+    }
+    const d = resolveDestination(requested, workerBranch, `sync-${Date.now()}`, policy);
+    const range = `origin/${base}...${bundleRef}`;
+    const { stdout: names } = await execFileP("git", ["-C", cloneDir, "diff", "--no-ext-diff", "--name-only", range], { timeout: 60_000, maxBuffer: 16 * 1024 * 1024 });
+    const { stdout: diff } = await execFileP("git", ["-C", cloneDir, "diff", "--text", "--no-textconv", "--no-ext-diff", "--unified=0", range], { timeout: 60_000, maxBuffer: 64 * 1024 * 1024 });
+    const check = evaluateChange(names.split("\n").filter(Boolean), diff, policy);
+    if (!check.ok) {
+      return { refused: { ok: false, cwd, branch: d.branch, workerBranch, commit: "policy-refused", synced: false, error: check.error, detail: check.detail } };
+    }
+    return { dest: d.branch, redirectedFrom: d.redirectedFrom };
+  };
+
   // Destination-branch resolution (issue #13, layer 3).
   //
   // `branch` is the CLONE BASE: the branch that exists on origin and that we
@@ -384,9 +440,10 @@ export async function syncFromNode(
       // purpose of sync — so `--branch <worker-branch>` would fail with "Remote
       // branch ... not found in upstream origin". Clone the base, then fetch
       // the worker's refs from the bundle, and push to the RESOLVED destination.
-      await execFileP("git", ["clone", "--branch", branch, normalizeRepo(repo), cloneDir], { timeout: 120_000 });
+      await execFileP("git", ["clone", "--branch", branch, "--", normalizeRepo(repo), cloneDir], { timeout: 120_000 });
       const workerBranch = prebuilt.workerBranch ?? branch;
-      const destBranch = chooseDest(workerBranch, prebuilt.destBranch);
+      let destBranch = chooseDest(workerBranch, prebuilt.destBranch);
+      let redirectedFrom: string | undefined;
       // Fetch every bundle ref under refs/remotes/bundler/* so we can push the
       // worker's actual branch even when it is not the destination branch.
       await execFileP("git", ["-C", cloneDir, "fetch", localBundle,
@@ -404,6 +461,12 @@ export async function syncFromNode(
           error: `worker bundle did not contain branch "${workerBranch}"`,
           detail: "refusing to report success when the worker branch is absent from the bundle (fail-closed)",
         };
+      }
+      {
+        const applied = await applyPolicy(cloneDir, workerBranch, destBranch, bundleRef, branch);
+        if ("refused" in applied) return { ...applied.refused, viaChannel: true };
+        destBranch = applied.dest;
+        redirectedFrom = applied.redirectedFrom;
       }
       // Record the destination's current head BEFORE pushing, so we can tell a
       // real push from a no-op. A destination branch that does not exist yet is
@@ -470,6 +533,7 @@ export async function syncFromNode(
         workerBranch,
         commit: "pushed",
         synced: true,
+        ...(redirectedFrom ? { redirectedFrom } : {}),
         viaChannel: true,
         detail: "synced via node channel",
       };
@@ -601,7 +665,7 @@ export async function syncFromNode(
     // worker's own branch usually does NOT exist remotely yet — creating it is
     // the purpose of sync — so `--branch <worker-branch>` fails. Clone the
     // destination branch, then fetch the worker's refs from the bundle.
-    await execFileP("git", ["clone", "--branch", branch, normalizeRepo(repo), cloneDir], { timeout: 120_000 });
+    await execFileP("git", ["clone", "--branch", branch, "--", normalizeRepo(repo), cloneDir], { timeout: 120_000 });
     // Detect the worker's checked-out branch (its work often lives on a feature
     // branch, not `main`); fall back to the destination branch when HEAD is
     // detached or unavailable.
@@ -637,7 +701,17 @@ export async function syncFromNode(
     // pinned destination when the caller provided one; otherwise publish the
     // worker's own branch when it differs from the clone base, so feature-branch
     // work stays reviewable rather than being forced onto `main`.
-    const destBranch = chooseDest(workerBranch, destBranchPinned);
+    let destBranch = chooseDest(workerBranch, destBranchPinned);
+    let redirectedFrom: string | undefined;
+    {
+      const applied = await applyPolicy(cloneDir, workerBranch, destBranch, bundleRef, branch);
+      if ("refused" in applied) {
+        await execFileP("ssh", [...SSH_ARGS, nodeHost, `rm -f ${shq(remoteBundle)}`], { timeout: 30_000 }).catch(() => {});
+        return applied.refused;
+      }
+      destBranch = applied.dest;
+      redirectedFrom = applied.redirectedFrom;
+    }
     // Record the destination's current head BEFORE pushing, so we can tell a
     // real push from a no-op. A destination branch that does not exist yet is
     // NOT an error — creating it remotely is the whole point of sync — so a
@@ -717,10 +791,11 @@ export async function syncFromNode(
     return {
       ok: true,
       cwd,
-      branch,
+      branch: destBranch,
       workerBranch,
       commit: "pushed",
       synced: true,
+      ...(redirectedFrom ? { redirectedFrom } : {}),
       uncommittedFiles: uncommitted,
       detail: uncommitted > 0
           ? `committed ${uncommitted} uncommitted file(s) on node, then pushed worker branch "${destBranch}"`

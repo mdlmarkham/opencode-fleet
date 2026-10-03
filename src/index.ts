@@ -11,8 +11,12 @@ import {
   type AckRecoveryOutcome,
 } from "./recovery.js";
 import { SSH_ARGS } from "./ssh.js";
+import { createHash } from "node:crypto";
+import { B64_MARKER, MAX_TRANSFER_B64, parseBundleOutput, parseStatusOutput, statusCommand } from "./outputs.js";
+import { acceptChunk, assembleChunks, isCanonicalBase64 } from "./xfer.js";
 import { guardCwd, taskUsesCwd, validateTaskIds } from "./guard.js";
 import { quoteUntrusted, sanitizeQuestion } from "./untrusted.js";
+import { checkSetup, partitionEnv } from "./policy.js";
 import { runPaths, xferPaths, ensureStateDir, writePrivate } from "./paths.js";
 
 /** OpenCode task plus the dispatch watchdog knobs (idle/duration guards). */
@@ -50,6 +54,14 @@ interface FleetConfig {
   nodePrefixes?: string[];
   defaultTimeoutMs?: number;
   apertureUrl?: string;
+  /** Operator switch: let agents pass `autoApprove` on dispatch (default true). */
+  allowAutoApprove?: boolean;
+  /** Operator switch: let fleet_provision `setup` be an arbitrary shell command, not just a repo script (default false). */
+  allowSetupCommands?: boolean;
+  /** fleet_sync publish policy (issue #33). */
+  sync?: { protectedBranches?: string[]; allowDirectPush?: string[]; allowSensitivePaths?: boolean; sensitivePaths?: string[] };
+  /** Dispatch env refinements: allowOnly makes injection allowlist-only; extraDeny adds refused names. */
+  env?: { allowOnly?: string[]; extraDeny?: string[] };
 }
 
 export default definePluginEntry({
@@ -77,6 +89,36 @@ export default definePluginEntry({
         type: "number",
         default: 300000,
         description: "Default timeout for OpenCode runs, ms.",
+      },
+      allowAutoApprove: {
+        type: "boolean",
+        default: true,
+        description: "Allow fleet_dispatch autoApprove (opencode --auto). Set false to forbid it fleet-wide.",
+      },
+      env: {
+        type: "object",
+        additionalProperties: false,
+        description: "Refine the dispatch env policy. Built-in denials (BASH_ENV, NODE_OPTIONS, LD_*, ...) always apply.",
+        properties: {
+          allowOnly: { type: "array", items: { type: "string" }, description: "If set, only these variable names may be injected." },
+          extraDeny: { type: "array", items: { type: "string" }, description: "Additional variable names to refuse." },
+        },
+      },
+      sync: {
+        type: "object",
+        additionalProperties: false,
+        description: "fleet_sync publish policy: protected branches are never pushed directly (work is redirected to fleet/<name>) unless listed in allowDirectPush.",
+        properties: {
+          protectedBranches: { type: "array", items: { type: "string" }, default: ["main", "master"] },
+          allowDirectPush: { type: "array", items: { type: "string" }, default: [] },
+          allowSensitivePaths: { type: "boolean", default: false, description: "Allow worker changes to CI/CODEOWNERS paths." },
+          sensitivePaths: { type: "array", items: { type: "string" }, default: [], description: "Extra path globs treated as sensitive (e.g. ci/**), added to the built-in list." },
+        },
+      },
+      allowSetupCommands: {
+        type: "boolean",
+        default: false,
+        description: "Allow fleet_provision setup to be an arbitrary shell command. Default: repo-relative script path only.",
       },
       apertureUrl: {
         type: "string",
@@ -152,13 +194,10 @@ export default definePluginEntry({
         }
         if (task.prompt === "__STATUS__") {
           // Working-tree state of the checkout (issue #4: manager visibility).
-          const st = await runShell(
-            `cd ${shq(task.cwd)} && git status --porcelain 2>/dev/null | head -50; echo "---COUNT---"; git status --porcelain 2>/dev/null | wc -l`,
-            20_000,
-            context?.signal,
-          );
-          const [files, count] = st.split("---COUNT\\n");
-          return JSON.stringify({ ok: true, cwd: task.cwd, uncommittedCount: parseInt((count ?? "0").trim(), 10) || 0, files: files.trim() });
+          const st = await runShell(statusCommand(shq(task.cwd)), 20_000, context?.signal);
+          const status = parseStatusOutput(st);
+          if (!status.ok) return JSON.stringify({ ok: false, cwd: task.cwd, error: status.error });
+          return JSON.stringify({ ok: true, cwd: task.cwd, uncommittedCount: status.uncommittedCount, files: status.files });
         }
         if (task.prompt === "__RECEIVE__") {
           // Node-channel bundle transfer: accumulate base64 chunks into a
@@ -167,26 +206,36 @@ export default definePluginEntry({
           const transferId = String(task.transferId ?? "t");
           const accDir = xferPaths(transferId).dir;
           await (await import("node:fs/promises")).mkdir(accDir, { recursive: true });
-          const target = join(accDir, "bundle.b64");
-          const expected = parseInt(String(task.chunkIndex ?? ""), 10);
-          const chunks = (task.chunks ?? []).slice();
-          for (const c of chunks) {
-            if (Number.isFinite(expected) && c.index !== expected) {
-              return JSON.stringify({ ok: false, error: `chunk out of order: expected ${expected}, got ${c.index}` });
-            }
-            await (await import("node:fs/promises")).appendFile(target, c.data);
+          const first = (task.chunks ?? [])[0];
+          if (!first) return JSON.stringify({ ok: false, error: "no chunk supplied" });
+          let last: Awaited<ReturnType<typeof acceptChunk>> = { ok: true, received: 0 };
+          for (const c of task.chunks ?? []) {
+            last = await acceptChunk(accDir, c.index, c.data, MAX_TRANSFER_B64);
+            if (!last.ok) return JSON.stringify(last);
           }
-          return JSON.stringify({ ok: true, transferId, appended: chunks.length });
+          return JSON.stringify({ ok: true, transferId, received: last.received });
         }
         if (task.prompt === "__UNPACK__") {
           // Decode accumulated base64 and clone into cwd (SSH-free path).
           const transferId = String(task.transferId ?? "t");
           const accDir = xferPaths(transferId).dir;
-          const accFile = join(accDir, "bundle.b64");
           try {
-            const b64 = await (await import("node:fs/promises")).readFile(accFile, "utf8");
+            // Integrity is mandatory: a direct or malformed request without a
+            // digest must not reach `git clone`.
+            if (typeof task.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(task.sha256)) {
+              return JSON.stringify({ ok: false, error: "sha256 (64 hex chars) required for __UNPACK__" });
+            }
+            const b64 = await assembleChunks(accDir);
+            if (!b64 || !isCanonicalBase64(b64)) {
+              return JSON.stringify({ ok: false, error: "assembled transfer is empty or not canonical base64" });
+            }
             const bundlePath = remoteBundlePath(transferId);
-            await (await import("node:fs/promises")).writeFile(bundlePath, Buffer.from(b64, "base64"));
+            const decoded = Buffer.from(b64, "base64");
+            const got = createHash("sha256").update(decoded).digest("hex");
+            if (got !== task.sha256) {
+              return JSON.stringify({ ok: false, error: `bundle checksum mismatch (expected ${task.sha256.slice(0, 12)}…, got ${got.slice(0, 12)}…); refusing to unpack a corrupted transfer` });
+            }
+            await (await import("node:fs/promises")).writeFile(bundlePath, decoded);
             const unpackCmd = [
               `rm -rf ${shq(task.cwd)}`,
               `mkdir -p ${shq(task.cwd)}`,
@@ -228,18 +277,22 @@ export default definePluginEntry({
               `DIRTY=$(git status --porcelain --untracked-files=all)`,
               `if [ -n "$DIRTY" ]; then git add -A && git -c user.email=fleet-worker@node -c user.name="fleet-worker" commit -q -m "fleet_sync: auto-commit worker working-tree changes before sync"; fi`,
               `git bundle create ${shq(join(accDir, "sync.bundle"))} --all`,
-              `echo "---B64---"`,
+              `git rev-parse HEAD`,
+              `git rev-parse --abbrev-ref HEAD`,
+              `echo "${B64_MARKER}"`,
               `base64 ${shq(join(accDir, "sync.bundle"))}`,
             ].filter(Boolean).join(" && "),
             120_000,
             context?.signal,
           );
-          const [meta, ...b64Lines] = commitOut.split("---B64---\\n");
-          if (!b64Lines.length || !b64Lines.join("").trim()) {
-            return JSON.stringify({ ok: false, error: `bundle failed: ${meta.slice(0, 300)}` });
-          }
-          await (await import("node:fs/promises")).writeFile(join(accDir, "bundle.b64"), b64Lines.join(""));
-          return JSON.stringify({ ok: true, transferId, staged: true, head: meta.trim().slice(-40) });
+          const bundled = parseBundleOutput(commitOut);
+          if (!bundled.ok) return JSON.stringify({ ok: false, error: bundled.error });
+          await (await import("node:fs/promises")).writeFile(join(accDir, "bundle.b64"), bundled.base64);
+          const bundleBytes = await (await import("node:fs/promises")).readFile(join(accDir, "sync.bundle"));
+          return JSON.stringify({
+            ok: true, transferId, staged: true, head: bundled.head, branch: bundled.branch,
+            sha256: createHash("sha256").update(bundleBytes).digest("hex"), bytes: bundleBytes.length,
+          });
         }
         if (task.prompt === "__RUN_START__") {
           // Issue #6: detached execution. The child survives relay timeouts
@@ -536,7 +589,7 @@ export default definePluginEntry({
           maxIdleMs: { type: "number", description: "Kill the run if no output for this long, ms (stuck-loop guard). Default 120000." },
           maxDurationMs: { type: "number", description: "Kill the run if total runtime exceeds this, ms (stuck-loop guard). Default 600000." },
           async: { type: "boolean", description: "Run detached: returns a run handle immediately (runId + pid); the worker survives relay timeouts and its completion is recorded. Poll with fleet_watch or fleet_run_status. Default true." },
-          env: { type: "object", additionalProperties: { type: "string" }, description: "Environment variables for the worker process (per-dispatch environment). PATH/HOME/LD_* are ignored for safety." },
+          env: { type: "object", additionalProperties: { type: "string" }, description: "Environment variables for the worker process (per-dispatch environment). Names that execute code or redirect configuration (PATH, HOME, BASH_ENV, NODE_OPTIONS, LD_*, GIT_SSH*, OPENCODE_CONFIG*, ...) are REFUSED: the dispatch fails and names them. Operators can narrow this further (config env.allowOnly / env.extraDeny)." },
           ref: { type: "object", additionalProperties: false, properties: { branch: { type: "string", description: "Branch to check out before running." }, commit: { type: "string", description: "Commit SHA to check out before running." } }, description: "Git ref to check out before running. Refused if the checkout has uncommitted changes." },
           requires: {
             type: "object",
@@ -619,7 +672,16 @@ export default definePluginEntry({
         // is invoked (the node handler re-checks with the same helper).
         const harnessCheck = validateHarnessTransport({ harness: p.harness, transport });
         if (!harnessCheck.ok) return jsonResult({ ok: false, harness: harnessCheck.harness, error: harnessCheck.error });
-        const { upsertRun, newRunId, probeRun, loadLedger } = await import("./ledger.js");
+        // Issue #34: refuse (never silently drop) env names that execute code or
+        // redirect config, and honor the operator's autoApprove ceiling.
+        const envPartition = partitionEnv(p.env, cfg.env);
+        if (envPartition.rejected.length) {
+          return jsonResult({ ok: false, error: `env not allowed: ${envPartition.rejected.join(", ")}` });
+        }
+        if (p.autoApprove === true && cfg.allowAutoApprove === false) {
+          return jsonResult({ ok: false, error: "autoApprove is disabled by the operator (allowAutoApprove=false)" });
+        }
+        const { upsertRun, newRunId, probeRun, loadLedger, outcomeEntry } = await import("./ledger.js");
         const rootDir = api.rootDir ?? process.cwd();
 
         // Issue #8: unfiltered dispatch must not fail on non-OpenCode nodes.
@@ -865,6 +927,9 @@ export default definePluginEntry({
           // the actual state instead of the ambiguous "MAY still be live".
           const timedOut = (inv as { invokeTimedOut?: boolean }).invokeTimedOut === true;
           let dispatchResult: unknown;
+          // Set when the silent-death reconcile below already recorded the run as failed;
+          // the outcome upsert must not overwrite that.
+          let reconciledDead = false;
           if (timedOut) {
             let probe: Record<string, unknown> = { probed: false };
             try {
@@ -885,18 +950,15 @@ export default definePluginEntry({
             // Reconcile the ledger: a dead run with no completion record is
             // marked failed, not left as timed-out/running (issue #11).
             if (dead) {
+              // Keep the original entry (startedAt, engine, pid): this is a state
+              // change of the same run, not a new one.
               await upsertRun(rootDir, {
-                runId,
-                node: node.displayName ?? node.nodeId,
-                cwd: p.cwd,
-                prompt: p.prompt,
-                model: p.model,
-                transport,
-                startedAt: new Date().toISOString(),
+                ...ledgerEntry,
                 updatedAt: new Date().toISOString(),
                 state: "failed",
                 summary: "run died without completion record (silent death)",
               });
+              reconciledDead = true;
             }
             dispatchResult = {
               ok: false,
@@ -938,23 +1000,9 @@ export default definePluginEntry({
             typeof payload === "string"
               ? (JSON.parse(payload) as { ok?: boolean; summary?: string; sessionId?: string; handRaised?: boolean; question?: string })
               : ((payload as { ok?: boolean; summary?: string; sessionId?: string; handRaised?: boolean; question?: string } | undefined) ?? {});
-          await upsertRun(rootDir, {
-            runId,
-            node: node.displayName ?? node.nodeId,
-            cwd: p.cwd,
-            prompt: p.prompt,
-            model: p.model,
-            transport,
-            harness: p.harness,
-            piModel: p.piModel,
-            startedAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString(),
-            state: timedOut ? "timed-out" : parsedResult.ok === false ? "failed" : "completed",
-            summary: parsedResult.summary,
-            sessionId: parsedResult.sessionId,
-            handRaised: parsedResult.handRaised,
-            question: parsedResult.question,
-          });
+          // Same run, new state (see outcomeEntry): keeps startedAt/engine/pid and a
+          // silent-death failure recorded above.
+          await upsertRun(rootDir, outcomeEntry(ledgerEntry, { timedOut, reconciledDead, parsed: parsedResult }));
 
           results[node.displayName ?? node.nodeId] = {
             runId,
@@ -1489,7 +1537,7 @@ export default definePluginEntry({
           setup: {
             type: "string",
             description:
-              "Optional repo-declared setup command to run on each node after checkout (issue #19), e.g. \"scripts/setup.sh\" or \"python3 -m venv .venv && .venv/bin/pip install -r requirements.txt\". Lets a repo declare its own environment bootstrap so 'provisioned' means 'can run the tests'. Reported per node; never hardcoded.",
+              "Optional repo-declared setup command to run on each node after checkout (issue #19), a repo-relative script path with plain arguments, e.g. \"scripts/setup.sh\" or \"./setup.sh --fast\" (the path must contain a \"/\"). Arbitrary shell commands (pipelines, &&, e.g. \"python3 -m venv .venv && ...\") are refused unless the operator sets allowSetupCommands. Lets a repo declare its own environment bootstrap so 'provisioned' means 'can run the tests'. Reported per node; never hardcoded.",
           },
         },
         required: ["repo"],
@@ -1497,6 +1545,9 @@ export default definePluginEntry({
       execute: async (toolCallId, params, signal) => {
         const p = params as { repo: string; cwd?: string; nodes?: string[]; branch?: string; commit?: string; setup?: string };
         const { createRepoBundle, provisionToNode, cleanupBundle } = await import("./provision.js");
+        // Issue #34: refuse an arbitrary-shell `setup` unless the operator allows it.
+        const setupCheck = checkSetup(p.setup ?? "", cfg.allowSetupCommands === true);
+        if (!setupCheck.ok) return jsonResult({ ok: false, error: setupCheck.error });
         // Issue #26: default the landing path to a workspace the worker
         // principal can actually enter, instead of a /root path it cannot.
         const { defaultFleetCwd } = await import("./cwd.js");
@@ -1542,6 +1593,7 @@ export default definePluginEntry({
               branch: p.branch,
               commit: p.commit,
               setup: p.setup,
+              allowSetupCommands: cfg.allowSetupCommands === true,
             },
             channelInvoke,
           );
@@ -1617,7 +1669,7 @@ export default definePluginEntry({
           node: { type: "string", description: "Node display name or id." },
           cwd: { type: "string", description: "Working directory on the node." },
           repo: { type: "string", description: "Git URL the manager can access." },
-          branch: { type: "string", description: "Destination branch to publish the worker's work to. When omitted, the worker's own checked-out branch is published if it differs from `main` (so feature-branch work stays reviewable); otherwise `main`." },
+          branch: { type: "string", description: "Destination branch to publish the worker's work to. When omitted, the worker's own checked-out branch is published if it differs from `main`. A protected destination (default main/master) is not pushed directly: the work goes to `fleet/<name>` and the result reports `redirectedFrom`, unless the operator lists the branch in sync.allowDirectPush." },
         },
         required: ["node", "cwd", "repo"],
       },
@@ -1654,18 +1706,34 @@ export default definePluginEntry({
             if (!c.ok || typeof c.data !== "string") return jsonResult({ ok: false, error: c.error ?? "chunk read failed" });
             parts.push(c.data);
           }
+          const assembled = parts.join("");
+          // Fail closed: node responses are not trusted, so a missing or
+          // malformed digest is as bad as a mismatch (node predating #38?).
+          if (typeof bundlePl.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(bundlePl.sha256)) {
+            return jsonResult({ ok: false, error: "worker did not return a bundle sha256; upgrade the node (opencode-fleet with checksum support) before syncing over the node channel" });
+          }
+          if (!isCanonicalBase64(assembled)) {
+            return jsonResult({ ok: false, error: "reassembled worker bundle is not canonical base64" });
+          }
+          const got = createHash("sha256").update(Buffer.from(assembled, "base64")).digest("hex");
+          if (got !== bundlePl.sha256) {
+            return jsonResult({ ok: false, error: "worker bundle checksum mismatch after transfer; refusing to push a corrupted bundle" });
+          }
           const { syncFromNode } = await import("./provision.js");
           const r = await syncFromNode("local", p.cwd, p.repo, p.branch ?? "main", {
             mode: "from-base64",
-            base64: parts.join(""),
+            base64: assembled,
             branch: p.branch ?? "main",
+            // The branch the worker actually has checked out (SSH-free path), so a
+            // feature-branch worker publishes its own commits instead of the base.
+            workerBranch: typeof bundlePl.branch === "string" ? bundlePl.branch : undefined,
             destBranch: p.branch,
-          });
+          }, undefined, cfg.sync);
           return jsonResult({ ...r, viaChannel: true });
         }
 
         const { syncFromNode } = await import("./provision.js");
-        const r = await syncFromNode(host, p.cwd, p.repo, p.branch ?? "main", undefined, p.branch);
+        const r = await syncFromNode(host, p.cwd, p.repo, p.branch ?? "main", undefined, p.branch, cfg.sync);
         return jsonResult(r);
       },
     });

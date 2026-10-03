@@ -11,6 +11,8 @@
 /** Patterns for common credential shapes. Conservative: prefer redacting too much. */
 const SECRET_PATTERNS: Array<[RegExp, string]> = [
   [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, "[REDACTED:private-key]"],
+  // A PEM header on its own line (diff scanners see one line at a time).
+  [/-----BEGIN [A-Z ]*PRIVATE KEY-----/g, "[REDACTED:private-key]"],
   [/\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b/g, "[REDACTED:github-token]"],
   [/\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, "[REDACTED:github-token]"],
   [/\bsk-(?:ant-)?[A-Za-z0-9_-]{20,}\b/g, "[REDACTED:api-key]"],
