@@ -619,7 +619,7 @@ export default definePluginEntry({
         // is invoked (the node handler re-checks with the same helper).
         const harnessCheck = validateHarnessTransport({ harness: p.harness, transport });
         if (!harnessCheck.ok) return jsonResult({ ok: false, harness: harnessCheck.harness, error: harnessCheck.error });
-        const { upsertRun, newRunId, probeRun, loadLedger } = await import("./ledger.js");
+        const { upsertRun, newRunId, probeRun, loadLedger, outcomeEntry } = await import("./ledger.js");
         const rootDir = api.rootDir ?? process.cwd();
 
         // Issue #8: unfiltered dispatch must not fail on non-OpenCode nodes.
@@ -865,6 +865,9 @@ export default definePluginEntry({
           // the actual state instead of the ambiguous "MAY still be live".
           const timedOut = (inv as { invokeTimedOut?: boolean }).invokeTimedOut === true;
           let dispatchResult: unknown;
+          // Set when the silent-death reconcile below already recorded the run as failed;
+          // the outcome upsert must not overwrite that.
+          let reconciledDead = false;
           if (timedOut) {
             let probe: Record<string, unknown> = { probed: false };
             try {
@@ -885,18 +888,15 @@ export default definePluginEntry({
             // Reconcile the ledger: a dead run with no completion record is
             // marked failed, not left as timed-out/running (issue #11).
             if (dead) {
+              // Keep the original entry (startedAt, engine, pid): this is a state
+              // change of the same run, not a new one.
               await upsertRun(rootDir, {
-                runId,
-                node: node.displayName ?? node.nodeId,
-                cwd: p.cwd,
-                prompt: p.prompt,
-                model: p.model,
-                transport,
-                startedAt: new Date().toISOString(),
+                ...ledgerEntry,
                 updatedAt: new Date().toISOString(),
                 state: "failed",
                 summary: "run died without completion record (silent death)",
               });
+              reconciledDead = true;
             }
             dispatchResult = {
               ok: false,
@@ -938,23 +938,9 @@ export default definePluginEntry({
             typeof payload === "string"
               ? (JSON.parse(payload) as { ok?: boolean; summary?: string; sessionId?: string; handRaised?: boolean; question?: string })
               : ((payload as { ok?: boolean; summary?: string; sessionId?: string; handRaised?: boolean; question?: string } | undefined) ?? {});
-          await upsertRun(rootDir, {
-            runId,
-            node: node.displayName ?? node.nodeId,
-            cwd: p.cwd,
-            prompt: p.prompt,
-            model: p.model,
-            transport,
-            harness: p.harness,
-            piModel: p.piModel,
-            startedAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString(),
-            state: timedOut ? "timed-out" : parsedResult.ok === false ? "failed" : "completed",
-            summary: parsedResult.summary,
-            sessionId: parsedResult.sessionId,
-            handRaised: parsedResult.handRaised,
-            question: parsedResult.question,
-          });
+          // Same run, new state (see outcomeEntry): keeps startedAt/engine/pid and a
+          // silent-death failure recorded above.
+          await upsertRun(rootDir, outcomeEntry(ledgerEntry, { timedOut, reconciledDead, parsed: parsedResult }));
 
           results[node.displayName ?? node.nodeId] = {
             runId,
