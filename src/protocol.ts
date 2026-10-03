@@ -10,9 +10,32 @@
  *
  *   protocol 0  nodes without this field (sentinel prompts only)
  *   protocol 1  `op` + `protocol` on requests; `protocol` echoed on every response
+ *   protocol 2  adds the post-run verification gate (`expect`); a node below 2 would
+ *               silently ignore it and report an apparently gated run as ungated
  */
 
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
+
+/** Minimum node protocol a request feature needs; a node below it would silently ignore the field. */
+export const FEATURE_MIN_PROTOCOL = { harness: 1, expect: 2 } as const;
+
+/**
+ * The lowest node protocol that can honor every non-default feature on this
+ * request (0 when it uses none). Only launching ops carry such features.
+ */
+export function requiredProtocol(task: { harness?: unknown; expect?: unknown }): { version: number; feature?: string } {
+  let version = 0;
+  let feature: string | undefined;
+  if (typeof task.harness === "string" && task.harness && task.harness !== "opencode") {
+    version = FEATURE_MIN_PROTOCOL.harness;
+    feature = `harness "${task.harness}"`;
+  }
+  if (task.expect !== undefined && task.expect !== null && FEATURE_MIN_PROTOCOL.expect > version) {
+    version = FEATURE_MIN_PROTOCOL.expect;
+    feature = "the verification gate (expect)";
+  }
+  return { version, feature };
+}
 
 /** Sentinel prompt -> op. Anything else is an ordinary task prompt (op "run"). */
 export const SENTINEL_OPS = {

@@ -83,10 +83,12 @@ A worker that exits 0 but produced nothing is not a success — but an exit code
 
 After the worker exits, the node evaluates the gate in the run's cwd and records it on the run result:
 
-- every path in `expect.files` must exist (relative to cwd; absolute allowed)
-- `expect.command`, when given, is run via `bash -lc` in cwd (bounded to 120s) and must exit 0
+- every path in `expect.files` must exist **inside the run directory** (relative paths only; absolute paths and `..` are refused, and a symlink that resolves outside the directory does not count)
+- `expect.command`, when given, is run via `bash -c` in cwd (bounded to 120s, whole process group killed on timeout) and must exit 0. It runs on the node **outside the engine's permission system**, so it follows the same rule as provision `setup`: a repo-relative script path with plain arguments (e.g. `./scripts/check.sh --fast`) unless the operator sets `allowSetupCommands`
 
 The outcome is recorded as `verified: boolean` with per-check `verifyDetails`, and is surfaced by `fleet_run_status`. **`verified` is separate from `ok`** (`ok` remains the raw process exit status): `ok: true, verified: false` means the worker exited cleanly but the expected artifacts were not produced — treat the run as unverified, not successful. Omitting `expect` changes nothing (`verified: null`).
+
+The gate needs a node speaking protocol 2: the gateway refuses to send `expect` to an older node (which would silently ignore it and look like an ungated run) and tells you to upgrade it. The relay timeout for a gated run is the worker's `timeoutMs` plus the gate's bound plus a grace period, so a worker that uses its whole budget still reports `verified`.
 
 ## Install
 

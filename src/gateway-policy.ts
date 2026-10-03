@@ -9,7 +9,8 @@
  * engine we therefore verify the node first instead of running the wrong engine.
  */
 
-import { PROTOCOL_VERSION, nodeProtocolOf, resolveOp } from "./protocol.js";
+import { PROTOCOL_VERSION, nodeProtocolOf, requiredProtocol, resolveOp } from "./protocol.js";
+import { relayTimeoutWithGate } from "./verify.js";
 
 export interface PolicyCtx {
   params: unknown;
@@ -79,31 +80,38 @@ export async function handleOpencodeRunPolicy(
   if (!resolved.ok) return { ok: false, message: resolved.error };
 
   const nodeId = ctx.node?.nodeId;
-  const engine = typeof task.harness === "string" && task.harness ? task.harness : "opencode";
   const launches = resolved.op === "run" || resolved.op === "run.start";
-  if (launches && engine !== "opencode") {
+  const need = launches ? requiredProtocol(task as { harness?: unknown; expect?: unknown }) : { version: 0 };
+  if (need.version > 0) {
+    // A node below the needed protocol would silently ignore the field (run the
+    // wrong engine, or skip the verification gate and report an ungated run).
     let cached = nodeId ? cache.get(nodeId) : undefined;
-    if (!cached || now() - cached.at > CACHE_TTL_MS) {
+    if (!cached || now() - cached.at > CACHE_TTL_MS || cached.version < need.version) {
       let version: number;
       try {
         version = await probeProtocol(ctx);
       } catch (e) {
-        return { ok: false, message: `cannot verify the node supports harness "${engine}": ${(e as Error).message}` };
+        return { ok: false, message: `cannot verify the node supports ${need.feature}: ${(e as Error).message}` };
       }
       cached = { version, at: now() };
       if (nodeId) cache.set(nodeId, cached);
     }
-    if (cached.version < PROTOCOL_VERSION) {
+    if (cached.version < need.version) {
       return {
         ok: false,
-        message: `node speaks protocol ${cached.version} (< ${PROTOCOL_VERSION}) and would ignore harness "${engine}"; upgrade opencode-fleet on the node first`,
+        message: `node speaks protocol ${cached.version} (< ${need.version}) and would silently ignore ${need.feature}; upgrade opencode-fleet on the node first`,
       };
     }
   }
 
+  // The gate runs after the worker; give the relay time for it so a worker that
+  // uses its whole budget still returns `verified` instead of timing out mid-gate.
+  const baseTimeout = typeof task.timeoutMs === "number" ? task.timeoutMs : undefined;
+  const timeoutMs =
+    baseTimeout !== undefined ? relayTimeoutWithGate(baseTimeout, launches && task.expect != null) : undefined;
   const result = await ctx.invokeNode({
     params: { ...task, op: resolved.op, protocol: PROTOCOL_VERSION },
-    timeoutMs: task.timeoutMs,
+    timeoutMs,
   });
   if (!result.ok) return { ok: false, message: result.message ?? "opencode.run failed on node." };
 

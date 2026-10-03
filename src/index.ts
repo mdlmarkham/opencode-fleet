@@ -316,10 +316,17 @@ export default definePluginEntry({
         }
         // Issue #62: validate the optional verification gate up front so a
         // malformed spec is a clear refusal, never a silently-dropped gate.
-        const { parseExpectSpec, withVerified } = await import("./verify.js");
+        const { parseExpectSpec, withVerified, relayTimeoutWithGate } = await import("./verify.js");
         const expectSpec = parseExpectSpec(p.expect);
         if (!expectSpec.ok) {
           return jsonResult({ ok: false, error: `invalid expect: ${expectSpec.error}` });
+        }
+        // `expect.command` runs on the node OUTSIDE the engine's permission system,
+        // so it gets the same rule as provision `setup`: a repo-relative script
+        // path unless the operator allows arbitrary commands (issue #34).
+        if (expectSpec.expect?.command) {
+          const cmdCheck = checkSetup(expectSpec.expect.command, cfg.allowSetupCommands === true);
+          if (!cmdCheck.ok) return jsonResult({ ok: false, error: `invalid expect.command: ${cmdCheck.error}` });
         }
         const { upsertRun, newRunId, probeRun, loadLedger, outcomeEntry } = await import("./ledger.js");
         const rootDir = api.rootDir ?? process.cwd();
@@ -443,7 +450,7 @@ export default definePluginEntry({
                 nodeId: node.nodeId,
                 command: "opencode.run",
                 params: task,
-                timeoutMs: task.timeoutMs,
+                timeoutMs: task.timeoutMs === undefined ? undefined : relayTimeoutWithGate(task.timeoutMs, expectSpec.expect !== undefined),
                 signal,
               })
               .catch((err: Error) => ({
@@ -1014,10 +1021,17 @@ export default definePluginEntry({
         // Issue #62 review (coverage gap): fleet_iterate accepts the same
         // optional verification gate as fleet_dispatch, validated up front and
         // threaded to the node on EVERY iteration.
-        const { parseExpectSpec, withVerified } = await import("./verify.js");
+        const { parseExpectSpec, withVerified, relayTimeoutWithGate } = await import("./verify.js");
         const expectSpec = parseExpectSpec(p.expect);
         if (!expectSpec.ok) {
           return jsonResult({ ok: false, error: `invalid expect: ${expectSpec.error}` });
+        }
+        // `expect.command` runs on the node OUTSIDE the engine's permission system,
+        // so it gets the same rule as provision `setup`: a repo-relative script
+        // path unless the operator allows arbitrary commands (issue #34).
+        if (expectSpec.expect?.command) {
+          const cmdCheck = checkSetup(expectSpec.expect.command, cfg.allowSetupCommands === true);
+          if (!cmdCheck.ok) return jsonResult({ ok: false, error: `invalid expect.command: ${cmdCheck.error}` });
         }
 
         const maxIter = p.maxIterations ?? 5;
@@ -1040,7 +1054,7 @@ export default definePluginEntry({
               timeoutMs: p.timeoutMs ?? 300_000,
               expect: expectSpec.expect,
             },
-            timeoutMs: p.timeoutMs ?? 300_000,
+            timeoutMs: relayTimeoutWithGate(p.timeoutMs ?? 300_000, expectSpec.expect !== undefined),
             signal,
           });
           const payload = (inv as { payload?: unknown }).payload;
@@ -1166,10 +1180,17 @@ export default definePluginEntry({
         // Issue #62 review (coverage gap): fleet_watch accepts the same
         // optional verification gate as fleet_dispatch — validated up front
         // and threaded to the node on every watch.
-        const { parseExpectSpec, withVerified } = await import("./verify.js");
+        const { parseExpectSpec, withVerified, relayTimeoutWithGate } = await import("./verify.js");
         const expectSpec = parseExpectSpec(p.expect);
         if (!expectSpec.ok) {
           return jsonResult({ ok: false, error: `invalid expect: ${expectSpec.error}` });
+        }
+        // `expect.command` runs on the node OUTSIDE the engine's permission system,
+        // so it gets the same rule as provision `setup`: a repo-relative script
+        // path unless the operator allows arbitrary commands (issue #34).
+        if (expectSpec.expect?.command) {
+          const cmdCheck = checkSetup(expectSpec.expect.command, cfg.allowSetupCommands === true);
+          if (!cmdCheck.ok) return jsonResult({ ok: false, error: `invalid expect.command: ${cmdCheck.error}` });
         }
 
         const timeoutMs = p.timeoutMs ?? 300_000;
@@ -1189,7 +1210,7 @@ export default definePluginEntry({
             timeoutMs,
             expect: expectSpec.expect,
           },
-          timeoutMs,
+          timeoutMs: relayTimeoutWithGate(timeoutMs, expectSpec.expect !== undefined),
           signal,
         });
 

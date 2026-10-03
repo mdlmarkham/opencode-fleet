@@ -335,11 +335,18 @@ export function verifyGateScript(
     // Paths are shell-quoted for the existence check; the recorded JSON path
     // strings are pre-rendered with JSON.stringify (then shq-wrapped) so no
     // escaping happens in bash — bash only moves literals around.
+    lines.push("__V_ROOT=$(pwd -P 2>/dev/null)");
     lines.push(`__V_PATHS=( ${files.map(shq).join(" ")} )`);
     lines.push(`__V_JPATHS=( ${files.map((p) => shq(JSON.stringify(p))).join(" ")} )`);
     lines.push("__V_SEP=''");
     lines.push('for __i in "${!__V_PATHS[@]}"; do');
-    lines.push('  if [ "$__V_CDW" = true ] && [ -e "${__V_PATHS[$__i]}" ]; then __ok=true; else __ok=false; __V_ALL_OK=false; fi');
+    // Exists AND resolves inside the run directory (a symlink out of it does not count).
+    lines.push('  __ok=false');
+    lines.push('  if [ "$__V_CDW" = true ] && [ -e "${__V_PATHS[$__i]}" ]; then');
+    lines.push('    __rp=$(realpath -e -- "${__V_PATHS[$__i]}" 2>/dev/null)');
+    lines.push('    case "$__rp" in "$__V_ROOT"/*) __ok=true;; esac');
+    lines.push('  fi');
+    lines.push('  if [ "$__ok" != true ]; then __V_ALL_OK=false; fi');
     lines.push('  __V_FILES_JSON="${__V_FILES_JSON}${__V_SEP}{\\\"path\\\":${__V_JPATHS[$__i]},\\\"ok\\\":$__ok}"');
     lines.push("__V_SEP=','");
     lines.push("done");
@@ -348,7 +355,7 @@ export function verifyGateScript(
     lines.push("__V_JCMD=" + shq(JSON.stringify(command)));
     lines.push('if [ "$__V_CDW" = true ]; then');
     lines.push(
-      `  if timeout ${timeoutSec} bash -lc ${shq(command)} >/dev/null 2>&1; then __V_CMD_OK=true; __V_CMD_EXIT=0; else __V_CMD_EXIT=$?; __V_CMD_OK=false; __V_ALL_OK=false; fi`,
+      `  if timeout -k 5 ${timeoutSec} bash -c ${shq(command)} >/dev/null 2>&1; then __V_CMD_OK=true; __V_CMD_EXIT=0; else __V_CMD_EXIT=$?; __V_CMD_OK=false; __V_ALL_OK=false; fi`,
     );
     lines.push('  __V_CMD_JSON="{\\\"cmd\\\":$__V_JCMD,\\\"exitCode\\\":$__V_CMD_EXIT,\\\"ok\\\":$__V_CMD_OK}"');
     lines.push("else");
