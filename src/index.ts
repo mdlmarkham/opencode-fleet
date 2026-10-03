@@ -2024,12 +2024,12 @@ export default definePluginEntry({
         // Issue #63: abort addresses one run. Resolve a sessionId through the ledger.
         let runId = p.runId;
         if (!runId && p.sessionId) {
-          const { loadLedger } = await import("./ledger.js");
-          const nodeNames = [node.displayName, node.nodeId];
-          const hits = (await loadLedger(api.rootDir ?? process.cwd())).filter(
-            (r) => r.sessionId === p.sessionId && nodeNames.includes(r.node),
+          const { loadLedger, resolveAbortRunId } = await import("./ledger.js");
+          runId = resolveAbortRunId(
+            await loadLedger(api.rootDir ?? process.cwd()),
+            p.sessionId,
+            [node.displayName, node.nodeId].filter((x): x is string => !!x),
           );
-          runId = (hits.find((r) => r.state === "running") ?? hits[hits.length - 1])?.runId;
         }
         if (!runId) {
           return jsonResult({ ok: false, aborted: false, error: "runId required: pass the runId from fleet_dispatch, or a sessionId the ledger recorded for this node" });
