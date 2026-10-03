@@ -75,6 +75,27 @@
         "default": false,
         "description": "Allow fleet_provision setup to be an arbitrary shell command. Default: repo-relative script path only."
       },
+      "env": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Refine the dispatch env policy. Built-in denials (BASH_ENV, NODE_OPTIONS, LD_*, ...) always apply.",
+        "properties": {
+          "allowOnly": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "If set, only these variable names may be injected."
+          },
+          "extraDeny": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Additional variable names to refuse."
+          }
+        }
+      },
       "sync": {
         "type": "object",
         "additionalProperties": false,

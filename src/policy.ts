@@ -23,10 +23,13 @@ const DENY_EXACT = new Set([
   "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CONFIG_DIRS", "XDG_DATA_DIRS",
   "OPENCODE_CONFIG", "OPENCODE_CONFIG_DIR", "OPENCODE_CONFIG_CONTENT", "OPENCODE_PERMISSION",
   "PI_CODING_AGENT_DIR",
+  // tools that run a program named in the environment
+  "LESSOPEN", "LESSCLOSE", "MANPAGER", "BROWSER", "MAKEFLAGS", "MAKEFILES", "GOFLAGS", "GOROOT",
+  "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
 ]);
 
 /** Prefixes denied wholesale. */
-const DENY_PREFIXES = ["LD_", "DYLD_", "GIT_CONFIG", "GIT_SSH", "BASH_FUNC_", "SUDO_"];
+const DENY_PREFIXES = ["LD_", "DYLD_", "GIT_CONFIG", "GIT_SSH", "BASH_FUNC_", "SUDO_", "CARGO_TARGET_", "NPM_CONFIG_SCRIPT", "NPM_CONFIG_NODE", "NPM_CONFIG_GLOBALCONFIG", "NPM_CONFIG_USERCONFIG"];
 
 /** Individual git variables that execute programs. */
 const DENY_GIT = new Set([
@@ -37,11 +40,22 @@ const DENY_GIT = new Set([
 
 const NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
-export function isEnvNameAllowed(name: string): boolean {
+/** Operator-supplied refinements (plugin config `env`). Built-in denials always win. */
+export interface EnvPolicyOptions {
+  /** When set, ONLY these names (exact, case-insensitive) may be injected. */
+  allowOnly?: string[];
+  /** Extra names to refuse, in addition to the built-in list. */
+  extraDeny?: string[];
+}
+
+export function isEnvNameAllowed(name: string, opts: EnvPolicyOptions = {}): boolean {
   if (!NAME_RE.test(name)) return false;
   const up = name.toUpperCase();
   if (DENY_EXACT.has(up) || DENY_GIT.has(up)) return false;
-  return !DENY_PREFIXES.some((p) => up.startsWith(p));
+  if (DENY_PREFIXES.some((p) => up.startsWith(p))) return false;
+  if (opts.extraDeny?.some((d) => d.toUpperCase() === up)) return false;
+  if (opts.allowOnly && !opts.allowOnly.some((a) => a.toUpperCase() === up)) return false;
+  return true;
 }
 
 export interface EnvPartition {
@@ -49,12 +63,17 @@ export interface EnvPartition {
   rejected: string[];
 }
 
-/** Split a requested environment into what will be exported and the names refused (never silently dropped). */
-export function partitionEnv(env: Record<string, unknown> | undefined): EnvPartition {
-  const allowed: Record<string, string> = {};
+/**
+ * Split a requested environment into what will be exported and the names
+ * refused (never silently dropped). Null-prototype records so a name like
+ * `__proto__` is an ordinary key rather than hitting the inherited setter.
+ */
+export function partitionEnv(env: Record<string, unknown> | undefined, opts: EnvPolicyOptions = {}): EnvPartition {
+  const allowed: Record<string, string> = Object.create(null);
   const rejected: string[] = [];
-  for (const [k, v] of Object.entries(env ?? {})) {
-    if (isEnvNameAllowed(k) && typeof v !== "object") allowed[k] = String(v);
+  for (const k of Object.keys(env ?? {})) {
+    const v = (env as Record<string, unknown>)[k];
+    if (isEnvNameAllowed(k, opts) && typeof v !== "object") allowed[k] = String(v);
     else rejected.push(k);
   }
   return { allowed, rejected };
@@ -63,10 +82,11 @@ export function partitionEnv(env: Record<string, unknown> | undefined): EnvParti
 export type SetupCheck = { ok: true } | { ok: false; error: string };
 
 /**
- * A safe setup is a repo-relative script path with optional plain arguments,
- * e.g. `scripts/setup.sh` or `./setup.sh --fast`: no shell metacharacters, no
- * `..`, not absolute. Anything else (pipelines, `&&`, redirects, command
- * substitution) needs `allowCommands`.
+ * A safe setup is a repo-relative script PATH with optional plain arguments,
+ * e.g. `scripts/setup.sh` or `./setup.sh --fast`. The first token must contain a
+ * `/` so the shell runs the file in the checkout rather than resolving a bare
+ * name through PATH (`sh -c id` would otherwise pass). No shell metacharacters,
+ * no `..`, not absolute. Anything else needs `allowCommands`.
  */
 const SCRIPT_RE = /^(?:\.\/)?[A-Za-z0-9_][A-Za-z0-9_.\/-]*(?: [A-Za-z0-9_.\/=:@+,-]+)*$/;
 
@@ -75,11 +95,11 @@ export function checkSetup(setup: string, allowCommands = false): SetupCheck {
   if (!s) return { ok: true };
   if (allowCommands) return { ok: true };
   const script = s.split(" ")[0];
-  if (!SCRIPT_RE.test(s) || script.split("/").includes("..")) {
+  if (!SCRIPT_RE.test(s) || !script.includes("/") || script.split("/").includes("..")) {
     return {
       ok: false,
       error:
-        "setup must be a repo-relative script path with plain arguments (e.g. \"scripts/setup.sh\"); " +
+        "setup must be a repo-relative script path containing a \"/\" with plain arguments (e.g. \"scripts/setup.sh\" or \"./setup.sh\"); " +
         "arbitrary shell commands require the operator to set allowSetupCommands in the plugin config",
     };
   }
