@@ -110,7 +110,11 @@
         "properties": {
           "gate": { "type": "string", "enum": ["off", "advise", "enforce"], "default": "advise" },
           "maxScopePatterns": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20, "description": "A spec with more scope patterns is `decompose`." },
-          "maxAcceptanceItems": { "type": "integer", "minimum": 1, "maximum": 50, "default": 15, "description": "A spec with more acceptance items is `decompose`." }
+          "maxAcceptanceItems": { "type": "integer", "minimum": 1, "maximum": 50, "default": 15, "description": "A spec with more acceptance items is `decompose`." },
+          "roots": { "type": "array", "items": { "type": "string" }, "description": "Directories on the gateway host under which fleet_project_show may read a checkout's .fleet/ record (issue #114). Default: the gateway's working directory and root dir." },
+          "rules": { "type": "array", "items": { "type": "object" }, "description": "Operator project rules (issue #114), same shape as .fleet/rules.yml entries but `block` is allowed. A repo can add rules and tighten severity, never weaken or redefine these." },
+          "requireCharterFields": { "type": "array", "items": { "type": "string", "enum": ["goal", "users", "constraints", "nonGoals", "successCriteria", "riskiestAssumptions"] }, "description": "Charter fields every project record must have; a repo cannot drop them." },
+          "allowRepoBlocking": { "type": "boolean", "default": false, "description": "Let a repo's `block-candidate` rules actually block. Default false: they only advise." }
         }
       },
       "s1": {
@@ -295,6 +299,7 @@
       "fleet_run_status",
       "fleet_run_report",
       "fleet_design_check",
+      "fleet_project_show",
       "fleet_board"
     ]
   }
