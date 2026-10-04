@@ -56,6 +56,8 @@ interface FleetConfig {
   allowSetupCommands?: boolean;
   /** Default per-run isolation for fleet_dispatch (issue #41): none (default) or clone. */
   isolation?: "none" | "clone";
+  /** Deterministic design gate for spec dispatches (issue #117): off | advise (default) | enforce, plus size bounds. */
+  project?: { gate?: "off" | "advise" | "enforce"; maxScopePatterns?: number; maxAcceptanceItems?: number };
   /** S1 decision layer (issue #79): backend, mode (default shadow), thresholds, egress opt-in. Validated by parseS1Config. */
   s1?: unknown;
   /** fleet_sync publish policy (issue #33). */
@@ -102,6 +104,16 @@ export default definePluginEntry({
         enum: ["none", "clone"],
         default: "none",
         description: "Default per-run isolation for fleet_dispatch (issue #41). `clone` gives every run its own git clone on branch fleet/<runId> (own .git, hooks disabled), so concurrent runs cannot clobber each other. Needs a protocol-4 node (an older node is refused, never silently run un-isolated).",
+      },
+      project: {
+        type: "object",
+        additionalProperties: false,
+        description: "Design gate for spec dispatches (issue #117). A deterministic check (no model call) of the spec before dispatch: missing acceptance/verify/scope, a spec too large for one task, overlap with in-flight runs on the same checkout. `advise` (default) attaches the verdict as `design` when it is not a plain accept; `enforce` also refuses dispatch while an unacknowledged blocking objection remains; `off` skips it. A prompt-only dispatch is never gated.",
+        properties: {
+          gate: { type: "string", enum: ["off", "advise", "enforce"], default: "advise" },
+          maxScopePatterns: { type: "integer", minimum: 1, maximum: 100, default: 20, description: "A spec with more scope patterns is `decompose`." },
+          maxAcceptanceItems: { type: "integer", minimum: 1, maximum: 50, default: 15, description: "A spec with more acceptance items is `decompose`." },
+        },
       },
       s1: {
         type: "object",
@@ -274,6 +286,7 @@ export default definePluginEntry({
               candidates: { type: "array", items: { type: "string" }, description: "Candidate engine names, e.g. ['opencode','pi'], in criteria/tie-break order." },
             },
           },
+          acknowledge: { type: "array", items: { type: "object", additionalProperties: false, properties: { objectionId: { type: "string" }, reason: { type: "string" } }, required: ["objectionId", "reason"] }, description: "Proceed despite design-gate objections (issue #117): each entry names an objection id from a previous verdict and gives a reason. Recorded on the ledger. An operator `block` cannot be acknowledged." },
           piModel: { type: "string", description: "Pi model override (harness=pi); `provider/id` ref, e.g. myprovider/some-model. Falls back to the operator's piDefaultModel config." },
           piTools: { type: "array", items: { type: "string" }, description: "Pi tool allowlist (harness=pi), e.g. ['read','grep','ls'] for a read-only reviewer; [] disables all tools. Omitted = Pi defaults (read, bash, edit, write...). Fails closed: a node whose Pi lacks --tools refuses the run." },
           piJson: { type: "boolean", description: "Opt-in (harness=pi): run Pi with --mode json (when the node's Pi supports it) so the result carries toolCalls, usage and stopReason and the final message is read from structured events. Default false." },
@@ -326,6 +339,7 @@ export default definePluginEntry({
           piTools?: string[];
           piOffline?: boolean;
           piJson?: boolean;
+          acknowledge?: unknown;
           model?: string;
           agent?: string;
           autoApprove?: boolean;
@@ -492,8 +506,32 @@ export default definePluginEntry({
           }
           return true;
         });
+        // Issue #117: deterministic design gate. Only a structured spec is gated; a prompt-only
+        // dispatch (no spec) and gate=off leave the dispatch byte-identical.
+        const gateMode = cfg.project?.gate ?? "advise";
+        let design: import("./design-gate.js").GateResult | undefined;
+        if (specCheck.spec && gateMode !== "off") {
+          const { evaluateDesignGate, parseAcknowledge } = await import("./design-gate.js");
+          const ackCheck = parseAcknowledge(p.acknowledge);
+          if (!ackCheck.ok) return jsonResult({ ok: false, error: ackCheck.error });
+          const names = new Set(opencodeTargets.flatMap((n) => [n.displayName, n.nodeId].filter((x): x is string => !!x)));
+          const inFlight = (await loadLedger(rootDir))
+            .filter((r) => r.state === "running" && names.has(r.node) && r.cwd === p.cwd)
+            .map((r) => ({ runId: r.runId, node: r.node, cwd: r.cwd, ...(r.spec?.scope ? { scope: r.spec.scope } : {}), ...(r.runCwd ? { isolated: true } : {}) }));
+          const gate = evaluateDesignGate(specCheck.spec, {
+            inFlight,
+            isolated: (p.isolation ?? cfg.isolation ?? "none") === "clone",
+            bounds: { ...(cfg.project?.maxScopePatterns ? { maxScopePatterns: cfg.project.maxScopePatterns } : {}), ...(cfg.project?.maxAcceptanceItems ? { maxAcceptanceItems: cfg.project.maxAcceptanceItems } : {}) },
+          }, ackCheck.acks);
+          if (!gate.ok) return jsonResult({ ok: false, error: gate.error });
+          design = gate.result;
+          if (gateMode === "enforce" && design.blocked) {
+            return jsonResult({ ok: false, error: `design gate (${design.verdict}): fix the objections or acknowledge them with a reason`, design });
+          }
+        }
         const results: Record<string, unknown> = {};
         if (skippedNodes.length) results.skipped = skippedNodes;
+        if (design && design.verdict !== "accept") results.design = design;
         // Issue #87, slice 3: surface the opt-in routing decision — only when
         // `route` was requested; the default path adds no field at all.
         if (s1RouteDecision) results.s1 = { route: s1RouteDecision };
@@ -596,6 +634,8 @@ export default definePluginEntry({
             // materialized) for prompt-only dispatches — the entry is
             // byte-identical to today's when no spec was given.
             ...(specCheck.spec ? { spec: specCheck.spec } : {}),
+            // Issue #117: overrides are part of the run's record.
+            ...(design?.acknowledged.length ? { gateAcknowledged: design.acknowledged } : {}),
           };
           await upsertRun(rootDir, ledgerEntry);
           // Issue #6: default to DETACHED execution. The node returns a run
@@ -982,6 +1022,49 @@ export default definePluginEntry({
           discarded: p.discard === true,
           runs: findings,
         });
+      },
+    });
+
+    api.registerTool({
+      name: "fleet_design_check",
+      label: "Fleet Design Check",
+      description:
+        "Dry-run the deterministic design gate (issue #117) on a task spec WITHOUT dispatching: returns a verdict (accept | accept-with-nudges | decompose | reject-with-reason) and objections, each with severity, message, cited evidence and a suggestion. Checks: missing acceptance/verify/scope, a spec too large for one task, overlap with runs already in flight on the same checkout (pass node and cwd). No model call. Iterate on the spec until it is accepted, then fleet_dispatch it.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          spec: { type: "object", description: "The task spec, same shape as fleet_dispatch's `spec` ({goal, acceptance?, verify?, scope?})." },
+          node: { type: "string", description: "Node display name or id, to check overlap against its in-flight runs." },
+          cwd: { type: "string", description: "Checkout the spec would run in, to check overlap against in-flight runs." },
+          isolation: { type: "string", enum: ["none", "clone"], description: "Isolation the dispatch would use. Default from config." },
+          acknowledge: { type: "array", items: { type: "object", additionalProperties: false, properties: { objectionId: { type: "string" }, reason: { type: "string" } }, required: ["objectionId", "reason"] }, description: "Preview the verdict with these objections acknowledged." },
+        },
+        required: ["spec"],
+      },
+      execute: async (_toolCallId, params) => {
+        const p = params as { spec?: unknown; node?: string; cwd?: string; isolation?: "none" | "clone"; acknowledge?: unknown };
+        const cfg = (api.pluginConfig ?? {}) as FleetConfig;
+        const { parseTaskSpec } = await import("./spec.js");
+        const specCheck = parseTaskSpec(p.spec);
+        if (!specCheck.ok) return jsonResult({ ok: false, error: specCheck.error });
+        if (!specCheck.spec) return jsonResult({ ok: false, error: "spec is required" });
+        const { evaluateDesignGate, parseAcknowledge } = await import("./design-gate.js");
+        const ackCheck = parseAcknowledge(p.acknowledge);
+        if (!ackCheck.ok) return jsonResult({ ok: false, error: ackCheck.error });
+        const { loadLedger } = await import("./ledger.js");
+        const inFlight = p.node && p.cwd
+          ? (await loadLedger(api.rootDir ?? process.cwd()))
+              .filter((r) => r.state === "running" && r.node === p.node && r.cwd === p.cwd)
+              .map((r) => ({ runId: r.runId, node: r.node, cwd: r.cwd, ...(r.spec?.scope ? { scope: r.spec.scope } : {}), ...(r.runCwd ? { isolated: true } : {}) }))
+          : [];
+        const gate = evaluateDesignGate(specCheck.spec, {
+          inFlight,
+          isolated: (p.isolation ?? cfg.isolation ?? "none") === "clone",
+          bounds: { ...(cfg.project?.maxScopePatterns ? { maxScopePatterns: cfg.project.maxScopePatterns } : {}), ...(cfg.project?.maxAcceptanceItems ? { maxAcceptanceItems: cfg.project.maxAcceptanceItems } : {}) },
+        }, ackCheck.acks);
+        if (!gate.ok) return jsonResult({ ok: false, error: gate.error });
+        return jsonResult({ ok: true, gate: cfg.project?.gate ?? "advise", overlapChecked: Boolean(p.node && p.cwd), ...gate.result });
       },
     });
 
