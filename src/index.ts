@@ -2171,6 +2171,46 @@ export default definePluginEntry({
     });
 
     api.registerTool({
+      name: "fleet_board",
+      label: "Fleet Board",
+      description:
+        "ONE call that renders the whole fleet's state: in-flight runs, anything that needs a human (hand-raise, failed verification gate), stale runs, and failures — with age, engine, node and the verification outcome. Use this INSTEAD of polling fleet_run_status per run: it is the single bounded read that answers 'how is it going'. Ledger-backed (fast, no node round-trips per run beyond the ledger).",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          includeLanded: { type: "boolean", description: "Also list completed runs (default false: the quiet majority is summarised in the header only)." },
+          staleMinutes: { type: "number", description: "A running run older than this with no completion is 'stale' (default 45)." },
+          tasksDir: { type: "string", description: "Directory holding the work-graph journal (tasks.jsonl, issue #132). When given, the board JOINS each run to its task by issue number and shows plan-vs-execution state/mismatches. Omit to show execution only." },
+        },
+      },
+      execute: async (toolCallId, params) => {
+        const p = params as { includeLanded?: boolean; staleMinutes?: number; tasksDir?: string };
+        const { loadLedger } = await import("./ledger.js");
+        const { renderBoard } = await import("./board.js");
+        const entries = await loadLedger(api.rootDir ?? process.cwd());
+        const opts: {
+          staleMs?: number;
+          buckets?: Array<"in-flight" | "needs-you" | "landed" | "failed" | "stale">;
+          tasks?: import("./tasks.js").Task[];
+        } = {};
+        if (typeof p.staleMinutes === "number" && p.staleMinutes > 0) opts.staleMs = p.staleMinutes * 60_000;
+        if (p.includeLanded) opts.buckets = ["needs-you", "stale", "failed", "in-flight", "landed"];
+        // Issue #132 join: fold the work graph when a tasks dir is supplied.
+        if (typeof p.tasksDir === "string" && p.tasksDir.trim() !== "") {
+          try {
+            const { openTaskTracker } = await import("./tasks.js");
+            opts.tasks = await openTaskTracker(p.tasksDir).list();
+          } catch {
+            /* no/unreadable journal: fall back to execution-only, never fail the board */
+          }
+        }
+        const { text, counts } = renderBoard(entries, opts);
+        return jsonResult({ board: text, counts });
+      },
+    });
+
+    api.registerTool({
       name: "fleet_activity",
       label: "Fleet Activity",
       description:
