@@ -421,6 +421,8 @@ function makeEnv(opts: { rootDir: string; s1?: unknown }) {
   const api = {
     pluginConfig: {
       nodes: { dev2: { roles: ["worker"], ssh: true, user: "svcuser" } },
+      // These tests pin what S1 does to a dispatch; the design gate (#117) has its own tests.
+      project: { gate: "off" },
       ...(opts.s1 !== undefined ? { s1: opts.s1 } : {}),
     },
     rootDir: opts.rootDir,

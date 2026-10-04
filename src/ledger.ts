@@ -64,6 +64,8 @@ export interface LedgerEntry {
    *  Absent for prompt-only dispatches (backward compatible: the key is not
    *  materialized when no spec was given). */
   spec?: TaskSpec;
+  /** Design-gate objections the caller acknowledged to dispatch anyway (issue #117), with their reasons. */
+  gateAcknowledged?: Array<{ objectionId: string; reason: string }>;
 }
 
 const LEDGER_FILE = "fleet-runs.json";
