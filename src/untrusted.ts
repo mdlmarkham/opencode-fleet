@@ -13,14 +13,16 @@ const SECRET_PATTERNS: Array<[RegExp, string]> = [
   [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, "[REDACTED:private-key]"],
   // A PEM header on its own line (diff scanners see one line at a time).
   [/-----BEGIN [A-Z ]*PRIVATE KEY-----/g, "[REDACTED:private-key]"],
-  // Issue #101: the leading \b was dropped so a token EMBEDDED mid-word (e.g.
-  // used as an object KEY like `opt_ghp_...`) is redacted in full, not just its
-  // tail. The trailing boundary stays so we do not over-match a longer run.
-  [/(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}/g, "[REDACTED:github-token]"],
-  [/github_pat_[A-Za-z0-9_]{20,}/g, "[REDACTED:github-token]"],
-  [/sk-(?:ant-)?[A-Za-z0-9_-]{20,}/g, "[REDACTED:api-key]"],
-  [/AKIA[0-9A-Z]{16}/g, "[REDACTED:aws-key]"],
-  [/xox[abprs]-[A-Za-z0-9-]{10,}/g, "[REDACTED:slack-token]"],
+  // Issue #101: no leading \b, so a token EMBEDDED mid-word (e.g. an object KEY
+  // like `opt_ghp_...`) is redacted too. But the run is BOUNDED (not `{20,}`) and
+  // followed by an end-of-token lookahead, so it does NOT eat legitimate chars
+  // that merely follow the token (`aaa<tok>bbb` must keep `aaa` and `bbb`).
+  // GitHub tokens are a fixed shape: prefix + exactly 36 [A-Za-z0-9].
+  [/(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36}(?![A-Za-z0-9])/g, "[REDACTED:github-token]"],
+  [/github_pat_[A-Za-z0-9_]{82}(?![A-Za-z0-9_])/g, "[REDACTED:github-token]"],
+  [/sk-(?:ant-)?[A-Za-z0-9_-]{20,}?(?![A-Za-z0-9_-])/g, "[REDACTED:api-key]"],
+  [/AKIA[0-9A-Z]{16}(?![0-9A-Z])/g, "[REDACTED:aws-key]"],
+  [/(?:xox[abprs]-[A-Za-z0-9-]{10,}?)(?![A-Za-z0-9-])/g, "[REDACTED:slack-token]"],
   [/(Bearer\s+)[A-Za-z0-9._~+/-]{20,}=*/gi, "$1[REDACTED]"],
   [
     /\b((?:api[_-]?key|secret|token|password|passwd|authorization)["']?\s*[:=]\s*["']?)[^\s"',;]{8,}/gi,

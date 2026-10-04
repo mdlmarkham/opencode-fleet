@@ -127,6 +127,10 @@ describe("#79: egress", () => {
     // The FULL token must not appear anywhere on the wire (key or value).
     expect(seen.init?.body).not.toContain(secret);
     expect(seen.init?.body).toContain("[REDACTED");
+    // AND the boundary must be preserved: redaction replaces the token, it must
+    // not swallow the characters around it (the greedy-run over-match the
+    // reviewer caught).
+    expect(seen.init?.body).toContain("opt_[REDACTED:github-token]");
   });
 });
 
