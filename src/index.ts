@@ -1349,7 +1349,7 @@ export default definePluginEntry({
 
           // Hand-raise: stop and let the caller answer.
           if (parsed.handRaised) {
-            return jsonResult({ iterations, handRaised: true, question: parsed.question, done: false });
+            return jsonResult(withVerified({ iterations, handRaised: true, question: parsed.question, done: false }, parsed));
           }
 
           // Success check.
@@ -1361,8 +1361,12 @@ export default definePluginEntry({
           const looksFailed = parsed.ok === undefined
             ? /error|failed|timed out|stuck/i.test(parsed.summary ?? "")
             : parsed.ok === false;
-          const success =
-            (p.successMarker ? (parsed.summary ?? "").includes(p.successMarker) : !looksFailed) && verified !== false;
+          // Issue #103: `successMarker` is a SUBSTRING match on worker-controlled
+          // text, so a worker can fake success just by printing the marker. Require
+          // the marker AND a real pass signal: the run must not look failed and the
+          // verification gate (if one ran) must not have failed.
+          const markerSeen = p.successMarker ? (parsed.summary ?? "").includes(p.successMarker) : false;
+          const success = (p.successMarker ? markerSeen && !looksFailed : !looksFailed) && verified !== false;
           if (success) {
             return jsonResult(withVerified({ iterations, done: true, success: true, finalSummary: parsed.summary }, parsed));
           }
