@@ -32,6 +32,14 @@ export interface OpenCodeTask {
    * (e.g. myprovider/some-model), NOT opencode's `provider-prefix/...` form.
    */
   piModel?: string;
+  /**
+   * Pi tool allowlist (harness="pi"): passed as `--tools`. An empty list disables every
+   * tool (`--no-tools`). Absent = Pi's defaults. Fail-closed: a node whose Pi lacks the flag
+   * refuses the run rather than running unrestricted.
+   */
+  piTools?: string[];
+  /** Run Pi with `--offline` (no automatic network activity). Fail-closed like piTools. */
+  piOffline?: boolean;
   /** Optional model override (must exist on the node's provider). */
   model?: string;
   /** Optional agent (build/plan). */
@@ -217,10 +225,13 @@ export function buildOpenCodeCommand(task: OpenCodeTask): string {
     // FIX: feed the prompt via STDIN — no `--`, no positional prompt. Live
     // proof: a normal prompt arrives as message content; a hostile `--evil ...`
     // prompt is delivered as MESSAGE CONTENT (no parser error) — injection-proof.
+    const piErr = validatePiOptions(task);
+    if (piErr) throw new Error(piErr);
     return [
       cdGuard,
       envExports,
-      `printf '%s' ${shq(task.prompt)} | timeout ${Math.floor(timeout / 1000)} pi -p --model ${shq(piModel)} 2>&1`,
+      ...piFlagLines(task),
+      `printf '%s' ${shq(task.prompt)} | timeout ${Math.floor(timeout / 1000)} pi -p $PI_FLAGS --model ${shq(piModel)} 2>&1`,
     ].filter(Boolean).join("\n");
   }
 
@@ -358,6 +369,39 @@ export type PiExecStatus = ExecStatus;
  * non-zero exit, exit 124 (`timeout`), a node watchdog kill, or a
  * `FLEET_ERROR:` (cd guard) marker all yield `ok:false` with diagnostics.
  */
+export const PI_TOOL_NAME = /^[a-z][a-z0-9_-]{0,31}$/;
+
+/** Validate the Pi restriction fields; they are interpolated into a shell command, so be strict. */
+export function validatePiOptions(task: { piTools?: unknown; piOffline?: unknown }): string | null {
+  if (task.piTools !== undefined) {
+    if (!Array.isArray(task.piTools) || task.piTools.length > 16 || !task.piTools.every((t) => typeof t === "string" && PI_TOOL_NAME.test(t))) {
+      return "piTools must be an array of at most 16 tool names (lowercase letters, digits, _ or -)";
+    }
+  }
+  if (task.piOffline !== undefined && typeof task.piOffline !== "boolean") return "piOffline must be a boolean";
+  return null;
+}
+
+/**
+ * Shell lines that build `PI_FLAGS` from what this node's Pi actually supports (`pi --help`).
+ * Baseline hardening flags are added only when supported, so an older Pi still runs; requested
+ * restrictions (piTools, piOffline) are mandatory: unsupported means exit 67, never unrestricted.
+ */
+export function piFlagLines(task: { piTools?: string[]; piOffline?: boolean }): string[] {
+  const lines = [
+    'PI_HELP="$(pi --help 2>&1)"',
+    'PI_FLAGS=""',
+    'for f in --no-session --no-approve --no-extensions --no-skills; do case "$PI_HELP" in *"$f"*) PI_FLAGS="$PI_FLAGS $f";; esac; done',
+  ];
+  const need = (flag: string, add: string): string =>
+    `case "$PI_HELP" in *"${flag}"*) PI_FLAGS="$PI_FLAGS ${add}";; *) echo "FLEET_ERROR: this node's pi does not support ${flag}; refusing to run unrestricted" >&2; exit 67;; esac`;
+  if (Array.isArray(task.piTools)) {
+    lines.push(task.piTools.length === 0 ? need("--no-tools", "--no-tools") : need("--tools", `--tools ${task.piTools.join(",")}`));
+  }
+  if (task.piOffline === true) lines.push(need("--offline", "--offline"));
+  return lines;
+}
+
 export function parsePiOutput(raw: string, exec?: ExecStatus): OpenCodeRunResult {
   const summary = redactSecrets(raw.trim().slice(-4000));
   const handRaiseMatch = summary.match(/HAND_RAISE\s*[:\-]?\s*([\s\S]{1,500})/i);

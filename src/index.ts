@@ -2,7 +2,7 @@ import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { buildJsonPluginConfigSchema, jsonResult } from "openclaw/plugin-sdk/core";
 import { join } from "node:path";
 import { shq } from "./shell.js";
-import { buildOpenCodeCommand, parseOpenCodeOutput, parsePiOutput, validateHarnessTransport, type OpenCodeTask } from "./opencode.js";
+import { buildOpenCodeCommand, parseOpenCodeOutput, parsePiOutput, validateHarnessTransport, validatePiOptions, type OpenCodeTask } from "./opencode.js";
 import {
   probeAckRecovery,
   abortStateWrite,
@@ -275,6 +275,8 @@ export default definePluginEntry({
             },
           },
           piModel: { type: "string", description: "Pi model override (harness=pi); `provider/id` ref, e.g. myprovider/some-model. Falls back to the operator's piDefaultModel config." },
+          piTools: { type: "array", items: { type: "string" }, description: "Pi tool allowlist (harness=pi), e.g. ['read','grep','ls'] for a read-only reviewer; [] disables all tools. Omitted = Pi defaults (read, bash, edit, write...). Fails closed: a node whose Pi lacks --tools refuses the run." },
+          piOffline: { type: "boolean", description: "Run Pi with --offline (no automatic network activity). Fails closed if the node's Pi lacks the flag." },
           model: { type: "string", description: "Optional model override (must exist on node)." },
           agent: { type: "string", description: "Optional OpenCode agent (build/plan)." },
           autoApprove: { type: "boolean", description: "Opt-in: append --auto to `opencode run` to auto-approve all non-denied permissions for this run. Default false — this widens the trust posture." },
@@ -320,6 +322,8 @@ export default definePluginEntry({
           harness?: "opencode" | "pi";
           route?: { candidates: string[] };
           piModel?: string;
+          piTools?: string[];
+          piOffline?: boolean;
           model?: string;
           agent?: string;
           autoApprove?: boolean;
@@ -541,12 +545,23 @@ export default definePluginEntry({
             results[nodeKey] = { ok: false, error: "isolation \"clone\" needs a detached run (transport http, async not false): the clone is made by the node when the run starts" };
             continue;
           }
+          if (routed.harness !== "pi" && (p.piTools !== undefined || p.piOffline !== undefined)) {
+            results[nodeKey] = { ok: false, error: "piTools/piOffline apply to harness=pi only; refusing so the restriction is not silently ignored" };
+            continue;
+          }
+          const piOptsErr = validatePiOptions(p);
+          if (piOptsErr) {
+            results[nodeKey] = { ok: false, error: piOptsErr };
+            continue;
+          }
           const task: OpenCodeTask = {
             prompt: p.prompt,
             cwd: p.cwd,
             transport,
             harness: routed.harness,
             piModel,
+            ...(p.piTools !== undefined ? { piTools: p.piTools } : {}),
+            ...(p.piOffline !== undefined ? { piOffline: p.piOffline } : {}),
             model: p.model,
             agent: p.agent,
             autoApprove: p.autoApprove === true,

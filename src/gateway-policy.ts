@@ -101,7 +101,7 @@ export async function handleOpencodeRunPolicy(
     const check = typeof cmd === "string" ? checkSetup(cmd, opts.allowExpectCommands === true) : { ok: false as const, error: "expect.command must be a string" };
     if (!check.ok) return { ok: false, message: `invalid expect.command: ${check.error}` };
   }
-  const need = launches ? requiredProtocol(task as { harness?: unknown; expect?: unknown; isolation?: unknown }) : requiredProtocolForOp(resolved.op);
+  const need = launches ? requiredProtocol(task as { harness?: unknown; expect?: unknown; isolation?: unknown; piTools?: unknown; piOffline?: unknown }) : requiredProtocolForOp(resolved.op);
   if (need.version > 0) {
     // A node below the needed protocol would silently ignore the field (run the
     // wrong engine, or skip the verification gate and report an ungated run).
