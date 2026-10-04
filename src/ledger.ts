@@ -199,6 +199,34 @@ export function upsertRun(rootDir: string, entry: LedgerEntry): Promise<void> {
   });
 }
 
+/**
+ * Record a new run only if its node has a free slot, atomically: the count and the insert happen
+ * inside the same ledger lock, so two concurrent dispatches cannot both take the last slot
+ * (issue #39). Entries older than `staleAfterMs` do not hold a slot.
+ */
+export function reserveRun(
+  rootDir: string,
+  entry: LedgerEntry,
+  slot: { nodeNames: string[]; limit: number; staleAfterMs: number; now?: number },
+): Promise<{ ok: true } | { ok: false; running: LedgerEntry[] }> {
+  return withLock(ledgerPath(rootDir), async () => {
+    const runs = await loadLedger(rootDir);
+    const names = new Set(slot.nodeNames);
+    const now = slot.now ?? Date.now();
+    const live = runs.filter((r) => {
+      if (r.state !== "running" || !names.has(r.node)) return false;
+      const t = Date.parse(r.updatedAt || r.startedAt);
+      return !(Number.isFinite(t) && now - t > slot.staleAfterMs);
+    });
+    if (live.length >= slot.limit) return { ok: false as const, running: live };
+    const i = runs.findIndex((r) => r.runId === entry.runId);
+    if (i >= 0) runs[i] = entry;
+    else runs.push(entry);
+    await saveLedger(rootDir, capLedger(runs));
+    return { ok: true as const };
+  });
+}
+
 export interface DispatchOutcome {
   timedOut: boolean;
   /** The silent-death reconcile already recorded this run as failed. */
