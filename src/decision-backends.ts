@@ -133,11 +133,19 @@ export function needsEgress(backend: BackendName, url: string): boolean {
 
 const DEFAULT_URL = "http://127.0.0.1:8009";
 
-/** Recursively redact secrets from every string in a state value before it leaves the machine. */
+/**
+ * Recursively redact secrets from every string in a state value before it leaves the machine.
+ * Issue #101 review: object KEYS are strings too, and caller-authored keys (e.g. choice
+ * criteria option names) can carry a secret — so redact keys as well as values.
+ */
 export function redactDeep(v: unknown): unknown {
   if (typeof v === "string") return redactSecrets(v);
   if (Array.isArray(v)) return v.map(redactDeep);
-  if (isRecord(v)) return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, redactDeep(x)]));
+  if (isRecord(v)) {
+    const out: Record<string, unknown> = {};
+    for (const [k, x] of Object.entries(v)) out[redactSecrets(k)] = redactDeep(x);
+    return out;
+  }
   return v;
 }
 

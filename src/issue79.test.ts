@@ -104,6 +104,30 @@ describe("#79: egress", () => {
     const body = JSON.parse(seen.init!.body);
     expect(Object.keys(body.questions)).toEqual(["risk"]);
   });
+
+  it("issue #101 (key leaf): a secret in a criteria KEY is also redacted before egress", async () => {
+    // The reviewer found VALUES were redacted but object KEYS were not, so a
+    // secret used as a choice criteria key reached the backend verbatim.
+    // Use a CHOICE question so the reply's answer type matches (the shared
+    // reply() helper returns a noul answer, which only maps to a boolean).
+    const seen: { url?: string; init?: S1RequestInit } = {};
+    const choiceReply = { model: "jev-1", answers: { risk: { type: "choice", choice: "opt" } }, usage: { input_tokens: 3, output_tokens: 1 } };
+    const d = makeDecider(
+      cfg({ backend: "zen-jev", backends: { "zen-jev": { url: "https://s1.example.net", allowEgress: true, model: "jev-1" } } }),
+      { fetch: fetchOf(choiceReply, seen) },
+    );
+    // Use a token that matches a REAL pattern (the `ghp_` github-token shape),
+    // so the assertion is honest: an unrecognized string would never be redacted.
+    const secret = "ghp_" + "Z".repeat(36);
+    const r = await d({
+      state: { command: "echo hi" },
+      questions: { risk: { type: "choice", instructions: "Pick", criteria: { [`opt_${secret}`]: "an option" } } },
+    });
+    expect(r.ok).toBe(true);
+    // The FULL token must not appear anywhere on the wire (key or value).
+    expect(seen.init?.body).not.toContain(secret);
+    expect(seen.init?.body).toContain("[REDACTED");
+  });
 });
 
 describe("#79: every failure mode leaves the STATIC verdict in force, never allow-by-silence", () => {

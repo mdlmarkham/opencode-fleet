@@ -13,12 +13,15 @@ const SECRET_PATTERNS: Array<[RegExp, string]> = [
   [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, "[REDACTED:private-key]"],
   // A PEM header on its own line (diff scanners see one line at a time).
   [/-----BEGIN [A-Z ]*PRIVATE KEY-----/g, "[REDACTED:private-key]"],
-  [/\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b/g, "[REDACTED:github-token]"],
-  [/\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, "[REDACTED:github-token]"],
-  [/\bsk-(?:ant-)?[A-Za-z0-9_-]{20,}\b/g, "[REDACTED:api-key]"],
-  [/\bAKIA[0-9A-Z]{16}\b/g, "[REDACTED:aws-key]"],
-  [/\bxox[abprs]-[A-Za-z0-9-]{10,}\b/g, "[REDACTED:slack-token]"],
-  [/\b(Bearer\s+)[A-Za-z0-9._~+/-]{20,}=*/gi, "$1[REDACTED]"],
+  // Issue #101: the leading \b was dropped so a token EMBEDDED mid-word (e.g.
+  // used as an object KEY like `opt_ghp_...`) is redacted in full, not just its
+  // tail. The trailing boundary stays so we do not over-match a longer run.
+  [/(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}/g, "[REDACTED:github-token]"],
+  [/github_pat_[A-Za-z0-9_]{20,}/g, "[REDACTED:github-token]"],
+  [/sk-(?:ant-)?[A-Za-z0-9_-]{20,}/g, "[REDACTED:api-key]"],
+  [/AKIA[0-9A-Z]{16}/g, "[REDACTED:aws-key]"],
+  [/xox[abprs]-[A-Za-z0-9-]{10,}/g, "[REDACTED:slack-token]"],
+  [/(Bearer\s+)[A-Za-z0-9._~+/-]{20,}=*/gi, "$1[REDACTED]"],
   [
     /\b((?:api[_-]?key|secret|token|password|passwd|authorization)["']?\s*[:=]\s*["']?)[^\s"',;]{8,}/gi,
     "$1[REDACTED]",
