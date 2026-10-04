@@ -17,7 +17,7 @@
  * This module wires nothing into dispatch; it hands callers a `DecideFn`.
  */
 
-import { decide, type DecideInput, type DecideOptions, type DecideResult, type S1Fetch } from "./decision.js";
+import { decide, type DecideInput, type DecideOptions, type DecideResult, type FleetQuestions, type S1Fetch } from "./decision.js";
 import { redactSecrets } from "./untrusted.js";
 
 export type BackendName = "local-kev" | "zen-jev" | "typesafe-jev";
@@ -141,6 +141,17 @@ export function redactDeep(v: unknown): unknown {
   return v;
 }
 
+/**
+ * Issue #101: redact every string in a questions map (instructions + criteria)
+ * before the payload leaves the machine. Caller-authored text lives here — in
+ * the shadow path, the whole dispatch task — so it must be scrubbed exactly like
+ * `state`. Shape is preserved; only the string leaves are rewritten.
+ */
+export function redactQuestions(qs: FleetQuestions): FleetQuestions {
+  if (!qs || !isRecord(qs)) return qs;
+  return Object.fromEntries(Object.entries(qs).map(([id, q]) => [id, redactDeep(q)])) as FleetQuestions;
+}
+
 // ---------------------------------------------------------------------------
 // Audit log
 // ---------------------------------------------------------------------------
@@ -246,8 +257,15 @@ export function makeDecider(config: S1Config, deps: DeciderDeps = {}): Decider {
       ? (u, init) => wrapped(u, { ...init, headers: { ...init.headers, authorization: `Bearer ${b.apiKey}` } })
       : wrapped;
     try {
+      // Issue #101: when the decision leaves this machine, redact secrets from the
+      // WHOLE payload, not just `state`. The question's `instructions`/`criteria`
+      // carry caller-authored text (in the shadow path, the full dispatch task),
+      // so a secret there would otherwise reach a hosted backend unredacted.
+      const safeInput = egress
+        ? { ...input, state: redactDeep(input.state), questions: redactQuestions(input.questions) }
+        : input;
       const r = await decide(
-        { ...input, state: egress ? redactDeep(input.state) : input.state, model: input.model ?? b.model },
+        { ...safeInput, model: input.model ?? b.model },
         { ...opts, url, fetch: withAuth, timeoutMs: opts.timeoutMs ?? config.timeoutMs },
       );
       return finish(r);

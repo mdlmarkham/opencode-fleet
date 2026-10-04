@@ -82,6 +82,28 @@ describe("#79: egress", () => {
     expect(out.a[1].b).not.toContain("BBBB");
     expect(out.n).toBe(5);
   });
+
+  it("issue #101: a secret in the QUESTION instructions/criteria is redacted before egress", async () => {
+    // The #101 bug: only `state` was redacted, so caller-authored text in the
+    // question (in the shadow path, the whole dispatch task) reached a hosted
+    // backend unredacted.
+    const seen: { url?: string; init?: S1RequestInit } = {};
+    const d = makeDecider(
+      cfg({ backend: "zen-jev", backends: { "zen-jev": { url: "https://s1.example.net", allowEgress: true, model: "jev-1" } } }),
+      { fetch: fetchOf(reply(0.9, "jev-1"), seen) },
+    );
+    const secret = "ghp_" + "C".repeat(36);
+    const r = await d({
+      state: { command: "echo hi" },
+      questions: { risk: { type: "boolean", instructions: `Does this task leak the token ${secret}.`, criteria: { yes: `it contains ${secret}` } } },
+    });
+    expect(r.ok).toBe(true);
+    expect(seen.init?.body).not.toContain("ghp_CCCC");
+    expect(seen.init?.body).toContain("[REDACTED");
+    // The question SHAPE must survive (same id) so the reply still maps.
+    const body = JSON.parse(seen.init!.body);
+    expect(Object.keys(body.questions)).toEqual(["risk"]);
+  });
 });
 
 describe("#79: every failure mode leaves the STATIC verdict in force, never allow-by-silence", () => {
