@@ -484,6 +484,6 @@ describe("issue #62: gateway wiring", () => {
   it("the node handler re-validates expect before launching (the node does not trust the gateway)", () => {
     const src = readFileSync(join(here, "node", "handler.ts"), "utf8");
     expect(src).toContain("parseExpectSpec(task.expect)");
-    expect(src).toContain("verifyGateScript(expect, donePath, { cwd: task.cwd })");
+    expect(src).toContain("verifyGateScript(expect, donePath, { cwd: eff.cwd })");
   });
 });

@@ -94,6 +94,15 @@
           }
         }
       },
+      "isolation": {
+        "type": "string",
+        "enum": [
+          "none",
+          "clone"
+        ],
+        "default": "none",
+        "description": "Default per-run isolation for fleet_dispatch (issue #41). `clone` gives every run its own git clone on branch fleet/<runId> (own .git, hooks disabled), so concurrent runs cannot clobber each other. Needs a protocol-4 node (an older node is refused, never silently run un-isolated)."
+      },
       "s1": {
         "type": "object",
         "additionalProperties": false,

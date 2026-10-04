@@ -44,6 +44,9 @@ import {
   runScriptRows,
   selfStateLines,
   changesCaptureLines,
+  createRunClone,
+  removeRunClone,
+  pruneRunClones,
   verifyGateScript,
 } from "./runtime.js";
 
@@ -114,8 +117,14 @@ OPS["state.prune"] = async ({ task }: OpCtx) => {
   } catch (e) {
     return JSON.stringify({ ok: false, error: `cannot list processes, not pruning: ${(e as Error).message}` });
   }
-  const res = await pruneStateDir(ensureStateDir(), d * 86_400_000, alive);
-  return JSON.stringify({ ok: true, olderThanDays: d, ...res });
+  const stateDir = ensureStateDir();
+  // Issue #41: finished runs' clones first. Unsynced work is kept (and listed) unless the
+  // operator passes discardUnsyncedClones; a kept run's state pointer is protected from the sweep.
+  const clones = await pruneRunClones(stateDir, d * 86_400_000, alive, { discardUnsynced: (task as { discardUnsyncedClones?: unknown }).discardUnsyncedClones === true });
+  const res = await pruneStateDir(stateDir, d * 86_400_000, new Set([...alive, ...clones.protect]));
+  const { protect: _protect, ...cloneReport } = clones;
+  void _protect;
+  return JSON.stringify({ ok: true, olderThanDays: d, ...res, ...cloneReport });
 };
 
 OPS["diff"] = async ({ task, io, context }: OpCtx) => {
@@ -283,10 +292,27 @@ OPS["run.start"] = async ({ task, io, context }: OpCtx) => {
       const statePath = runStatePath(runId);
       const logPath = runPaths(runId).log;
       const scriptPath = runScriptPath(runId);
+      // Issue #41: optional per-run isolation. "clone" gives the run its OWN git
+      // clone (own object store, hooks and config), so concurrent runs cannot
+      // clobber each other and a hook or config written by one cannot run in
+      // another's, or in the source checkout. The worker, the verify gate, the
+      // scope check and the audit capture all use the clone.
+      const isoMode = (task as { isolation?: unknown }).isolation;
+      if (isoMode !== undefined && isoMode !== "none" && isoMode !== "clone") {
+        return JSON.stringify({ ok: false, error: `refused: unknown isolation ${JSON.stringify(String(isoMode).slice(0, 20))} (expected none|clone)` });
+      }
+      let eff = task;
+      let isolation: { mode: "clone"; source: string; cwd: string; branch: string; sourceDirty: boolean } | undefined;
+      if (isoMode === "clone") {
+        const clone = await createRunClone(runId, task.cwd);
+        if (!clone.ok) return JSON.stringify({ ok: false, error: `refused: cannot isolate the run: ${clone.error}` });
+        isolation = { mode: "clone", source: task.cwd, cwd: clone.cwd, branch: clone.branch, sourceDirty: clone.sourceDirty };
+        eff = { ...task, cwd: clone.cwd };
+      }
       // The script re-echoes the launch command with its own timeout, then
       // writes the final output into the state file on exit.
       const inner = buildOpenCodeCommand({
-        ...task,
+        ...eff,
         prompt: realPrompt,
         timeoutMs: task.maxDurationMs ?? task.timeoutMs ?? 600_000,
       });
@@ -305,7 +331,7 @@ OPS["run.start"] = async ({ task, io, context }: OpCtx) => {
       // The start commit is recorded for every run (issue #42 manifest, #65 scope).
       let startHead: string | undefined;
       {
-        const head = (await runShell(`git -C ${shq(task.cwd)} rev-parse --verify HEAD 2>/dev/null`, 10_000, context?.signal)).trim();
+        const head = (await runShell(`git -C ${shq(eff.cwd)} rev-parse --verify HEAD 2>/dev/null`, 10_000, context?.signal)).trim();
         if (/^[0-9a-f]{40,64}$/.test(head)) startHead = head;
       }
       // Completion is written to a SEPARATE file so the manager's JSON
@@ -314,7 +340,7 @@ OPS["run.start"] = async ({ task, io, context }: OpCtx) => {
       // With an `expect` gate the tail evaluates it in the run cwd AFTER the
       // worker exits (issue #62) and the done record gains verified +
       // verifyDetails; without one this is byte-identical to before.
-      const gate = expect ? verifyGateScript(expect, donePath, { cwd: task.cwd }) : undefined;
+      const gate = expect ? verifyGateScript(expect, donePath, { cwd: eff.cwd }) : undefined;
       const script = [
         "#!/bin/bash",
         // Issue #22 bug 4: no exit-code laundering. `set -o pipefail` is not
@@ -322,11 +348,11 @@ OPS["run.start"] = async ({ task, io, context }: OpCtx) => {
         // final exit propagates the worker's real status.
         "set -u",
         // The script publishes its own pid/pgid/state first (issues #64, #69).
-        ...selfStateLines(statePath, { runId, harness: task.harness ?? "opencode", ...(task.piModel ? { piModel: task.piModel } : {}), cwd: task.cwd, ...(startHead ? { startHead } : {}), ...(scopeSpec.scope ? { scope: scopeSpec.scope } : {}) }),
+        ...selfStateLines(statePath, { runId, harness: task.harness ?? "opencode", ...(task.piModel ? { piModel: task.piModel } : {}), cwd: eff.cwd, ...(isolation ? { isolation } : {}), ...(startHead ? { startHead } : {}), ...(scopeSpec.scope ? { scope: scopeSpec.scope } : {}) }),
         inner,
         `EC=$?`,
         ...(gate?.verifyLines ?? []),
-        ...changesCaptureLines(task.cwd, startHead, runPaths(runId).changes),
+        ...changesCaptureLines(eff.cwd, startHead, runPaths(runId).changes),
         gate?.doneLine ?? doneMarkerLine(donePath),
         `exit $EC`,
       ].join("\n");
@@ -341,6 +367,7 @@ OPS["run.start"] = async ({ task, io, context }: OpCtx) => {
       if (!pidMatch) {
         // Fail closed: no pid means no receipt. Report the real reason
         // rather than letting the manager mint an optimistic handle.
+        if (isolation) await removeRunClone(isolation.cwd).catch(() => {});
         return JSON.stringify({
           ok: false,
           error: `launch failed (no LAUNCHED_PID): ${launchOut.trim().slice(0, 200) || "empty launcher output"}`,
@@ -362,11 +389,11 @@ OPS["run.start"] = async ({ task, io, context }: OpCtx) => {
       if (!selfState) {
         await writePrivate(
           statePath,
-          JSON.stringify({ runId, pid: launcherPid, pidSource: "launcher", startedAt: new Date().toISOString(), state: "running", harness: task.harness ?? "opencode", ...(task.piModel ? { piModel: task.piModel } : {}) }),
+          JSON.stringify({ runId, pid: launcherPid, pidSource: "launcher", startedAt: new Date().toISOString(), state: "running", harness: task.harness ?? "opencode", cwd: eff.cwd, ...(isolation ? { isolation } : {}), ...(task.piModel ? { piModel: task.piModel } : {}) }),
         );
       }
       const runPid = selfState?.pid ?? launcherPid;
-      return JSON.stringify({ ok: true, detached: true, runId, pid: runPid, ...(selfState?.pgid ? { pgid: selfState.pgid } : {}), pidSource: selfState ? "script" : "launcher", statePath, logPath, harness: task.harness ?? "opencode" });
+      return JSON.stringify({ ok: true, detached: true, runId, pid: runPid, ...(selfState?.pgid ? { pgid: selfState.pgid } : {}), pidSource: selfState ? "script" : "launcher", statePath, logPath, harness: task.harness ?? "opencode", ...(isolation ? { isolation: "clone", runCwd: isolation.cwd, branch: isolation.branch, sourceDirty: isolation.sourceDirty } : {}) });
 };
 
 OPS["run.status"] = async ({ task, io, context }: OpCtx) => {

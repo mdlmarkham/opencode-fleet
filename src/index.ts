@@ -54,6 +54,8 @@ interface FleetConfig {
   allowAutoApprove?: boolean;
   /** Operator switch: let fleet_provision `setup` be an arbitrary shell command, not just a repo script (default false). */
   allowSetupCommands?: boolean;
+  /** Default per-run isolation for fleet_dispatch (issue #41): none (default) or clone. */
+  isolation?: "none" | "clone";
   /** S1 decision layer (issue #79): backend, mode (default shadow), thresholds, egress opt-in. Validated by parseS1Config. */
   s1?: unknown;
   /** fleet_sync publish policy (issue #33). */
@@ -94,6 +96,12 @@ export default definePluginEntry({
         type: "boolean",
         default: true,
         description: "Allow fleet_dispatch autoApprove (opencode --auto). Set false to forbid it fleet-wide.",
+      },
+      isolation: {
+        type: "string",
+        enum: ["none", "clone"],
+        default: "none",
+        description: "Default per-run isolation for fleet_dispatch (issue #41). `clone` gives every run its own git clone on branch fleet/<runId> (own .git, hooks disabled), so concurrent runs cannot clobber each other. Needs a protocol-4 node (an older node is refused, never silently run un-isolated).",
       },
       s1: {
         type: "object",
@@ -276,6 +284,7 @@ export default definePluginEntry({
           maxDurationMs: { type: "number", description: "Kill the run if total runtime exceeds this, ms (stuck-loop guard). Default 600000." },
           async: { type: "boolean", description: "Run detached: returns a run handle immediately (runId + pid); the worker survives relay timeouts and its completion is recorded. Poll with fleet_watch or fleet_run_status. Default true." },
           env: { type: "object", additionalProperties: { type: "string" }, description: "Environment variables for the worker process (per-dispatch environment). Names that execute code or redirect configuration (PATH, HOME, BASH_ENV, NODE_OPTIONS, LD_*, GIT_SSH*, OPENCODE_CONFIG*, ...) are REFUSED: the dispatch fails and names them. Operators can narrow this further (config env.allowOnly / env.extraDeny)." },
+          isolation: { type: "string", enum: ["none", "clone"], description: "Per-run isolation (issue #41). `clone`: the node makes a private git clone of `cwd` (committed state only) at <parent>/.fleet-runs/<runId>/repo on branch fleet/<runId>, runs the worker there, and returns runCwd and branch; pass runCwd to fleet_sync. Detached runs only. A node that predates isolation is refused rather than run in the shared checkout. Default from config `isolation`, else none." },
           expect: {
             type: "object",
             additionalProperties: false,
@@ -319,6 +328,7 @@ export default definePluginEntry({
           maxIdleMs?: number;
           maxDurationMs?: number;
           async?: boolean;
+          isolation?: "none" | "clone";
           env?: Record<string, string>;
           expect?: { files?: string[]; command?: string };
           spec?: { goal: string; acceptance?: string[]; verify?: { files?: string[]; command?: string }; scope?: { files: string[] } };
@@ -526,6 +536,11 @@ export default definePluginEntry({
             results[nodeKey] = { ok: false, error: cwdCheck.error };
             continue;
           }
+          const isolationMode = p.isolation ?? cfg.isolation ?? "none";
+          if (isolationMode === "clone" && (transport !== "http" || p.async === false)) {
+            results[nodeKey] = { ok: false, error: "isolation \"clone\" needs a detached run (transport http, async not false): the clone is made by the node when the run starts" };
+            continue;
+          }
           const task: OpenCodeTask = {
             prompt: p.prompt,
             cwd: p.cwd,
@@ -543,6 +558,7 @@ export default definePluginEntry({
             ...(specCheck.spec?.scope ? { scope: specCheck.spec.scope } : {}),
             ref: p.ref,
             async: p.async !== false,
+            ...(isolationMode === "clone" ? { isolation: "clone" as const } : {}),
           };
           // Ledger: record BEFORE the invoke so an agent/worker crash mid-run
           // still leaves a discoverable record (interruption handling).
@@ -613,6 +629,9 @@ export default definePluginEntry({
               detached?: boolean;
               runId?: string;
               pid?: number;
+              runCwd?: string;
+              branch?: string;
+              sourceDirty?: boolean;
               error?: string;
             };
             const invokeTimedOut = (inv as { invokeTimedOut?: boolean }).invokeTimedOut === true;
@@ -690,6 +709,7 @@ export default definePluginEntry({
               await upsertRun(rootDir, {
                 ...ledgerEntry,
                 pid: launchPayload.pid,
+                ...(launchPayload.runCwd ? { runCwd: launchPayload.runCwd, branch: launchPayload.branch } : {}),
                 updatedAt: new Date().toISOString(),
                 state: "running",
               });
@@ -697,6 +717,15 @@ export default definePluginEntry({
                 runId,
                 detached: true,
                 pid: launchPayload.pid,
+                ...(launchPayload.runCwd
+                  ? {
+                      runCwd: launchPayload.runCwd,
+                      branch: launchPayload.branch,
+                      ...(launchPayload.sourceDirty ? { isolationNote: "the source checkout has uncommitted changes; only committed state was cloned" } : {}),
+                    }
+                  : isolationMode === "clone"
+                    ? { isolationNote: "isolation was requested but the node did not return a run clone" }
+                    : {}),
                 ackPending: false,
                 note: "Worker launched detached and survives relay timeouts. Poll with fleet_run_status(runId) or fleet_watch; fleet_resume finds it after interruptions.",
               };
@@ -1782,11 +1811,12 @@ export default definePluginEntry({
             description: "Node display names or ids. Omit for all fleet nodes.",
           },
           cwd: { type: "string", description: "Optional checkout dir to GC on each node." },
+          discardUnsyncedClones: { type: "boolean", description: "Also delete finished runs' isolated clones (issue #41) that hold commits or changes beyond their start commit. Off by default: unsynced work is kept and listed under keptUnsynced, never deleted silently." },
           pruneOlderThanDays: { type: "number", description: "Also delete finished runs' scripts/logs/state/done files and stale transfer staging older than this many days from the node's private state dir (default 7; 0 skips). A run whose script is still alive is never touched. Needs a node on protocol 3+." },
         },
       },
       execute: async (toolCallId, params, signal) => {
-        const p = params as { nodes?: string[]; cwd?: string; pruneOlderThanDays?: number };
+        const p = params as { nodes?: string[]; cwd?: string; pruneOlderThanDays?: number; discardUnsyncedClones?: boolean };
         const { cleanupNode } = await import("./provision.js");
         const list = await api.runtime.nodes.list();
         const nodes = list.nodes ?? [];
@@ -1808,7 +1838,7 @@ export default definePluginEntry({
               const pr = await api.runtime.nodes.invoke({
                 nodeId: node.nodeId,
                 command: "opencode.run",
-                params: { prompt: "__PRUNE__", cwd: "/", transport: "http", op: "state.prune", olderThanDays: pruneDays },
+                params: { prompt: "__PRUNE__", cwd: "/", transport: "http", op: "state.prune", olderThanDays: pruneDays, ...(p.discardUnsyncedClones ? { discardUnsyncedClones: true } : {}) },
                 timeoutMs: 30000,
                 signal,
               });

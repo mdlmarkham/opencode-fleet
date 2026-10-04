@@ -49,6 +49,10 @@ export interface LedgerEntry {
   verified?: boolean;
   /** The node's verify-gate details, persisted so a FAILED gate survives node state cleanup. */
   verifyDetails?: unknown;
+  /** The isolated clone the run worked in (issue #41); pass it to fleet_sync. */
+  runCwd?: string;
+  /** The branch fleet/<runId> created in the run clone. */
+  branch?: string;
   summary?: string;
   sessionId?: string;
   handRaised?: boolean;
@@ -125,7 +129,7 @@ export function resolveAbortRunId(runs: LedgerEntry[], sessionId: string, nodeNa
 /** The newest run recorded for this node + checkout directory (ledger order independent), if any. */
 export function latestRunFor(runs: LedgerEntry[], nodeNames: string[], cwd: string): LedgerEntry | undefined {
   return runs
-    .filter((r) => nodeNames.includes(r.node) && r.cwd === cwd && r.state !== "discarded")
+    .filter((r) => nodeNames.includes(r.node) && (r.cwd === cwd || r.runCwd === cwd) && r.state !== "discarded")
     .sort((a, b) => (a.startedAt < b.startedAt ? 1 : a.startedAt > b.startedAt ? -1 : 0))[0];
 }
 

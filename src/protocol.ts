@@ -14,9 +14,11 @@
  *               silently ignore it and report an apparently gated run as ungated
  *   protocol 3  adds the `state.prune` op; an older node would take its sentinel for
  *               an ordinary task prompt, so the gateway must not send it below 3
+ *   protocol 4  adds per-run `isolation`; a node below 4 would run the task in the SHARED
+ *               checkout, silently dropping the isolation the caller asked for
  */
 
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 4;
 
 /** Ops that only a node of at least this protocol understands (absent = any node). */
 export const OP_MIN_PROTOCOL: Readonly<Record<string, number>> = { "state.prune": 3 };
@@ -28,13 +30,13 @@ export function requiredProtocolForOp(op: string): { version: number; feature?: 
 }
 
 /** Minimum node protocol a request feature needs; a node below it would silently ignore the field. */
-export const FEATURE_MIN_PROTOCOL = { harness: 1, expect: 2 } as const;
+export const FEATURE_MIN_PROTOCOL = { harness: 1, expect: 2, isolation: 4 } as const;
 
 /**
  * The lowest node protocol that can honor every non-default feature on this
  * request (0 when it uses none). Only launching ops carry such features.
  */
-export function requiredProtocol(task: { harness?: unknown; expect?: unknown }): { version: number; feature?: string } {
+export function requiredProtocol(task: { harness?: unknown; expect?: unknown; isolation?: unknown }): { version: number; feature?: string } {
   let version = 0;
   let feature: string | undefined;
   if (typeof task.harness === "string" && task.harness && task.harness !== "opencode") {
@@ -44,6 +46,10 @@ export function requiredProtocol(task: { harness?: unknown; expect?: unknown }):
   if (task.expect !== undefined && task.expect !== null && FEATURE_MIN_PROTOCOL.expect > version) {
     version = FEATURE_MIN_PROTOCOL.expect;
     feature = "the verification gate (expect)";
+  }
+  if (typeof task.isolation === "string" && task.isolation !== "none" && FEATURE_MIN_PROTOCOL.isolation > version) {
+    version = FEATURE_MIN_PROTOCOL.isolation;
+    feature = `per-run isolation "${task.isolation}"`;
   }
   return { version, feature };
 }
