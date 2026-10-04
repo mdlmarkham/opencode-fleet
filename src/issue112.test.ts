@@ -30,7 +30,7 @@ describe("#112: corpus loading", () => {
     const bad = JSON.stringify({ version: "1", tasks: [{ id: "x", goal: "g", expect: {} }] });
     const r = loadCorpus(bad);
     expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.error).toMatch(/at least one file or a command/);
+    if (!r.ok) expect(r.error).toMatch(/at least one file or a command|requires at least one/);
   });
 
   it("requires a version (so a corpus change is traceable)", () => {
@@ -38,6 +38,39 @@ describe("#112: corpus loading", () => {
     const r = loadCorpus(bad);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toMatch(/version is required/);
+  });
+
+  it("reuses the #40 gate: rejects the expect shapes parseExpectSpec rejects (reviewer finds)", () => {
+    // The #121 review caught loadCorpus hand-rolling a weaker expect check than
+    // verify.ts#parseExpectSpec. These must all be REJECTED at load.
+    const mk = (exp: unknown) => JSON.stringify({ version: "1", tasks: [{ id: "x", goal: "g", expect: exp }] });
+    for (const [label, exp] of [
+      ["files non-string", { files: [123], command: "pytest -q" }],
+      ["files ../escape", { files: ["../etc/passwd"] }],
+      ["files absolute", { files: ["/etc/passwd"] }],
+      ["empty command", { command: "  " }],
+      ["expect with neither", {}],
+    ] as Array<[string, unknown]>) {
+      expect(loadCorpus(mk(exp)).ok, label).toBe(false);
+    }
+  });
+
+  it("rejects a non-numeric timeoutMs rather than silently dropping it", () => {
+    const raw = JSON.stringify({ version: "1", tasks: [{ id: "x", goal: "g", expect: { command: "true" }, timeoutMs: "9999" }] });
+    const r = loadCorpus(raw);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/timeoutMs/);
+  });
+
+  it("stores the NORMALIZED expect from parseExpectSpec", () => {
+    const raw = JSON.stringify({ version: "1", tasks: [{ id: "x", goal: "g", expect: { files: [], command: "pytest -q" } }] });
+    const r = loadCorpus(raw);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      // an empty file list checks nothing -> parseExpectSpec drops it to undefined
+      expect(r.tasks[0].expect.files).toBeUndefined();
+      expect(r.tasks[0].expect.command).toBe("pytest -q");
+    }
   });
 
   it("rejects duplicate ids, bad slugs, empty goal, and non-JSON", () => {

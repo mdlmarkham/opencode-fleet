@@ -10,7 +10,7 @@
  * dispatch lives in the runner so this can be unit-tested with no node.
  */
 
-import type { ExpectCheck } from "./verify.js";
+import { parseExpectSpec, type ExpectCheck } from "./verify.js";
 
 /** One benchmark task. `expect` is mandatory: a task with no check is not a benchmark. */
 export interface BenchTask {
@@ -60,27 +60,33 @@ export function loadCorpus(raw: string): CorpusResult {
     if (typeof t.goal !== "string" || t.goal.trim() === "") {
       return { ok: false, error: `${where}.goal is required` };
     }
-    if (!t.expect || typeof t.expect !== "object") {
+    if (t.expect === undefined || t.expect === null) {
       return { ok: false, error: `${where}.expect is required — a task with no check is not a benchmark` };
     }
-    const expect = t.expect as ExpectCheck;
-    const files = Array.isArray(expect.files) ? expect.files : [];
-    const hasFiles = files.length > 0;
-    const hasCmd = typeof expect.command === "string" && expect.command.trim() !== "";
-    if (!hasFiles && !hasCmd) {
+    // Reuse the canonical #40 gate validation (issue #121 review): parseExpectSpec
+    // rejects non-string/empty/absolute/`..` file entries and empty commands, and
+    // returns the NORMALIZED check. Never hand-roll this — a weaker local check
+    // let malformed expects flow straight into evaluateExpect.
+    const parsed = parseExpectSpec(t.expect);
+    if (!parsed.ok) return { ok: false, error: `${where}.expect ${parsed.error}` };
+    if (!parsed.expect) {
       return { ok: false, error: `${where}.expect must name at least one file or a command` };
     }
+    const expect: ExpectCheck = parsed.expect;
     if (t.acceptance !== undefined && (!Array.isArray(t.acceptance) || t.acceptance.some((a) => typeof a !== "string"))) {
       return { ok: false, error: `${where}.acceptance must be an array of strings` };
     }
     if (t.tags !== undefined && (!Array.isArray(t.tags) || t.tags.some((a) => typeof a !== "string"))) {
       return { ok: false, error: `${where}.tags must be an array of strings` };
     }
+    if (t.timeoutMs !== undefined && (typeof t.timeoutMs !== "number" || !Number.isFinite(t.timeoutMs) || t.timeoutMs <= 0)) {
+      return { ok: false, error: `${where}.timeoutMs must be a positive number` };
+    }
     tasks.push({
       id: t.id,
       goal: t.goal,
       ...(t.acceptance ? { acceptance: t.acceptance } : {}),
-      expect: t.expect as ExpectCheck,
+      expect,
       ...(typeof t.timeoutMs === "number" ? { timeoutMs: t.timeoutMs } : {}),
       ...(t.tags ? { tags: t.tags } : {}),
     });
