@@ -23,7 +23,7 @@
  * state (temp file 0600 in the same directory, renamed over the target).
  */
 
-import { mkdir, readFile } from "node:fs/promises";
+import { mkdir, readFile, appendFile, stat, rm, rename } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { writePrivate } from "./paths.js";
 import { makeDecider, parseS1Config, type AuditSink } from "./decision-backends.js";
@@ -62,22 +62,67 @@ const appendChains = new Map<string, Promise<void>>();
 
 async function appendJsonLineOnce(path: string, entry: object): Promise<void> {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-  let existing = "";
-  try {
-    existing = await readFile(path, "utf8");
-  } catch {
-    existing = ""; // first line (or the file vanished); append starts fresh
-  }
-  // Same private+atomic style as saveLedger/writePrivate: a 0600 temp file in
-  // the same directory, renamed over the target (crash cannot leave a
-  // truncated line, and the file is never group/other readable).
-  await writePrivate(path, `${existing}${JSON.stringify(entry)}\n`);
+  await rotateIfNeeded(path);
+  // Issue #102: APPEND, do not read-modify-write. The old form read the whole
+  // file and rewrote it (temp+rename) on every dispatch — O(n) per append and
+  // unbounded. A single line-sized appendFile is atomic enough and O(1).
+  await appendFile(path, `${JSON.stringify(entry)}\n`, { mode: 0o600 });
+}
+
+/** Issue #102: default size cap before rotation (bytes) and files kept. */
+export const SHADOW_LOG_MAX_BYTES = 8 * 1024 * 1024;
+export const SHADOW_LOG_KEEP = 3;
+
+/** Overridable via ShadowLogOptions (tests, operator config). */
+export interface ShadowLogOptions {
+  maxBytes?: number;
+  keep?: number;
+}
+
+let shadowLogOpts: ShadowLogOptions = {};
+/** Set process-wide rotation bounds (from `s1` config). */
+export function setShadowLogOptions(opts: ShadowLogOptions): void {
+  shadowLogOpts = { ...opts };
 }
 
 /**
- * Serialize all appends to one path. Two fire-and-forget shadow calls must not
- * read-modify-write each other into a lost line; dispatches can interleave at
- * await points, so appends are chained per path.
+ * Rotate `path` -> `path.1` -> `path.2` ... when it exceeds maxBytes, keeping
+ * `keep` rotated files. Best-effort: a rotation failure must not lose the append.
+ */
+async function rotateIfNeeded(path: string): Promise<void> {
+  const cap = typeof shadowLogOpts.maxBytes === "number" && shadowLogOpts.maxBytes > 0 ? shadowLogOpts.maxBytes : SHADOW_LOG_MAX_BYTES;
+  const keep = typeof shadowLogOpts.keep === "number" && shadowLogOpts.keep >= 0 ? shadowLogOpts.keep : SHADOW_LOG_KEEP;
+  let size: number;
+  try {
+    size = (await stat(path)).size;
+  } catch {
+    return; // no existing file -> nothing to rotate
+  }
+  if (size < cap) return;
+  try {
+    // drop the oldest, then shift each down, then move the live file to .1
+    if (keep === 0) {
+      await rm(path, { force: true });
+      return;
+    }
+    await rm(`${path}.${keep}`, { force: true });
+    for (let i = keep - 1; i >= 1; i--) {
+      try {
+        await rename(`${path}.${i}`, `${path}.${i + 1}`);
+      } catch {
+        /* that generation may not exist */
+      }
+    }
+    await rename(path, `${path}.1`);
+  } catch {
+    /* best-effort: if rotation fails we still append to the live file */
+  }
+}
+/**
+ * Serialize all appends to one path (in-process). Issue #102: two gateway
+ * processes sharing a rootDir can still interleave, but a single line-sized
+ * appendFile is far narrower than the old read-modify-write, and each writes a
+ * complete line, so a shared file loses at most ordering, never content.
  */
 function appendJsonLine(path: string, entry: object): Promise<void> {
   const prev = appendChains.get(path) ?? Promise.resolve();
@@ -121,10 +166,18 @@ export interface ShadowDeps {
   rootDir?: string;
 }
 
+/** Issue #102: warn ONCE per process when an `s1` config is present but invalid. */
+let warnedInvalidConfig = false;
+
+/** Test hook: reset the once-per-process warning latch. */
+export function resetShadowConfigWarning(): void {
+  warnedInvalidConfig = false;
+}
+
 /**
  * Build the shadow decider for the plugin's `s1` config, or `undefined` when
  * S1 is disabled for shadow purposes:
- *   - `parseS1Config(cfgS1)` fails (invalid config) => undefined;
+ *   - `parseS1Config(cfgS1)` fails (invalid config) => undefined (and one warning);
  *   - the parsed mode is `off`                      => undefined.
  * Otherwise returns `makeDecider(config, { sink })` where the sink defaults to
  * appending one JSON line to `<rootDir>/.opencode-fleet/s1-shadow.jsonl` and
@@ -133,7 +186,16 @@ export interface ShadowDeps {
 export function buildShadowDecider(cfgS1: unknown, deps: ShadowDeps = {}): DeciderLike | undefined {
   try {
     const parsed = parseS1Config(cfgS1);
-    if (!parsed.ok || parsed.config.mode === "off") return undefined;
+    if (!parsed.ok) {
+      // Issue #102: an invalid config used to disable shadow SILENTLY, so the
+      // operator assumed evidence was being collected. Warn once, naming the error.
+      if (cfgS1 !== undefined && cfgS1 !== null && !warnedInvalidConfig) {
+        warnedInvalidConfig = true;
+        console.warn(`[opencode-fleet] s1 config is present but invalid; shadow evidence is NOT being collected: ${parsed.error}`);
+      }
+      return undefined;
+    }
+    if (parsed.config.mode === "off") return undefined;
     if (deps.decider) return deps.decider;
     return makeDecider(parsed.config, {
       sink: deps.sink ?? shadowFileSink(deps.rootDir),
@@ -301,7 +363,15 @@ export function recordDispatchShadow(
 ): void {
   const p = (async () => {
     try {
-      const decider = buildShadowDecider(cfgS1, { ...(rootDir ? { rootDir } : {}), ...(deps?.decider ? { decider: deps.decider } : {}) });
+      // Issue #102: ONE record per dispatch. The decider's own audit sink and the
+      // shadow record both used to write a line per dispatch (a `decision` entry
+      // plus an `s1-shadow` entry). Give the decider a no-op audit sink here so
+      // only the single bounded shadow record is written.
+      const decider = buildShadowDecider(cfgS1, {
+        ...(rootDir ? { rootDir } : {}),
+        ...(deps?.decider ? { decider: deps.decider } : {}),
+        sink: () => Promise.resolve(),
+      });
       if (!decider) return; // S1 off/invalid for shadow purposes: do nothing
       const candidates = DISPATCH_ROUTE_CANDIDATES.slice();
       const task = typeof req?.task === "string" ? req.task : "";

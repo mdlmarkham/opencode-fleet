@@ -626,10 +626,10 @@ describe("issue #79b e2e: fleet_dispatch with s1 configured (shadow records-only
     });
     expect(body.questions[DISPATCH_ROUTE_QUESTION_ID]?.instructions).toContain(TASK);
 
-    // The shadow log carries the bounded record (and the client-level audit line).
+    // Issue #102: ONE record per dispatch (the double-write was merged).
     await shadowRecords(rootDir, (recs, allLines, kinds) => {
-      expect(allLines).toBe(2);
-      expect(kinds.slice().sort()).toEqual(["decision", "s1-shadow"]);
+      expect(allLines).toBe(1);
+      expect(kinds).toEqual(["s1-shadow"]);
       expect(recs).toHaveLength(1);
       expect(recs[0].ok).toBe(true);
       expect(recs[0].questionId).toBe(DISPATCH_ROUTE_QUESTION_ID);
@@ -711,7 +711,7 @@ describe("issue #79b e2e: fleet_dispatch with s1 configured (shadow records-only
     await drainShadowDecisions();
     expectUnchangedDispatchShape(details);
     await shadowRecords(rootDir, (recs, allLines) => {
-      expect(allLines).toBe(2); // the client-level CallLog error AND the record error
+      expect(allLines).toBe(1); // issue #102: one record per dispatch
       expect(recs).toHaveLength(1);
       expect(recs[0].ok).toBe(false);
       expect(typeof recs[0].error).toBe("string");
