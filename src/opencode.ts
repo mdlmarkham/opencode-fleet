@@ -40,6 +40,12 @@ export interface OpenCodeTask {
   piTools?: string[];
   /** Run Pi with `--offline` (no automatic network activity). Fail-closed like piTools. */
   piOffline?: boolean;
+  /**
+   * Opt-in (harness="pi"): ask Pi for `--mode json` and parse the JSONL events into tool calls,
+   * usage and a reliable final message. Only applied when the node's Pi lists `--mode`; otherwise
+   * the plain-text path runs unchanged.
+   */
+  piJson?: boolean;
   /** Optional model override (must exist on the node's provider). */
   model?: string;
   /** Optional agent (build/plan). */
@@ -124,6 +130,19 @@ export interface OpenCodeRunResult {
    */
   verified?: boolean | null;
   verifyDetails?: VerifyDetails;
+  /** Pi `--mode json` only (#137 Pi-1): tools the worker ran, in order. */
+  toolCalls?: PiToolCall[];
+  /** Pi `--mode json` only: provider-reported usage from the last assistant message, passed through. */
+  usage?: Record<string, unknown>;
+  /** Pi `--mode json` only: the assistant's stopReason. */
+  stopReason?: string;
+}
+
+export interface PiToolCall {
+  tool: string;
+  /** The bash command, or a short rendering of the args, redacted and capped. */
+  input?: string;
+  isError?: boolean;
 }
 
 import { shq } from "./shell.js";
@@ -379,6 +398,7 @@ export function validatePiOptions(task: { piTools?: unknown; piOffline?: unknown
     }
   }
   if (task.piOffline !== undefined && typeof task.piOffline !== "boolean") return "piOffline must be a boolean";
+  if ((task as { piJson?: unknown }).piJson !== undefined && typeof (task as { piJson?: unknown }).piJson !== "boolean") return "piJson must be a boolean";
   return null;
 }
 
@@ -387,7 +407,7 @@ export function validatePiOptions(task: { piTools?: unknown; piOffline?: unknown
  * Baseline hardening flags are added only when supported, so an older Pi still runs; requested
  * restrictions (piTools, piOffline) are mandatory: unsupported means exit 67, never unrestricted.
  */
-export function piFlagLines(task: { piTools?: string[]; piOffline?: boolean }): string[] {
+export function piFlagLines(task: { piTools?: string[]; piOffline?: boolean; piJson?: boolean }): string[] {
   const lines = [
     'PI_HELP="$(pi --help 2>&1)"',
     'PI_FLAGS=""',
@@ -399,10 +419,14 @@ export function piFlagLines(task: { piTools?: string[]; piOffline?: boolean }): 
     lines.push(task.piTools.length === 0 ? need("--no-tools", "--no-tools") : need("--tools", `--tools ${task.piTools.join(",")}`));
   }
   if (task.piOffline === true) lines.push(need("--offline", "--offline"));
+  // Output format only, so a node without it just keeps the plain-text path.
+  if (task.piJson === true) lines.push('case "$PI_HELP" in *"--mode"*) PI_FLAGS="$PI_FLAGS --mode json";; esac');
   return lines;
 }
 
 export function parsePiOutput(raw: string, exec?: ExecStatus): OpenCodeRunResult {
+  const events = parsePiJsonEvents(raw);
+  if (events) return parsePiJsonOutput(raw, events, exec);
   const summary = redactSecrets(raw.trim().slice(-4000));
   const handRaiseMatch = summary.match(/HAND_RAISE\s*[:\-]?\s*([\s\S]{1,500})/i);
   const handRaised = Boolean(handRaiseMatch);
@@ -435,5 +459,93 @@ export function parsePiOutput(raw: string, exec?: ExecStatus): OpenCodeRunResult
     handRaised,
     question,
     ...(error ? { error } : {}),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Pi `--mode json` (#137 Pi-1). Shapes follow Pi's docs (json.md), not yet verified live:
+// every field is read defensively and anything unexpected is ignored, never thrown on.
+// ---------------------------------------------------------------------------
+
+type PiEvent = Record<string, unknown>;
+const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+
+/** The JSON event lines of a Pi run, or null when the output is not JSONL (plain-text path). */
+export function parsePiJsonEvents(raw: string): PiEvent[] | null {
+  const events: PiEvent[] = [];
+  for (const line of raw.split("\n")) {
+    const t = line.trim();
+    if (!t.startsWith("{")) continue;
+    try {
+      const v: unknown = JSON.parse(t);
+      if (isObj(v) && typeof v.type === "string") events.push(v);
+    } catch { /* a stray non-JSON line */ }
+  }
+  return events.some((e) => e.type === "message_end" || e.type === "agent_end" || e.type === "agent_start") ? events : null;
+}
+
+function textOf(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.map((b) => (isObj(b) && b.type === "text" && typeof b.text === "string" ? b.text : "")).join("");
+}
+
+const cap = (s: string, n: number): string => redactSecrets(s.length > n ? `${s.slice(0, n)}…` : s);
+
+function parsePiJsonOutput(raw: string, events: PiEvent[], exec?: ExecStatus): OpenCodeRunResult {
+  let finalText = "";
+  let stopReason: string | undefined;
+  let usage: Record<string, unknown> | undefined;
+  let providerError: string | undefined;
+  const toolCalls: PiToolCall[] = [];
+  const open = new Map<string, PiToolCall>();
+  for (const e of events) {
+    if (e.type === "message_end" && isObj(e.message) && e.message.role === "assistant") {
+      const text = textOf(e.message.content);
+      if (text) finalText = text;
+      if (typeof e.message.stopReason === "string") stopReason = e.message.stopReason;
+      if (isObj(e.message.usage)) usage = e.message.usage;
+    } else if (e.type === "message_update") {
+      if (isObj(e.usage)) usage = e.usage;
+      const ame = e.assistantMessageEvent;
+      if (isObj(ame) && ame.type === "error") providerError = cap(String(ame.reason ?? ame.error ?? "provider error"), 300);
+    } else if (e.type === "tool_execution_start" && typeof e.toolName === "string") {
+      const a = isObj(e.args) ? e.args : {};
+      const input = typeof a.command === "string" ? a.command : Object.keys(a).length ? JSON.stringify(a) : undefined;
+      const call: PiToolCall = { tool: e.toolName, ...(input ? { input: cap(input, 500) } : {}) };
+      toolCalls.push(call);
+      if (typeof e.toolCallId === "string") open.set(e.toolCallId, call);
+    } else if (e.type === "tool_execution_end" && typeof e.toolCallId === "string") {
+      const call = open.get(e.toolCallId);
+      if (call && e.isError === true) call.isError = true;
+    }
+  }
+  const summary = redactSecrets((finalText || raw).trim().slice(-4000));
+  const handRaiseMatch = summary.match(/HAND_RAISE\s*[:\-]?\s*([\s\S]{1,500})/i);
+  const cdError = /(^|\n)FLEET_ERROR:/.test(raw);
+  const timedOut = exec?.timedOut === true || /(^|\n)\[timeout\]/.test(raw) || exec?.exitCode === 124;
+  const stuck = exec?.stuck === true || /(^|\n)\[stuck:/.test(raw);
+  const nonzeroExit = typeof exec?.exitCode === "number" && exec.exitCode !== 0;
+  const modelFailed = stopReason === "error" || (providerError !== undefined && !finalText);
+  const failed = cdError || timedOut || stuck || nonzeroExit || modelFailed;
+  let error: string | undefined;
+  if (failed) {
+    if (cdError) error = raw.match(/(?:^|\n)(FLEET_ERROR:[^\n]*)/)?.[1] ?? "worker could not enter cwd";
+    else if (timedOut) error = `pi run timed out${exec?.exitCode != null ? ` (exit ${exec.exitCode})` : ""}`;
+    else if (stuck) error = `pi run killed by watchdog: ${raw.match(/\[stuck:[^\]]*\]/)?.[0] ?? "stuck"}`;
+    else if (nonzeroExit) error = `pi run exited non-zero (exit ${exec?.exitCode})`;
+    else error = `pi run failed: ${providerError ?? `stopReason ${stopReason}`}`;
+  }
+  return {
+    ok: !failed,
+    harness: "pi",
+    transport: "http",
+    summary: handRaiseMatch ? summary.replace(/HAND_RAISE\s*[:\-]?\s*/i, "").trim() : summary,
+    handRaised: Boolean(handRaiseMatch),
+    ...(handRaiseMatch ? { question: sanitizeQuestion(handRaiseMatch[1]) } : {}),
+    ...(error ? { error } : {}),
+    toolCalls,
+    ...(usage ? { usage } : {}),
+    ...(stopReason ? { stopReason } : {}),
   };
 }
