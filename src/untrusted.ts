@@ -9,50 +9,12 @@
  */
 
 /**
- * Patterns for common credential shapes.
- *
- * FAIL-CLOSED (issue #101 review): the mechanism is a BROAD class, and the
- * exact-shape rules are a bonus — never the other way round. A fixed pattern set
- * leaks silently the moment a vendor changes a token's shape. So the FLOOR is:
- * any long random-looking run next to a credential-ish context word, or any long
- * run that is not ordinary prose, is redacted. That will occasionally redact a
- * non-secret (a long hex digest, a base64 blob). That is the CORRECT failure
- * direction for a redactor: never leak to protect a false positive.
+ * Secret redaction now lives in `./redact.ts` (fail-closed, inverted polarity:
+ * redact by default, spare only positively-identified prose). Re-exported here so
+ * existing callers keep importing from `./untrusted.js`.
  */
-type Replacer = string | ((substring: string, ...args: any[]) => string);
-const SECRET_PATTERNS: Array<[RegExp, Replacer]> = [
-  [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, "[REDACTED:private-key]"],
-  // A PEM header on its own line (diff scanners see one line at a time).
-  [/-----BEGIN [A-Z ]*PRIVATE KEY-----/g, "[REDACTED:private-key]"],
-  // --- BONUS: known exact shapes (fast, precise, but never the only line) ---
-  [/(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36}/g, "[REDACTED:github-token]"],
-  [/github_pat_[A-Za-z0-9_]{82}/g, "[REDACTED:github-token]"],
-  [/sk-(?:ant-)?[A-Za-z0-9_-]{20,}/g, "[REDACTED:api-key]"],
-  [/AKIA[0-9A-Z]{16}/g, "[REDACTED:aws-key]"],
-  [/xox[abprs]-[A-Za-z0-9-]{10,}/g, "[REDACTED:slack-token]"],
-  // --- FLOOR (fail-closed): a credential-ish key word, then any long opaque run ---
-  // Catches shape changes and unknown vendors: the context word is the signal,
-  // the value is redacted whatever its exact shape.
-  [
-    /\b(?:api[_-]?key|apikey|secret|token|password|passwd|passphrase|authorization|auth|access[_-]?key|private[_-]?key|client[_-]?secret|credential|bearer)["']?\s*[:=]\s*["']?[^\s"',;]{6,}/gi,
-    "[REDACTED:credential]",
-  ],
-  // A long (>= 20) opaque run of token-ish characters that is NOT ordinary prose
-  // (no spaces, no sentence punctuation, mixed case or digits) is redacted. Bounded
-  // on both sides by a word boundary so it cannot swallow neighbouring text.
-  [/(?<![A-Za-z0-9])[A-Za-z0-9][A-Za-z0-9_-]{19,}(?![A-Za-z0-9_-])/g, (m: string) => (/(?:[A-Za-z][0-9]|[0-9][A-Za-z]|[A-Z][a-z])/.test(m) ? "[REDACTED:opaque]" : m)],
-];
-
-/** Mask credential-shaped substrings so they do not reach the ledger or an agent's context. */
-export function redactSecrets(text: string): string {
-  let out = text;
-  for (const [re, rep] of SECRET_PATTERNS) {
-    out = typeof rep === "string"
-      ? out.replace(re, rep)
-      : out.replace(re, rep as (substring: string, ...args: any[]) => string);
-  }
-  return out;
-}
+import { redactSecrets } from "./redact.js";
+export { redactSecrets };
 
 /** Strip control characters (keeping \n and \t), then cap length. */
 export function sanitizeText(text: string, max: number): string {
