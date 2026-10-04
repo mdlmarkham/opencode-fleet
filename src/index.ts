@@ -276,6 +276,7 @@ export default definePluginEntry({
           },
           piModel: { type: "string", description: "Pi model override (harness=pi); `provider/id` ref, e.g. myprovider/some-model. Falls back to the operator's piDefaultModel config." },
           piTools: { type: "array", items: { type: "string" }, description: "Pi tool allowlist (harness=pi), e.g. ['read','grep','ls'] for a read-only reviewer; [] disables all tools. Omitted = Pi defaults (read, bash, edit, write...). Fails closed: a node whose Pi lacks --tools refuses the run." },
+          piJson: { type: "boolean", description: "Opt-in (harness=pi): run Pi with --mode json (when the node's Pi supports it) so the result carries toolCalls, usage and stopReason and the final message is read from structured events. Default false." },
           piOffline: { type: "boolean", description: "Run Pi with --offline (no automatic network activity). Fails closed if the node's Pi lacks the flag." },
           model: { type: "string", description: "Optional model override (must exist on node)." },
           agent: { type: "string", description: "Optional OpenCode agent (build/plan)." },
@@ -324,6 +325,7 @@ export default definePluginEntry({
           piModel?: string;
           piTools?: string[];
           piOffline?: boolean;
+          piJson?: boolean;
           model?: string;
           agent?: string;
           autoApprove?: boolean;
@@ -545,8 +547,8 @@ export default definePluginEntry({
             results[nodeKey] = { ok: false, error: "isolation \"clone\" needs a detached run (transport http, async not false): the clone is made by the node when the run starts" };
             continue;
           }
-          if (routed.harness !== "pi" && (p.piTools !== undefined || p.piOffline !== undefined)) {
-            results[nodeKey] = { ok: false, error: "piTools/piOffline apply to harness=pi only; refusing so the restriction is not silently ignored" };
+          if (routed.harness !== "pi" && (p.piTools !== undefined || p.piOffline !== undefined || p.piJson !== undefined)) {
+            results[nodeKey] = { ok: false, error: "piTools/piOffline/piJson apply to harness=pi only; refusing so the restriction is not silently ignored" };
             continue;
           }
           const piOptsErr = validatePiOptions(p);
@@ -562,6 +564,7 @@ export default definePluginEntry({
             piModel,
             ...(p.piTools !== undefined ? { piTools: p.piTools } : {}),
             ...(p.piOffline !== undefined ? { piOffline: p.piOffline } : {}),
+            ...(p.piJson === true ? { piJson: true } : {}),
             model: p.model,
             agent: p.agent,
             autoApprove: p.autoApprove === true,
