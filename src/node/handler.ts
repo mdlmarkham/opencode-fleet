@@ -15,6 +15,7 @@ import {
   parseOpenCodeOutput,
   parsePiOutput,
   validateHarnessTransport,
+  validatePiOptions,
   type OpenCodeTask,
 } from "../opencode.js";
 import type { VerifyDetails } from "../verify.js";
@@ -692,6 +693,8 @@ export async function handleOpencodeRun(
   // roots before any destructive/clone operation can run.
   const idErr = validateTaskIds(task);
   if (idErr) return stampProtocol(JSON.stringify({ ok: false, error: idErr }));
+  const piErr = validatePiOptions(task);
+  if (piErr) return stampProtocol(JSON.stringify({ ok: false, error: piErr }));
   if (taskUsesCwd(task.prompt)) {
     const cwdCheck = await guardCwd(task.cwd);
     if (!cwdCheck.ok) return stampProtocol(JSON.stringify({ ok: false, error: `refused: ${cwdCheck.error}` }));

@@ -179,6 +179,8 @@ Worker work is pushed with the manager's credentials, so `fleet_sync` applies a 
 
 `opencode.run` requests carry an explicit `op` (`run`, `run.start`, `run.status`, `xfer.receive`, `bundle`, ...) and a `protocol` version; every node reply echoes `protocol`. The old `__SENTINEL__` prompts remain as a compatibility encoding: with no `op` the prompt decides, and when both are present they must agree, so a task prompt can never be promoted to a control message nor a control message passed off as a task. `fleet_dispatch` also rejects a task prompt that equals a sentinel.
 
+**Pi restrictions.** Every Pi run is started with `--no-session --no-approve --no-extensions --no-skills`, each only if this node's `pi --help` lists it (an older Pi still runs, unhardened). A dispatch may add `piTools` (an allowlist passed as `--tools`; `[]` means `--no-tools`) and `piOffline` (`--offline`). These are mandatory once requested: if the node's Pi lacks the flag the run exits 67 instead of running unrestricted, and a node below protocol 5 refuses the dispatch. Pi has no permission system of its own, so this allowlist is the only tool-level control. See #137.
+
 Nodes that predate the protocol report none (protocol 0). They ignore `harness`/`piModel`, so a dispatch with a non-default harness first probes the node (a harmless `run.status` for an id that cannot exist) and is refused with "upgrade opencode-fleet on the node" instead of silently running the wrong engine. The probe result is cached for five minutes.
 
 ## SSH access

@@ -27,7 +27,7 @@ import { shq } from "./shell.js";
 describe("issue #30A: buildOpenCodeCommand (pi) + autoApprove", () => {
   it("drives pi with the supplied Pi model, prompt via stdin (findings B+C)", () => {
     const cmd = buildOpenCodeCommand({ prompt: "do work", cwd: "/work", transport: "http", harness: "pi", piModel: "p/m1" });
-    expect(cmd).toContain("pi -p --model 'p/m1'");
+    expect(cmd).toContain("pi -p $PI_FLAGS --model 'p/m1'");
     expect(cmd).toContain("printf '%s' 'do work' |");
     expect(cmd).not.toContain("opencode run");
   });
@@ -62,7 +62,7 @@ describe("issue #30A: buildOpenCodeCommand (pi) + autoApprove", () => {
     const hostile = `-rf /; echo "$(id)" && it's`;
     const cmd = buildOpenCodeCommand({ prompt: hostile, cwd: "/w", transport: "http", harness: "pi", piModel: "p/m1" });
     expect(cmd).toContain(`printf '%s' ${shq(hostile)} |`);
-    expect(cmd).toContain("pi -p --model");
+    expect(cmd).toContain("pi -p $PI_FLAGS --model");
     // No `--` end-of-options separator (pi rejects it: Unknown option: --),
     // and no positional prompt trailing the flags.
     expect(cmd).not.toContain(" -- ");
