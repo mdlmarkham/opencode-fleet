@@ -64,6 +64,8 @@ export interface LedgerEntry {
    *  Absent for prompt-only dispatches (backward compatible: the key is not
    *  materialized when no spec was given). */
   spec?: TaskSpec;
+  /** Files the run changed outside its declared `spec.scope`, as reported by the node when the finished run was observed (issue #104). Absent: never observed. null: a scope was declared but the node could not report. */
+  scopeViolations?: string[] | null;
   /** Design-gate objections the caller acknowledged to dispatch anyway (issue #117), with their reasons. */
   gateAcknowledged?: Array<{ objectionId: string; reason: string }>;
 }
@@ -150,7 +152,7 @@ export interface SyncGate {
  * configured, or no run is recorded) is allowed with a caution, or refused when
  * the operator requires verified work. Never silently treats null as true.
  */
-export function syncGate(entry: LedgerEntry | undefined, opts: { allowUnverified?: boolean; requireVerified?: boolean }): SyncGate {
+function verifyGate(entry: LedgerEntry | undefined, opts: { allowUnverified?: boolean; requireVerified?: boolean }): SyncGate {
   if (!entry) {
     return opts.requireVerified && !opts.allowUnverified
       ? { allow: false, verified: null, reason: "sync.requireVerified is set and no fleet run is recorded for this node and checkout, so there is no verification to rely on (pass allowUnverified to override)" }
@@ -166,6 +168,34 @@ export function syncGate(entry: LedgerEntry | undefined, opts: { allowUnverified
   return opts.requireVerified && !opts.allowUnverified
     ? { allow: false, verified: null, runId: entry.runId, reason: `sync.requireVerified is set and run ${entry.runId} has no verification result (dispatch with expect/spec.verify, or pass allowUnverified)` }
     : { allow: true, verified: null, runId: entry.runId, reason: `run ${entry.runId} has no verification result; the work is unverified` };
+}
+
+export interface SyncGateOptions {
+  allowUnverified?: boolean;
+  requireVerified?: boolean;
+  /** Operator policy (issue #104): refuse a run that changed files outside its declared scope, or whose scope was never checked. */
+  blockOnScopeViolation?: boolean;
+  /** Caller override for the scope policy; recorded in the reason. */
+  allowScopeViolations?: boolean;
+}
+
+/**
+ * Whether the latest run's work may be published. Verification comes first (a failed gate is never
+ * bypassed by the scope override). The scope policy only applies when it is on AND the run declared
+ * a scope; "not observed" and "node could not report" are refusals, never treated as clean.
+ */
+export function syncGate(entry: LedgerEntry | undefined, opts: SyncGateOptions): SyncGate {
+  const base = verifyGate(entry, opts);
+  if (!base.allow || !opts.blockOnScopeViolation || !entry?.spec?.scope) return base;
+  const v = entry.scopeViolations;
+  if (Array.isArray(v) && v.length === 0) return base;
+  const detail = Array.isArray(v)
+    ? `run ${entry.runId} changed ${v.length} file(s) outside its declared scope: ${v.slice(0, 5).join(", ")}${v.length > 5 ? ", ..." : ""}`
+    : v === null
+      ? `run ${entry.runId} declared a scope but the node could not report which files changed`
+      : `run ${entry.runId} declared a scope that was never checked (call fleet_run_status on the finished run first)`;
+  if (opts.allowScopeViolations) return { ...base, reason: [base.reason, `overridden (allowScopeViolations): ${detail}`].filter(Boolean).join("; ") };
+  return { allow: false, verified: base.verified, runId: entry.runId, reason: `sync.blockOnScopeViolation is set and ${detail}. Review the changes, or pass allowScopeViolations: true to publish anyway` };
 }
 
 /** A recipe outcome never reports success for a run whose gate failed or whose process failed. */

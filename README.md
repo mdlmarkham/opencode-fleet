@@ -176,6 +176,7 @@ Worker work is pushed with the manager's credentials, so `fleet_sync` applies a 
 - **Protected branches** (default `main`, `master`) are never pushed directly. The work goes to `fleet/<worker-branch or sync-id>` and the result reports `redirectedFrom`; open a PR from it. List a branch in `sync.allowDirectPush` to allow direct pushes to it.
 - **CI/CODEOWNERS paths** (`.github/workflows/**`, `.github/actions/**`, `CODEOWNERS`, `.gitlab-ci.yml`, `.circleci/**`, `Jenkinsfile`, …) in the worker's changes are refused unless `sync.allowSensitivePaths` is set; add your own with `sync.sensitivePaths`.
 - **Credential-shaped text** in added lines (tokens, keys, private keys, password assignments) is refused; nothing is pushed and the secret is never echoed.
+- **Scope policy** (opt in with `sync.blockOnScopeViolation: true`): a run that declared `spec.scope` and changed files outside it, or whose scope was never checked (call `fleet_run_status` on the finished run, which records what the node reported), is refused. Pass `allowScopeViolations: true` to publish anyway; that never bypasses a failed verification gate. Runs without a declared scope are not affected. Off by default, where scope violations stay advisory.
 - Branch names that could be read as git options (leading `-`, `..`, …) are refused, and the repo argument is passed after `--`.
 
 ## Node protocol
