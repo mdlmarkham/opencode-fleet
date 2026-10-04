@@ -137,7 +137,14 @@ const DEFAULT_URL = "http://127.0.0.1:8009";
 export function redactDeep(v: unknown): unknown {
   if (typeof v === "string") return redactSecrets(v);
   if (Array.isArray(v)) return v.map(redactDeep);
-  if (isRecord(v)) return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, redactDeep(x)]));
+  if (isRecord(v)) {
+    // Issue #101: redact object KEYS as well as values. Caller-authored keys (e.g.
+    // a choice criteria option name like `opt_<token>`) are strings too, and they
+    // reach an egressing backend unless the key itself is scrubbed.
+    const out: Record<string, unknown> = {};
+    for (const [k, x] of Object.entries(v)) out[redactSecrets(k)] = redactDeep(x);
+    return out;
+  }
   return v;
 }
 

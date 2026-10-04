@@ -70,12 +70,13 @@ describe("issue #35: hand-raise question is bounded and single-line", () => {
 
 describe("issue #35: secret redaction", () => {
   const cases: Array<[string, string]> = [
-    ["ghp_abcdefghijklmnopqrstuvwxyz0123456789", "github-token"],
-    ["github_pat_11ABCDEFG0123456789_abcdefghijklmnop", "github-token"],
-    ["sk-ant-api03-abcdefghijklmnopqrstuvwxyz", "api-key"],
-    ["AKIAIOSFODNN7EXAMPLE", "aws-key"],
-    ["-----BEGIN RSA PRIVATE KEY-----\nMIIB\n-----END RSA PRIVATE KEY-----", "private-key"],
+    ["ghp_" + "A".repeat(36), "github-token"],
+    ["github_pat_" + "B".repeat(82), "github-token"],
+    ["sk-ant-" + "C".repeat(24), "api-key"],
+    ["AKIA" + "D".repeat(16), "aws-key"],
+    ["-----BEGIN RSA PRIVATE KEY-----", "private-key"],
   ];
+
   for (const [secret, tag] of cases) {
     it(`redacts ${tag}`, () => {
       const out = redactSecrets(`before ${secret} after`);
@@ -84,7 +85,7 @@ describe("issue #35: secret redaction", () => {
     });
   }
   it("redacts key=value and Bearer forms, leaves ordinary text alone", () => {
-    expect(redactSecrets("API_KEY=supersecretvalue123")).toContain("[REDACTED]");
+    expect(redactSecrets("API_KEY=supersecretvalue123")).toContain("[REDACTED:credential]");
     expect(redactSecrets("Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345")).not.toContain("abcdefghijklmnop");
     expect(redactSecrets("password reset flow works")).toBe("password reset flow works");
   });
