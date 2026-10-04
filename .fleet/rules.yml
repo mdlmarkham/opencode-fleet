@@ -1,0 +1,25 @@
+schemaVersion: 1
+rules:
+  - id: protocol-older-node-test
+    severity: block-candidate
+    match:
+      paths: [src/protocol.ts, src/gateway-policy.ts, src/node/handler.ts]
+    message: A wire-protocol change must be proven against an older node.
+    evidence: "Decision 0003; the #76 revert (stamping protocol on every request broke older nodes and poisoned the probe)."
+    requires:
+      - Add a test that simulates a node below the new protocol and shows it refuses instead of silently dropping the feature.
+      - Bump PROTOCOL_VERSION and add a FEATURE_MIN_PROTOCOL entry for any new request field.
+  - id: redaction-false-positive-test
+    severity: advise
+    match:
+      paths: [src/untrusted.ts, src/redact.ts, src/decision-backends.ts]
+    message: A redaction change needs a false-positive test next to the seeded-secret test.
+    evidence: "The rejected global redactor in PR #109 redacted shas, run ids and camelCase."
+    requires:
+      - Show that ordinary text (shas, run ids, identifiers) is not redacted.
+  - id: security-independent-review
+    severity: block-candidate
+    match:
+      paths: [src/guard.ts, src/deny-baseline.ts, src/decision-backends.ts, src/provision.ts, src/ssh.ts]
+    message: Security-boundary changes get an independent review, from a different session than the author.
+    evidence: "Decision 0002 and the review policy open in #45."

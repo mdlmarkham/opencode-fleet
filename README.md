@@ -30,6 +30,7 @@ The **manager** (Main/Metis) holds GitHub credentials and model routing. **Worke
 ### Audit
 - **`fleet_run_report`** — the audit manifest of a finished run: files changed against the start commit, `git diff --stat`, commands the engine ran (opencode reports them; Pi's plain transcript does not, so `commandsRecorded: false`), exit code, duration, token/cost usage, verification and scope results, event-log size, plus the dispatch spec. Raw evidence stays on the node (private state dir); secrets are redacted when it is returned. Fields that could not be captured are `null`, never an implied empty list. Needs a node with the audit trail; an older node is reported as such.
 - **`fleet_design_check`** — dry-run of the deterministic design gate on a task spec, with no model call and no dispatch. It returns a verdict (`accept`, `accept-with-nudges`, `decompose`, `reject-with-reason`) and objections, each with a severity, a message, **cited evidence** (a run id, a count, a missing field) and a suggestion. v1 checks: missing acceptance/verify/scope, a spec too large for one task, and overlap with runs already in flight on the same checkout (pass `node` and `cwd`). `fleet_dispatch` runs the same gate on a structured `spec` according to the `project.gate` setting (`off`, `advise` by default, `enforce`): in `advise` the verdict is attached as `design` unless it is a plain accept; in `enforce` a dispatch is refused while an unacknowledged blocking objection stands. To proceed anyway pass `acknowledge: [{objectionId, reason}]`; the reasons are recorded on the ledger entry (`gateAcknowledged`). A prompt-only dispatch is never gated. Checks that need the `.fleet/` project record (risky surfaces, recorded decisions, baseline failures, "if you touch X also do Y" rules) arrive with that record (#114, #115).
+- **`fleet_project_show`** — what a project believes: the validated `.fleet/` record of a checkout on the gateway host, or the precise validation errors (file, field, message). Read-only, and only under the operator's `project.roots`. See "The `.fleet/` project record" below.
 
 ### Model selection & learning
 - **`fleet_models`** — query the Aperture model catalog (pricing/context) so the agent picks the right model per task
@@ -240,3 +241,23 @@ installed `dist/index.js` sha256 matches the built artifact. Two node-state fact
 - **Use a non-login shell (`bash -c`) for node install/verify** — a login shell (`bash -lc`) sources the profile and can print MOTD/banner text to stdout, corrupting the parsed rc/hash. Parse the last well-formed 64-hex line as the hash.
 - **`[sqlite/transaction] slow SQLite transaction hold` is a transient warning**, not a failure — a clean re-run exits `rc=0`.
 - **Verify the running process, not just "service active"**: check process uptime (confirms restart) and the running code hash (confirms the new build is loaded).
+
+## The `.fleet/` project record
+
+A repo can carry its own context and rules in `.fleet/` (this repository does; use it as the worked example):
+
+```
+.fleet/
+  charter.md                  frontmatter (schemaVersion, name) + sections: Goal, Users, Constraints,
+                              Non-goals, Success criteria, Riskiest assumptions
+  rules.yml                   schemaVersion + rules: [{id, severity, match{paths|keywords}, message, evidence?, requires?}]
+  decisions/NNNN-<slug>.md    frontmatter (schemaVersion, id, title, status, date, scope?, supersededBy?)
+                              + sections: Context, Decision, Alternatives rejected, Consequences
+  roles/ skills/              reserved for #110
+```
+
+Everything in it is **untrusted repo text**: data to show and to check specs against, never instructions to the manager. The parser is strict: unknown keys and unknown sections are errors (an unknown key is where behaviour would be smuggled in), YAML aliases and duplicate keys are refused, files are capped (64 KiB each, 512 KiB total), only the known file names are read, and any symlink under `.fleet/` is refused rather than followed.
+
+**Layering** is built-in defaults < operator config (`project.rules`) < repo `.fleet/`. A repo can add rules and context. It cannot lower an operator rule's severity, redefine what an operator rule matches or says, or declare `block`, which is operator-only. It may tighten an operator `advise` rule to `block-candidate`. **Severities:** `advise` is a nudge; `block-candidate` is the repo asking to block and only takes effect when the operator sets `project.allowRepoBlocking: true`; `block` is operator-only. `project.requireCharterFields` lists charter fields every record must have, and a repo cannot drop them. Each rule in the output has its declared `severity`, its `source`, and what is actually `enforced`.
+
+The design gate (#117) will consult these rules and decisions; today the record is read and validated, and `fleet_project_show` shows it. Reading a record from a node (rather than a checkout on the gateway host) is a follow-up: it needs a new protocol op.
