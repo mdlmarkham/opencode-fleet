@@ -40,6 +40,8 @@ export interface FleetNodeConfig {
   serviceUser?: string;
   /** Free-form platform hint (e.g. "windows", "linux"). Informational. */
   platform?: string;
+  /** Max concurrent runs the gateway will start on this node (issue #39); overrides `capacity.maxConcurrentPerNode`. */
+  maxConcurrent?: number;
   /** Arbitrary operator tags for future routing. */
   tags?: string[];
 }

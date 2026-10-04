@@ -57,6 +57,8 @@ interface FleetConfig {
   /** Default per-run isolation for fleet_dispatch (issue #41): none (default) or clone. */
   isolation?: "none" | "clone";
   /** Deterministic design gate for spec dispatches (issue #117): off | advise (default) | enforce, plus size bounds. */
+  /** Concurrency slots (issue #39). */
+  capacity?: { maxConcurrentPerNode?: number; staleAfterMs?: number };
   project?: { gate?: "off" | "advise" | "enforce"; maxScopePatterns?: number; maxAcceptanceItems?: number; roots?: string[]; rules?: unknown[]; requireCharterFields?: string[]; allowRepoBlocking?: boolean };
   /** S1 decision layer (issue #79): backend, mode (default shadow), thresholds, egress opt-in. Validated by parseS1Config. */
   s1?: unknown;
@@ -104,6 +106,15 @@ export default definePluginEntry({
         enum: ["none", "clone"],
         default: "none",
         description: "Default per-run isolation for fleet_dispatch (issue #41). `clone` gives every run its own git clone on branch fleet/<runId> (own .git, hooks disabled), so concurrent runs cannot clobber each other. Needs a protocol-4 node (an older node is refused, never silently run un-isolated).",
+      },
+      capacity: {
+        type: "object",
+        additionalProperties: false,
+        description: "Concurrency slots (issue #39). Slots are counted from the gateway's run ledger; see fleet_capacity.",
+        properties: {
+          maxConcurrentPerNode: { type: "integer", minimum: 1, maximum: 64, description: "Default max concurrent runs per node. Unset means unlimited." },
+          staleAfterMs: { type: "integer", minimum: 60000, default: 21600000, description: "A run still `running` in the ledger after this long without an update stops holding a slot and is reported as suspected stale." },
+        },
       },
       project: {
         type: "object",
@@ -641,7 +652,28 @@ export default definePluginEntry({
             // Issue #117: overrides are part of the run's record.
             ...(design?.acknowledged.length ? { gateAcknowledged: design.acknowledged } : {}),
           };
-          await upsertRun(rootDir, ledgerEntry);
+          // Issue #39: per-node concurrency slots. With no limit configured this is the plain
+          // upsert it always was; with one, the count and the insert are a single atomic step.
+          const { slotLimit, staleAfter, noCapacity } = await import("./capacity.js");
+          const limit = slotLimit(cfg.capacity, (node as { member?: { maxConcurrent?: unknown } }).member);
+          if (!limit.ok) {
+            results[nodeKey] = { ok: false, error: limit.error };
+            continue;
+          }
+          if (limit.limit !== undefined) {
+            const { reserveRun } = await import("./ledger.js");
+            const slot = await reserveRun(rootDir, ledgerEntry, {
+              nodeNames: [node.displayName, node.nodeId].filter((x): x is string => !!x),
+              limit: limit.limit,
+              staleAfterMs: staleAfter(cfg.capacity),
+            });
+            if (!slot.ok) {
+              results[nodeKey] = noCapacity(nodeKey, limit.limit, slot.running);
+              continue;
+            }
+          } else {
+            await upsertRun(rootDir, ledgerEntry);
+          }
           // Issue #6: default to DETACHED execution. The node returns a run
           // handle immediately; the child survives relay timeouts/cancels and
           // records its own completion. fleet_watch/fleet_run_status poll it.
@@ -750,6 +782,12 @@ export default definePluginEntry({
                   note: recovery.note,
                 };
                 continue;
+              }
+              // Issue #39: a launch the node definitively refused (or a probe proving nothing started)
+              // leaves no run, so the ledger entry must not keep holding a concurrency slot. An
+              // inconclusive probe stays `running`: the run may exist.
+              if (nodeRejected || recovery.verdict === "absent") {
+                await upsertRun(rootDir, { ...ledgerEntry, updatedAt: new Date().toISOString(), state: "failed", summary: `launch failed: ${errMsg}`.slice(0, 500) });
               }
               results[node.displayName ?? node.nodeId] = {
                 runId,
@@ -1109,6 +1147,42 @@ export default definePluginEntry({
         }, ackCheck.acks);
         if (!gate.ok) return jsonResult({ ok: false, error: gate.error });
         return jsonResult({ ok: true, gate: cfg.project?.gate ?? "advise", overlapChecked: Boolean(p.node && p.cwd), ...gate.result });
+      },
+    });
+
+    api.registerTool({
+      name: "fleet_capacity",
+      label: "Fleet Capacity",
+      description:
+        "Concurrency slots per node (issue #39): the limit (node `maxConcurrent`, else `capacity.maxConcurrentPerNode`, else unlimited), the runs holding slots with their ages, free slots, and runs suspected stale (still `running` in the ledger past `capacity.staleAfterMs`, so no longer holding a slot; settle them with fleet_run_status or fleet_recover). A fleet_dispatch to a node at its limit returns a retryable `no-capacity` result instead of starting. Read-only. Spend caps and a daily budget are not part of this yet.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: { nodes: { type: "array", items: { type: "string" }, description: "Node display names or ids. Omit for all fleet nodes." } },
+      },
+      execute: async (_toolCallId, params) => {
+        const p = params as { nodes?: string[] };
+        const cfg = (api.pluginConfig ?? {}) as FleetConfig;
+        const list = await api.runtime.nodes.list();
+        const fleet = (await import("./membership.js")).resolveFleetNodes(list.nodes ?? [], cfg);
+        const targets = p.nodes?.length ? fleet.filter((n) => p.nodes!.includes(n.displayName ?? n.nodeId) || p.nodes!.includes(n.nodeId)) : fleet;
+        const { slotLimit, staleAfter, liveRuns } = await import("./capacity.js");
+        const { loadLedger } = await import("./ledger.js");
+        const runs = await loadLedger(api.rootDir ?? process.cwd());
+        const now = Date.now();
+        const age = (r: { updatedAt?: string; startedAt: string }) => Math.round((now - Date.parse(r.updatedAt || r.startedAt)) / 1000);
+        const out = targets.map((n) => {
+          const name = n.displayName ?? n.nodeId;
+          const limit = slotLimit(cfg.capacity, (n as { member?: { maxConcurrent?: unknown } }).member);
+          const { live, stale } = liveRuns(runs, [n.displayName, n.nodeId].filter((x): x is string => !!x), now, staleAfter(cfg.capacity));
+          return {
+            node: name,
+            ...(limit.ok ? { limit: limit.limit ?? null, free: limit.limit === undefined ? null : Math.max(0, limit.limit - live.length) } : { configError: limit.error }),
+            running: live.map((r) => ({ runId: r.runId, ageSeconds: age(r) })),
+            suspectedStale: stale.map((r) => ({ runId: r.runId, ageSeconds: age(r) })),
+          };
+        });
+        return jsonResult({ ok: true, staleAfterMs: staleAfter(cfg.capacity), nodes: out });
       },
     });
 

@@ -59,8 +59,23 @@
             "serviceUser": {
               "type": "string",
               "description": "Principal the node's OpenClaw service runs as, when it differs from the login user. Install/verify target this principal's plugin root."
+            },
+            "maxConcurrent": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 64,
+              "description": "Max concurrent runs the gateway will start on this node (issue #39). A dispatch at the limit returns a retryable no-capacity result. Overrides capacity.maxConcurrentPerNode."
             }
           }
+        }
+      },
+      "capacity": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Concurrency slots (issue #39). Slots are counted from the gateway's run ledger; see fleet_capacity.",
+        "properties": {
+          "maxConcurrentPerNode": { "type": "integer", "minimum": 1, "maximum": 64, "description": "Default max concurrent runs per node. Unset means unlimited." },
+          "staleAfterMs": { "type": "integer", "minimum": 60000, "default": 21600000, "description": "A run still `running` in the ledger after this long without an update stops holding a slot and is reported as suspected stale." }
         }
       },
       "allowAutoApprove": {
@@ -298,6 +313,7 @@
       "fleet_resume",
       "fleet_run_status",
       "fleet_run_report",
+      "fleet_capacity",
       "fleet_design_check",
       "fleet_project_show",
       "fleet_board"
