@@ -161,7 +161,11 @@ describe("issue #40 review: gateway wiring (fleet_watch / fleet_iterate / reconc
   });
 
   it("fleet_iterate's success check honors `verified` (a gate failure is not success/done)", () => {
-    expect(src).toContain("(p.successMarker ? (parsed.summary ?? \"\").includes(p.successMarker) : !looksFailed) && verified !== false");
+    // Issue #103: the successMarker is worker-controlled text, so a worker could
+    // fake success by printing it. The check must require the marker AND a real
+    // pass signal (not looksFailed), and must still honor `verified`.
+    expect(src).toContain("const markerSeen = p.successMarker ? (parsed.summary ?? \"\").includes(p.successMarker) : false");
+    expect(src).toContain("const success = (p.successMarker ? markerSeen && !looksFailed : !looksFailed) && verified !== false");
   });
 
   it("the sync dispatch path uses withVerified (shape parity; no key omission when expect is absent)", () => {

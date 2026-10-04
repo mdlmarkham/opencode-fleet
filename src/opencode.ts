@@ -111,7 +111,9 @@ export interface OpenCodeTask {
 
 export interface OpenCodeRunResult {
   ok: boolean;
-  transport: OpenCodeTransport;
+  /** The transport the run used, when known. Issue #103: omit rather than assert
+   * a hard-coded value; consumers already treat an absent transport as default. */
+  transport?: OpenCodeTransport;
   /** Worker engine that produced this result (issue #30 finding A). */
   harness?: FleetHarness;
   sessionId?: string;
@@ -355,12 +357,14 @@ export function parseOpenCodeOutput(raw: string, exec?: ExecStatus): OpenCodeRun
 
   return {
     ok,
-    transport: "http",
+    // Issue #103: report the REAL transport/iterations when the caller knows them;
+    // omit rather than assert a hard-coded wrong value.
+    ...(exec?.transport ? { transport: exec.transport } : {}),
     sessionId,
     summary: handRaised ? summary.replace(/HAND_RAISE\s*[:\-]?\s*/i, "").trim() : summary,
     handRaised,
     question,
-    iterations: 1,
+    ...(typeof exec?.iterations === "number" ? { iterations: exec.iterations } : {}),
     diffSummary: undefined,
     error: error ? redactSecrets(error) : undefined,
   };
@@ -374,6 +378,10 @@ export interface ExecStatus {
   timedOut?: boolean;
   /** True when the node-side watchdog killed the run for idling/exceeding max duration. */
   stuck?: boolean;
+  /** Issue #103: the REAL transport the run used (omit rather than assert a wrong value). */
+  transport?: OpenCodeTransport;
+  /** Issue #103: the REAL iteration count when the caller knows it. */
+  iterations?: number;
 }
 
 /** @deprecated use ExecStatus */
@@ -454,7 +462,7 @@ export function parsePiOutput(raw: string, exec?: ExecStatus): OpenCodeRunResult
   return {
     ok: !failed,
     harness: "pi",
-    transport: "http",
+    ...(exec?.transport ? { transport: exec.transport } : {}),
     summary: handRaised ? summary.replace(/HAND_RAISE\s*[:\-]?\s*/i, "").trim() : summary,
     handRaised,
     question,
@@ -539,7 +547,7 @@ function parsePiJsonOutput(raw: string, events: PiEvent[], exec?: ExecStatus): O
   return {
     ok: !failed,
     harness: "pi",
-    transport: "http",
+    ...(exec?.transport ? { transport: exec.transport } : {}),
     summary: handRaiseMatch ? summary.replace(/HAND_RAISE\s*[:\-]?\s*/i, "").trim() : summary,
     handRaised: Boolean(handRaiseMatch),
     ...(handRaiseMatch ? { question: sanitizeQuestion(handRaiseMatch[1]) } : {}),
