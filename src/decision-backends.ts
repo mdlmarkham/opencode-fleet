@@ -17,7 +17,7 @@
  * This module wires nothing into dispatch; it hands callers a `DecideFn`.
  */
 
-import { decide, type DecideInput, type DecideOptions, type DecideResult, type S1Fetch } from "./decision.js";
+import { decide, type DecideInput, type DecideOptions, type DecideResult, type FleetQuestions, type S1Fetch } from "./decision.js";
 import { redactSecrets } from "./untrusted.js";
 
 export type BackendName = "local-kev" | "zen-jev" | "typesafe-jev";
@@ -141,6 +141,29 @@ export function redactDeep(v: unknown): unknown {
   return v;
 }
 
+/**
+ * Redact the caller-authored text a QUESTION carries (issue #101): `instructions`
+ * and every `criteria` string/object. Keys stay as they are — question ids and
+ * choice option ids are code-defined, not caller data — but any string VALUES
+ * (instructions, option descriptions, score labels, boolean criteria) leave the
+ * machine through a hosted backend and must be scrubbed like `state`.
+ */
+export function redactQuestions(qs: FleetQuestions): FleetQuestions {
+  if (!qs || !isRecord(qs)) return qs;
+  const out: Record<string, unknown> = {};
+  for (const [id, q] of Object.entries(qs)) {
+    if (!isRecord(q)) {
+      out[id] = q;
+      continue;
+    }
+    const scrubbed: Record<string, unknown> = { ...q };
+    if ("instructions" in q) scrubbed.instructions = redactDeep(q.instructions);
+    if ("criteria" in q) scrubbed.criteria = redactDeep(q.criteria);
+    out[id] = scrubbed;
+  }
+  return out as FleetQuestions;
+}
+
 // ---------------------------------------------------------------------------
 // Audit log
 // ---------------------------------------------------------------------------
@@ -246,8 +269,15 @@ export function makeDecider(config: S1Config, deps: DeciderDeps = {}): Decider {
       ? (u, init) => wrapped(u, { ...init, headers: { ...init.headers, authorization: `Bearer ${b.apiKey}` } })
       : wrapped;
     try {
+      // Issue #101: redact the WHOLE request on the egress path — `state` AND each
+      // question's instructions/criteria. A dispatch task can carry a pasted secret
+      // and it is interpolated into the instructions (#100), so scrubbing only
+      // `state` left it on the wire to a hosted backend.
+      const outgoing = egress
+        ? { ...input, state: redactDeep(input.state), questions: redactQuestions(input.questions) }
+        : input;
       const r = await decide(
-        { ...input, state: egress ? redactDeep(input.state) : input.state, model: input.model ?? b.model },
+        { ...outgoing, model: input.model ?? b.model },
         { ...opts, url, fetch: withAuth, timeoutMs: opts.timeoutMs ?? config.timeoutMs },
       );
       return finish(r);
