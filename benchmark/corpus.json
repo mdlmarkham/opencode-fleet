@@ -1,0 +1,26 @@
+{
+  "version": "1",
+  "tasks": [
+    {
+      "id": "parse-duration",
+      "goal": "Create solution.py implementing parse_duration(s: str) -> int that parses strings like '1h30m', '45s', '2d4h15m', '90m' into total seconds and raises ValueError for invalid input (empty, bad units, negative, non-numeric). Create test_solution.py with pytest coverage including error cases, and run python3 -m pytest -q so it passes.",
+      "acceptance": ["solution.py exists", "test_solution.py exists", "pytest passes"],
+      "expect": { "files": ["solution.py", "test_solution.py"], "command": "python3 -m pytest -q" },
+      "tags": ["python", "greenfield", "tests"]
+    },
+    {
+      "id": "fizzbuzz-cli",
+      "goal": "Write fizzbuzz.py that prints FizzBuzz for 1..100 (Fizz on multiples of 3, Buzz on 5, FizzBuzz on both, the number otherwise) and fizzbuzz_test.py with pytest tests for the core mapping function. Run pytest so it passes.",
+      "acceptance": ["fizzbuzz.py exists", "tests pass"],
+      "expect": { "files": ["fizzbuzz.py", "fizzbuzz_test.py"], "command": "python3 -m pytest -q" },
+      "tags": ["python", "greenfield", "tests"]
+    },
+    {
+      "id": "word-count-fn",
+      "goal": "Add a function count_words(text: str) -> dict[str, int] in wordcount.py that returns a case-insensitive word frequency map, and test_wordcount.py with at least 4 pytest cases (including punctuation and empty string). Run pytest so it passes.",
+      "acceptance": ["wordcount.py exists", "tests pass"],
+      "expect": { "files": ["wordcount.py", "test_wordcount.py"], "command": "python3 -m pytest -q" },
+      "tags": ["python", "greenfield", "tests"]
+    }
+  ]
+}
