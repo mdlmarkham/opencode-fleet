@@ -63,7 +63,7 @@ interface FleetConfig {
   /** S1 decision layer (issue #79): backend, mode (default shadow), thresholds, egress opt-in. Validated by parseS1Config. */
   s1?: unknown;
   /** fleet_sync publish policy (issue #33). */
-  sync?: { protectedBranches?: string[]; allowDirectPush?: string[]; allowSensitivePaths?: boolean; sensitivePaths?: string[]; requireVerified?: boolean };
+  sync?: { protectedBranches?: string[]; allowDirectPush?: string[]; allowSensitivePaths?: boolean; sensitivePaths?: string[]; requireVerified?: boolean; blockOnScopeViolation?: boolean };
   /** Dispatch env refinements: allowOnly makes injection allowlist-only; extraDeny adds refused names. */
   env?: { allowOnly?: string[]; extraDeny?: string[] };
   /** SSH client policy for manager-to-node commands. */
@@ -177,6 +177,7 @@ export default definePluginEntry({
         properties: {
           protectedBranches: { type: "array", items: { type: "string" }, default: ["main", "master"] },
           allowDirectPush: { type: "array", items: { type: "string" }, default: [] },
+          blockOnScopeViolation: { type: "boolean", default: false, description: "Refuse fleet_sync for a run that changed files outside its declared spec.scope, or whose scope was never checked (issue #104). Override per call with allowScopeViolations." },
           requireVerified: { type: "boolean", default: false, description: "Refuse fleet_sync for work with no verification result (a run that did not use expect/spec.verify). A run whose gate FAILED is always refused unless allowUnverified is passed." },
           allowSensitivePaths: { type: "boolean", default: false, description: "Allow worker changes to CI/CODEOWNERS paths." },
           sensitivePaths: { type: "array", items: { type: "string" }, default: [], description: "Extra path globs treated as sensitive (e.g. ci/**), added to the built-in list." },
@@ -1317,6 +1318,8 @@ export default definePluginEntry({
             ...(typeof st.exitCode === "number" ? { exitCode: st.exitCode } : {}),
             ...(reconcileVerified !== null ? { verified: reconcileVerified } : {}),
             ...(st.verifyDetails != null ? { verifyDetails: st.verifyDetails } : {}),
+            // Issue #104: persist what the node reported so fleet_sync can apply the scope policy.
+            ...(entry?.spec?.scope && st.finishedAt ? { scopeViolations: Array.isArray(st.scopeViolations) ? (st.scopeViolations as string[]) : null } : {}),
             summary:
               state === "failed" && !st.finishedAt
                 ? "worker process died without completion record (silent death)"
@@ -1940,13 +1943,14 @@ export default definePluginEntry({
           node: { type: "string", description: "Node display name or id." },
           cwd: { type: "string", description: "Working directory on the node." },
           repo: { type: "string", description: "Git URL the manager can access." },
+          allowScopeViolations: { type: "boolean", description: "Publish even though the run changed files outside its declared scope (or its scope was never checked) and sync.blockOnScopeViolation is set. Does not bypass a failed verification gate. Off by default." },
           allowUnverified: { type: "boolean", description: "Publish even though the latest fleet run on this node and checkout FAILED its verification gate (or, with sync.requireVerified, has none). Off by default." },
           branch: { type: "string", description: "Clone BASE branch: a branch that already EXISTS on origin, checked out so the worker's changes can be applied on top of it (default main). NOT the destination — the destination is resolved from the worker's own branch (or from a pinned destination set internally); a protected destination is redirected to `fleet/<name>` and reported as `redirectedFrom`." },
         },
         required: ["node", "cwd", "repo"],
       },
       execute: async (toolCallId, params, signal) => {
-        const p = params as { node: string; cwd: string; repo: string; branch?: string; allowUnverified?: boolean };
+        const p = params as { node: string; cwd: string; repo: string; branch?: string; allowUnverified?: boolean; allowScopeViolations?: boolean };
         const list = await api.runtime.nodes.list();
         const nodes = list.nodes ?? [];
         const node = nodes.find((n) => n.displayName === p.node || n.nodeId === p.node);
@@ -1960,7 +1964,7 @@ export default definePluginEntry({
         const { loadLedger, latestRunFor, syncGate } = await import("./ledger.js");
         const gate = syncGate(
           latestRunFor(await loadLedger(api.rootDir ?? process.cwd()), [node.displayName, node.nodeId].filter((x): x is string => !!x), p.cwd),
-          { allowUnverified: p.allowUnverified === true, requireVerified: cfg.sync?.requireVerified === true },
+          { allowUnverified: p.allowUnverified === true, requireVerified: cfg.sync?.requireVerified === true, blockOnScopeViolation: cfg.sync?.blockOnScopeViolation === true, allowScopeViolations: p.allowScopeViolations === true },
         );
         if (!gate.allow) return jsonResult({ ok: false, error: gate.reason, verified: gate.verified, ...(gate.runId ? { runId: gate.runId } : {}) });
         const gateNote = gate.reason ? { verifiedNote: gate.reason, verified: gate.verified } : { verified: gate.verified };
