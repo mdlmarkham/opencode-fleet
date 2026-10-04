@@ -141,6 +141,17 @@ export function redactDeep(v: unknown): unknown {
   return v;
 }
 
+/**
+ * Redact every free-text string a question carries (instructions and criteria values).
+ * Question ids and choice option ids are code-defined keys and stay as they are.
+ */
+export function redactQuestions<Q>(questions: Q): Q {
+  if (!isRecord(questions)) return questions;
+  return Object.fromEntries(
+    Object.entries(questions).map(([id, q]) => [id, isRecord(q) ? { ...q, instructions: redactDeep(q.instructions), ...("criteria" in q ? { criteria: redactDeep(q.criteria) } : {}) } : q]),
+  ) as Q;
+}
+
 // ---------------------------------------------------------------------------
 // Audit log
 // ---------------------------------------------------------------------------
@@ -247,7 +258,7 @@ export function makeDecider(config: S1Config, deps: DeciderDeps = {}): Decider {
       : wrapped;
     try {
       const r = await decide(
-        { ...input, state: egress ? redactDeep(input.state) : input.state, model: input.model ?? b.model },
+        { ...input, state: egress ? redactDeep(input.state) : input.state, questions: egress ? redactQuestions(input.questions) : input.questions, model: input.model ?? b.model },
         { ...opts, url, fetch: withAuth, timeoutMs: opts.timeoutMs ?? config.timeoutMs },
       );
       return finish(r);
