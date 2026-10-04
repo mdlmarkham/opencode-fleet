@@ -9,6 +9,7 @@
  */
 
 import { redactSecrets } from "./untrusted.js";
+import { parsePiJsonEvents } from "./opencode.js";
 
 export interface FileChange {
   /** git name-status letter (A, M, D, R, C, T) or `?` for an untracked file. */
@@ -62,16 +63,53 @@ export interface Commands {
   usage?: { inputTokens: number; outputTokens: number; reasoningTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number; costUsd?: number };
 }
 
+/**
+ * Pi's `--mode json` stream (#137): tool calls come from `tool_execution_start` events and token
+ * counts from each assistant `message_end`'s `usage`. Pi without `--mode json` prints plain text,
+ * so `commandsRecorded` stays false (unknown, never "none"). Shapes follow Pi's docs and are read
+ * defensively; field-name variants are accepted and anything else is skipped.
+ */
+function extractPiEvents(raw: string): Commands {
+  const events = parsePiJsonEvents(raw);
+  if (!events) return { commandsRecorded: false, commands: [], eventCount: 0 };
+  const commands: Commands["commands"] = [];
+  const u = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costUsd: 0 };
+  let sawUsage = false;
+  for (const e of events) {
+    if (e.type === "tool_execution_start" && typeof e.toolName === "string") {
+      const a = e.args;
+      const isObj = typeof a === "object" && a !== null && !Array.isArray(a);
+      const rec = isObj ? (a as Record<string, unknown>) : {};
+      const text = typeof rec.command === "string" ? rec.command : typeof rec.path === "string" ? rec.path : a !== undefined ? JSON.stringify(a) : "";
+      commands.push({ tool: e.toolName, input: text.slice(0, 2000) });
+    } else if (e.type === "message_end") {
+      const m = e.message as { role?: unknown; usage?: unknown } | null | undefined;
+      const usage = m && m.role === "assistant" && typeof m.usage === "object" && m.usage !== null ? (m.usage as Record<string, unknown>) : undefined;
+      if (!usage) continue;
+      const cost = usage.cost;
+      const costNum = typeof cost === "number" ? cost : typeof cost === "object" && cost !== null ? num((cost as Record<string, unknown>).total) : 0;
+      u.inputTokens += num(usage.input ?? usage.inputTokens);
+      u.outputTokens += num(usage.output ?? usage.outputTokens);
+      u.cacheReadTokens += num(usage.cacheRead ?? usage.cacheReadTokens);
+      u.cacheWriteTokens += num(usage.cacheWrite ?? usage.cacheWriteTokens);
+      u.costUsd += costNum;
+      sawUsage = true;
+    }
+  }
+  return { commandsRecorded: true, commands, eventCount: events.length, ...(sawUsage ? { usage: u } : {}) };
+}
+
 const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
 
 /**
  * Best-effort extraction from an engine's structured event stream. opencode's
  * `--format json` emits NDJSON: `tool_use` events carry the tool name and its
  * input, `step_finish` events carry token counts and cost. The schema is the
- * engine's, so unknown shapes are skipped rather than guessed at; Pi prints a
- * plain transcript, so for it `commandsRecorded` is false.
+ * engine's, so unknown shapes are skipped rather than guessed at; Pi's
+ * `--mode json` stream is handled separately (extractPiEvents); plain Pi text is unknown.
  */
 export function extractEvents(raw: string, harness: string): Commands {
+  if (harness === "pi") return extractPiEvents(raw);
   if (harness !== "opencode") return { commandsRecorded: false, commands: [], eventCount: 0 };
   const commands: Commands["commands"] = [];
   let eventCount = 0;

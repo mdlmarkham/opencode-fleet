@@ -71,3 +71,27 @@ describe("#137 Pi-1: piJson flag", () => {
     expect(validatePiOptions({ piJson: "yes" } as never)).not.toBeNull();
   });
 });
+
+import { extractEvents } from "./audit.js";
+describe("#137 Pi-1: audit manifest from a Pi JSON stream", () => {
+  it("records commands and usage; plain Pi text stays unknown", () => {
+    const raw = J(
+      { type: "agent_start" },
+      { type: "tool_execution_start", toolCallId: "c1", toolName: "bash", args: { command: "npm test" } },
+      { type: "tool_execution_start", toolCallId: "c2", toolName: "read", args: { path: "a.ts" } },
+      { type: "message_end", message: { role: "assistant", content: [], usage: { input: 10, output: 4, cacheRead: 2, cost: { total: 0.01 } } } },
+      { type: "message_end", message: { role: "assistant", content: [], usage: { inputTokens: 5, outputTokens: 1, cost: 0.005 } } },
+    );
+    const e = extractEvents(raw, "pi");
+    expect(e.commandsRecorded).toBe(true);
+    expect(e.commands).toEqual([{ tool: "bash", input: "npm test" }, { tool: "read", input: "a.ts" }]);
+    expect(e.usage).toMatchObject({ inputTokens: 15, outputTokens: 5, cacheReadTokens: 2 });
+    expect(e.usage!.costUsd).toBeCloseTo(0.015, 5);
+    expect(extractEvents("plain transcript", "pi")).toEqual({ commandsRecorded: false, commands: [], eventCount: 0 });
+  });
+  it("a stream without usage records commands but no usage; odd shapes never throw", () => {
+    const e = extractEvents(J({ type: "agent_start" }, { type: "tool_execution_start", toolName: "x", args: 5 }, { type: "message_end", message: null }), "pi");
+    expect(e.commandsRecorded).toBe(true);
+    expect(e.usage).toBeUndefined();
+  });
+});
