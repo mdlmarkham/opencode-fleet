@@ -19,13 +19,17 @@ const SECRET_PATTERNS: Array<[RegExp, string]> = [
   [/\bAKIA[0-9A-Z]{16}\b/g, "[REDACTED:aws-key]"],
   [/\bxox[abprs]-[A-Za-z0-9-]{10,}\b/g, "[REDACTED:slack-token]"],
   // Credentials embedded in a URL: scheme://user:password@host
+  // The user segment is optional (`[^\s:@\/]*`) so the standard empty-username
+  // form `redis://:password@host` is redacted too (issue #160); the match still
+  // requires the colon directly after `://`, so `user@host` and
+  // `ssh://git@github.com:org/repo.git` stay untouched.
   // The password class (`[^\s]*?`, lazy) may contain `/`, `?`, `#` and `@`; the
   // trailing lookahead anchors on a plausible host token -- dotted (`db.internal`),
   // `host:port`, a bracketed `[IPv6]` literal, OR a bare single-label host
   // terminated by `/`, `?`, `#` or end-of-string (`db/app`, `intranet/x`). A
   // password with delimiters or an embedded `@` is therefore removed whole while
   // the host stays readable; prose like `mail me@x.org` stays untouched.
-  [/\b([a-z][a-z0-9+.-]*:\/\/[^\s:@\/]+:)([^\s]*?)@(?=[A-Za-z0-9\[][^\s@\/]*(?:\.[^\s@\/]*|:[0-9]+)?(?:[\/?#]|$))/gi, "$1[REDACTED]@"],
+  [/\b([a-z][a-z0-9+.-]*:\/\/[^\s:@\/]*:)([^\s]*?)@(?=[A-Za-z0-9\[][^\s@\/]*(?:\.[^\s@\/]*|:[0-9]+)?(?:[\/?#]|$))/gi, "$1[REDACTED]@"],
   [/\b(Bearer\s+)[A-Za-z0-9._~+/-]{20,}=*/gi, "$1[REDACTED]"],
   [
     /\b((?:api[_-]?key|access_token|secret|token|password|passwd|pwd|authorization)["']?\s*[:=]\s*["']?)[^\s"',;]{8,}/gi,

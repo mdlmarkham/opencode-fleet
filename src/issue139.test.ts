@@ -63,6 +63,49 @@ describe("issue #139: URL credential redaction", () => {
     );
   });
 
+  // Issue #160 -- empty-username URL credentials (the standard Redis form)
+  // must be redacted too: scheme, the empty user and the host stay readable.
+  const EMPTY_USER_URLS: Array<[string, string]> = [
+    ["redis empty-username", j("redis://:", "hunter2pass", "@redis:6379")],
+    ["https empty-username", j("https://:", "hunter2pass", "@example.com/x")],
+    ["postgres empty-username", j("postgres://:", "hunter2pass", "@db.internal:5432/app")],
+  ];
+
+  it("redacts empty-username URL credentials (redis://:***@host), keeping scheme/host readable", () => {
+    for (const [label, raw] of EMPTY_USER_URLS) {
+      const out = redactSecrets(raw);
+      expect(out, label).not.toContain(raw);
+      expect(out, label).not.toContain("hunter2pass");
+      expect(out, label).toContain("[REDACTED]@");
+    }
+    // Scheme and host survive as readable prefixes; the password is the marker
+    // used elsewhere in the codebase.
+    expect(redactSecrets(j("redis://:", "hunter2pass", "@redis:6379"))).toBe("redis://:[REDACTED]@redis:6379");
+    expect(redactSecrets(j("https://:", "hunter2pass", "@example.com/x"))).toBe("https://:[REDACTED]@example.com/x");
+    expect(redactSecrets(j("postgres://:", "hunter2pass", "@db.internal:5432/app"))).toBe(
+      "postgres://:[REDACTED]@db.internal:5432/app",
+    );
+  });
+
+  it("never redacts a URL without a userinfo colon -- negatives stay byte-identical", () => {
+    const negatives: Array<[string, string]> = [
+      ["clean URL", "https://example.com/a/b?x=1&y=2"],
+      ["prose", "The password policy requires at least twelve characters."],
+      ["bare email", "me@x.org"],
+      ["bare @", "plain text with an @ sign"],
+      ["user without password", "user@host"],
+      ["scp-like colon not after ://", "ssh://git@github.com:org/repo.git"],
+    ];
+    for (const [label, raw] of negatives) expect(redactSecrets(raw), label).toBe(raw);
+  });
+
+  it("over-redacts a port-colon followed by an email-like path as a documented fail-safe", () => {
+    // Known over-redaction, pinned as fail-safe behaviour (not a leak): the
+    // host:port segment of a plain URL is rewritten as if it were credentials.
+    const raw = "https://example.com:8080/docs/a@b.com";
+    expect(redactSecrets(raw)).toBe("https://example.com:[REDACTED]@b.com");
+  });
+
   it("redacts common password query params", () => {
     for (const key of ["password", "passwd", "pwd", "secret", "token", "api_key", "access_token"]) {
       const out = redactSecrets("https://host/endpoint?" + key + "=" + "supersecretvalue123");
