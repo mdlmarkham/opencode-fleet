@@ -475,7 +475,7 @@ describe("issue #62: node handler — the synchronous (op 'run') path verifies t
 describe("issue #62: gateway wiring", () => {
   it("fleet_dispatch validates + threads expect; fleet_run_status surfaces the gate", () => {
     const src = readFileSync(join(here, "index.ts"), "utf8");
-    expect(src).toContain("Optional post-run verification gate (issue #62)");
+    expect(src).toContain("Post-run verification gate.");
     expect(src).toContain("parseExpectSpec(p.expect)");
     expect(src).toContain("expect: expectSpec.expect,");
     expect(src).toContain('verified: typeof st.verified === "boolean" ? st.verified : null');
