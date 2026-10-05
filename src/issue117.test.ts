@@ -89,7 +89,10 @@ describe.skipIf(!entry)("#117: tools", () => {
   const NODES = [{ nodeId: "n-dev2", displayName: "dev2", connected: true, invocableCommands: ["opencode.run"] }];
   const cfg = (project?: Record<string, unknown>) => ({ nodes: { dev2: { roles: ["worker"], ssh: false } }, ...(project ? { project } : {}) });
   const ok = () => nodeReply({ ok: true, detached: true, runId: "r", pid: 1 });
-  const seedRunning = () => upsertRun(p!.rootDir, { runId: "live1", node: "dev2", cwd: "/w/proj", prompt: "p", startedAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z", state: "running", spec: { goal: "g", scope: { files: ["src/x/"] } } } as never);
+  // Issue #196: a genuinely-running entry must be FRESH (updated within staleAfterMs) to count as
+  // in-flight — the old pin seeded 2026-01-01 timestamps, pinning the bug where finished/stale runs
+  // polluted overlap evidence.
+  const seedRunning = () => upsertRun(p!.rootDir, { runId: "live1", node: "dev2", cwd: "/w/proj", prompt: "p", startedAt: new Date().toISOString(), updatedAt: new Date().toISOString(), state: "running", spec: { goal: "g", scope: { files: ["src/x/"] } } } as never);
   const call = (args: Record<string, unknown>) => p!.call("fleet_dispatch", { node: "dev2", cwd: "/w/proj", ...args });
 
   it("fleet_design_check is a dry run: verdict out, nothing dispatched, overlap checked when node+cwd given", async () => {
