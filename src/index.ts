@@ -1558,6 +1558,14 @@ export default definePluginEntry({
             type: "boolean",
             description: "Escalate (stop + report) when consecutive iterations produce identical output (no progress). Default true.",
           },
+          judgeProgress: {
+            type: "boolean",
+            description: "Issue #165: additionally ask the S1 progress judge (shadow-first) between iterations whether each attempt is strictly closer to the acceptance criteria than the last. Escalates after TWO consecutive unlikely-progress verdicts; any S1 failure falls back to the identical-output check. Never active unless explicitly true.",
+          },
+          progressThreshold: {
+            type: "number",
+            description: "S1 probabilityTrue below which an iteration counts as unlikely progress (default 0.5). Only used with judgeProgress.",
+          },
           expect: {
             type: "object",
             additionalProperties: false,
@@ -1581,6 +1589,8 @@ export default definePluginEntry({
           timeoutMs?: number;
           successMarker?: string;
           noProgressEscalate?: boolean;
+          judgeProgress?: boolean;
+          progressThreshold?: number;
           expect?: { files?: string[]; command?: string };
         };
         const list = await api.runtime.nodes.list();
@@ -1611,6 +1621,23 @@ export default definePluginEntry({
         // Last iteration's parsed outcome, in scope after the loop exits.
         let lastOutcome: { verified?: boolean; verifyDetails?: unknown } | null = null;
 
+        // Issue #165: optional S1 PROGRESS JUDGE, shadow-first. Everything is
+        // gated on p.judgeProgress === true: when the param is absent/false the
+        // decider is NEVER imported or called and the loop below is byte-identical
+        // to the existing string-equality behaviour. When on, the EXISTING decider
+        // (decide() from src/decision.ts, default backend local-kev) is asked a
+        // narrow stated-criteria boolean after each failed iteration:
+        //   Given (a) the spec's acceptance criteria, (b) the previous attempt's
+        //   failure output, and (c) this attempt's result + verify output, is this
+        //   attempt strictly closer to the acceptance criteria than the last?
+        //   -> probabilityTrue
+        // decide() never throws and injectable transports make it unit-testable.
+        const judgeOn = p.judgeProgress === true;
+        const judgeThreshold = p.progressThreshold ?? 0.5;
+        // Per-transition S1 samples, in order (a failed/absent decision records
+        // judgeError; the loop's identical-output check stays the baseline).
+        const judgeSamples: Array<{ probabilityTrue?: number; judgeError?: string }> = [];
+
         for (let i = 1; i <= maxIter; i++) {
           const inv = await api.runtime.nodes.invoke({
             nodeId: node.nodeId,
@@ -1637,6 +1664,32 @@ export default definePluginEntry({
           // Fingerprint the output to detect progress (or lack thereof).
           const fingerprint = (parsed.summary ?? "").slice(0, 500) + "|" + (parsed.error ?? "").slice(0, 500);
           const progress = i === 1 ? true : fingerprint !== prevFingerprint;
+
+          // Issue #165 (shadow-first): between iterations ask the EXISTING decider
+          // whether this attempt is strictly closer to the acceptance criteria than
+          // the last. Only runs when judgeProgress is explicitly true; ANY failure,
+          // timeout, or absent decision records a failed/absent sample and leaves
+          // the existing string-diff behaviour in force (S1 is additive evidence,
+          // never permission; the deterministic baseline below always wins).
+          if (judgeOn && i > 1) {
+            const { buildProgressQuestion } = await import("./progressJudge.js");
+            const { decide } = await import("./decision.js");
+            const question = buildProgressQuestion({
+              acceptanceCriteria: p.prompt,
+              prevFailureOutput: prevFingerprint,
+              thisResult: (parsed.summary ?? "") + "|" + (parsed.error ?? ""),
+              verifyOutput: parsed.verifyDetails !== undefined ? JSON.stringify(parsed.verifyDetails).slice(0, 1000) : "no verification gate ran",
+            });
+            const r = await decide(
+              { state: { tool: "fleet_iterate", node: p.node, iteration: i }, questions: { progress: question } },
+              { timeoutMs: 30_000 },
+            );
+            if (r.ok && r.answers.progress.type === "boolean" && Number.isFinite(r.answers.progress.probabilityTrue)) {
+              judgeSamples.push({ probabilityTrue: r.answers.progress.probabilityTrue });
+            } else {
+              judgeSamples.push({ judgeError: r.ok ? "S1 answer not boolean/finite" : r.error });
+            }
+          }
           prevFingerprint = fingerprint;
 
           iterations.push({
@@ -1695,6 +1748,38 @@ export default definePluginEntry({
                 lastOutcome,
               ),
             );
+          }
+
+          // Issue #165: S1 progress-judge escalation, IN ADDITION to the
+          // string-equality check above. Escalates only when the S1 judge
+          // reported progress unlikely (probabilityTrue strictly below the
+          // threshold) across TWO consecutive iterations. Pure helper decides —
+          // identical strings (deterministic baseline) win over an optimistic
+          // estimate, and any failed/absent S1 sample falls back to the
+          // string-diff result. Never runs when judgeProgress is off.
+          if (judgeOn && i > 1 && judgeSamples.length >= 2) {
+            const { evaluateProgress, DEFAULT_PROGRESS_THRESHOLD } = await import("./progressJudge.js");
+            const verdict = evaluateProgress({
+              iterations: judgeSamples,
+              identicalConsecutive: !progress,
+              threshold: judgeThreshold ?? DEFAULT_PROGRESS_THRESHOLD,
+            });
+            if (verdict.escalate) {
+              return jsonResult(
+                withVerified(
+                  {
+                    iterations,
+                    done: false,
+                    success: false,
+                    escalated: true,
+                    reason: verdict.reason,
+                    recommendation: verdict.recommendation ?? "Escalate: switch to a heavier model, change the approach, or hand off to a human.",
+                    ...(verdict.s1Estimates ? { s1ProgressEstimates: verdict.s1Estimates } : {}),
+                  },
+                  lastOutcome,
+                ),
+              );
+            }
           }
 
           // Re-dispatch with the failure context appended.
