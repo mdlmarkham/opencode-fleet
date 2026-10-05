@@ -223,6 +223,35 @@ describe("#164: the isolation-gate probe host matches the cwd probe (loginUser s
       delete process.env.FLEET_SSH_ARGLOG;
     }
   }, 30_000);
+
+  // Issue #164 review: the case that ACTUALLY distinguishes pre-fix from post-fix —
+  // remoteIp PRESENT *and* a login user set. Pre-fix `entryHostForCaps = remoteIp ?? sshHost`
+  // picks the bare remoteIp; the cwd probe still uses `loginUser@nodeKey`. The two must MATCH,
+  // so the gate must NOT prefer remoteIp. This test FAILS on master (the divergent branch).
+  it.skipIf(!entry)("the gate ignores remoteIp when a login user is set (the divergent branch)", async () => {
+    restore = fakeSshArgLog();
+    const NODES_WITH_IP: FakeNode[] = [{
+      nodeId: "n-dev2",
+      displayName: "dev2",
+      remoteIp: "192.0.2.7",
+      connected: true,
+      invocableCommands: ["opencode.run"],
+    } as unknown as FakeNode];
+    p = loadPlugin(entry!, { nodes: NODES_WITH_IP, config: cfg, invoke: () => ack() });
+    process.env.FLEET_SSH_ARGLOG = join(p.rootDir, "ssh-args.log");
+    try {
+      const res = nodeRes(await dispatch({ isolation: "clone" }));
+      const start = await p.waitForInvoke((c) => c.params.prompt === "__RUN_START__");
+      const hosts = argLog(p.rootDir);
+      expect(start, `dispatch result: ${JSON.stringify(res)}`).toBeDefined();
+      // The capability/gate probe must use the SAME host as the cwd probe ("walt@dev2"),
+      // NOT the bare remoteIp the pre-fix code preferred.
+      expect(hosts, `ssh argv hosts: ${JSON.stringify(hosts)}`).toContain("walt@dev2");
+      expect(hosts, `ssh argv hosts: ${JSON.stringify(hosts)}`).not.toContain("192.0.2.7");
+    } finally {
+      delete process.env.FLEET_SSH_ARGLOG;
+    }
+  }, 30_000);
 });
 
 describe("#105: fleet_dispatch refuses an unsupported isolation level (tool level, fake ssh + fake node)", () => {
