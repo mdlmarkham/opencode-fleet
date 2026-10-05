@@ -124,6 +124,10 @@ export interface OpenCodeRunResult {
   error?: string;
   /** Which limit ended the run, when one did (issue #168): the wall-clock `timeout`, or the node's idle/duration watchdog. */
   endedBy?: "wall-clock" | "idle-watchdog";
+  /** Pi version the node reported (harness=pi; issue #137). */
+  piVersion?: string;
+  /** Baseline hardening flags this node's Pi did NOT support, so they were not applied (harness=pi; issue #137). Absent when all were applied. */
+  piHardeningGaps?: string[];
   /** True when the worker stopped to ask a clarifying question. */
   handRaised?: boolean;
   /** The worker's clarifying question (when handRaised). */
@@ -444,6 +448,20 @@ export function validatePiOptions(task: { piTools?: unknown; piOffline?: unknown
  * Baseline hardening flags are added only when supported, so an older Pi still runs; requested
  * restrictions (piTools, piOffline) are mandatory: unsupported means exit 67, never unrestricted.
  */
+/** Marker line the Pi launcher prints so the parser can report the version and applied flags (issue #137). */
+export const PI_MARKER = "FLEET_PI: ";
+export const PI_BASELINE_FLAGS = ["--no-session", "--no-approve", "--no-extensions", "--no-skills"] as const;
+
+/** Strip the launcher marker from Pi output and read what it said. Pure. */
+export function extractPiMarker(raw: string): { rest: string; version?: string; flags?: string[] } {
+  // Anchored at the start of the output: the launcher prints it before Pi runs, so a model that prints
+  // a look-alike line later cannot spoof it.
+  const m = /^\s*FLEET_PI: version=([^\n]*?) flags=([^\n]*)(?:\n|$)/.exec(raw);
+  if (!m) return { rest: raw };
+  const version = m[1]!.trim();
+  return { rest: raw.slice(m[0].length), ...(version ? { version } : {}), flags: m[2]!.split(/\s+/).filter((f) => f.startsWith("--")) };
+}
+
 export function piFlagLines(task: { piTools?: string[]; piOffline?: boolean; piJson?: boolean }): string[] {
   const lines = [
     'PI_HELP="$(pi --help 2>&1)"',
@@ -457,11 +475,23 @@ export function piFlagLines(task: { piTools?: string[]; piOffline?: boolean; piJ
   }
   if (task.piOffline === true) lines.push(need("--offline", "--offline"));
   // Output format only, so a node without it just keeps the plain-text path.
-  if (task.piJson === true) lines.push('case "$PI_HELP" in *"--mode"*) PI_FLAGS="$PI_FLAGS --mode json";; esac');
+  // Issue #137: JSON mode is the DEFAULT (live-verified on pi 0.73.1): without it the audit manifest
+  // is empty (no commands, no usage). `piJson: false` opts out; a node without --mode keeps plain text.
+  if (task.piJson !== false) lines.push('case "$PI_HELP" in *"--mode"*) PI_FLAGS="$PI_FLAGS --mode json";; esac');
+  // One marker line says which Pi ran and which flags it got, so a hardening flag this version lacks is visible.
+  lines.push(`echo "${PI_MARKER}version=$(pi --version 2>&1 | head -n 1 | tr -cd 'A-Za-z0-9._+ -' | cut -c1-40) flags=$PI_FLAGS"`);
   return lines;
 }
 
-export function parsePiOutput(raw: string, exec?: ExecStatus): OpenCodeRunResult {
+export function parsePiOutput(rawIn: string, exec?: ExecStatus): OpenCodeRunResult {
+  const marker = extractPiMarker(rawIn);
+  const res = parsePiOutputBody(marker.rest, exec);
+  if (marker.version === undefined && marker.flags === undefined) return res;
+  const gaps = marker.flags ? PI_BASELINE_FLAGS.filter((f) => !marker.flags!.includes(f)) : [];
+  return { ...res, ...(marker.version ? { piVersion: marker.version } : {}), ...(gaps.length ? { piHardeningGaps: [...gaps] } : {}) };
+}
+
+function parsePiOutputBody(raw: string, exec?: ExecStatus): OpenCodeRunResult {
   const events = parsePiJsonEvents(raw);
   if (events) return parsePiJsonOutput(raw, events, exec);
   const summary = redactSecrets(raw.trim().slice(-4000));

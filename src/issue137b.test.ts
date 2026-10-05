@@ -60,9 +60,11 @@ describe("#137 Pi-1: piJson flag", () => {
     chmodSync(join(dir, "pi"), 0o755);
     return dir;
   };
-  const run = (piJson: boolean, flags: string) =>
-    spawnSync("bash", ["-c", buildOpenCodeCommand({ prompt: "p", cwd: "/tmp", transport: "http", harness: "pi", piModel: "a/b", ...(piJson ? { piJson } : {}) })], { env: { ...process.env, PATH: `${fake(flags)}:${process.env.PATH}` }, encoding: "utf8" }).stdout;
-  it("adds --mode json only when asked and supported", () => {
+  const run = (piJson: boolean | undefined, flags: string) =>
+    spawnSync("bash", ["-c", buildOpenCodeCommand({ prompt: "p", cwd: "/tmp", transport: "http", harness: "pi", piModel: "a/b", ...(piJson !== undefined ? { piJson } : {}) })], { env: { ...process.env, PATH: `${fake(flags)}:${process.env.PATH}` }, encoding: "utf8" }).stdout;
+  it("adds --mode json by default when supported (issue #137), never when unsupported, and not when piJson is false", () => {
+    expect(run(undefined, "--mode")).toContain("--mode json");
+    expect(run(undefined, "--no-session")).not.toContain("--mode json");
     expect(run(true, "--mode")).toContain("--mode json");
     expect(run(true, "--no-session")).not.toContain("--mode json");
     expect(run(false, "--mode")).not.toContain("--mode json");
