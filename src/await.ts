@@ -102,7 +102,7 @@ const realSleep = (ms: number, signal?: AbortSignal): Promise<void> =>
  * large set cannot open a burst of simultaneous ssh/node calls to one host. Partial results are
  * always returned: runs that finished are reported even if others are still going.
  */
-export async function awaitRuns(runs: AwaitRun[], opts: { timeoutMs?: number; pollMs?: number }, deps: AwaitDeps): Promise<AwaitResult> {
+export async function awaitRuns(runs: AwaitRun[], opts: { timeoutMs?: number; pollMs?: number; until?: "all" | "any" }, deps: AwaitDeps): Promise<AwaitResult> {
   const now = deps.now ?? Date.now;
   const sleep = deps.sleep ?? realSleep;
   const timeoutMs = clampTimeout(opts.timeoutMs);
@@ -140,6 +140,8 @@ export async function awaitRuns(runs: AwaitRun[], opts: { timeoutMs?: number; po
   for (;;) {
     await round();
     if (pendingCount() === 0) break;
+    // until:"any" returns as soon as one run is terminal (the rest stay pending, not failed).
+    if (opts.until === "any" && [...byId.values()].some((o) => o.terminal)) break;
     if (deps.signal?.aborted) break;
     const left = timeoutMs - (now() - started);
     if (left <= 0) break;
@@ -149,5 +151,6 @@ export async function awaitRuns(runs: AwaitRun[], opts: { timeoutMs?: number; po
   }
   const outcomes = runs.map((r) => byId.get(r.runId)!);
   const allTerminal = outcomes.every((o) => o.terminal);
-  return { allTerminal, timedOut: !allTerminal && !deps.signal?.aborted, aborted: !allTerminal && deps.signal?.aborted === true, waitedMs: now() - started, outcomes };
+  const satisfied = allTerminal || (opts.until === "any" && outcomes.some((o) => o.terminal));
+  return { allTerminal, timedOut: !satisfied && !deps.signal?.aborted, aborted: !satisfied && deps.signal?.aborted === true, waitedMs: now() - started, outcomes };
 }
