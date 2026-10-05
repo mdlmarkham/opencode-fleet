@@ -31,6 +31,7 @@ import { mkdtemp, rm, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { shq } from "./shell.js";
+import { ownershipProbeCommand, parseOwnership, type OwnershipReport } from "./ownership.js";
 import { SSH_ARGS, scpPrefix, scpRemote, sshPrefix } from "./ssh.js";
 import { ID_RE } from "./guard.js";
 import { checkSetup } from "./policy.js";
@@ -433,6 +434,21 @@ export async function cleanupNode(nodeHost: string, cwd?: string): Promise<{ ok:
     return { ok: true, detail: stdout.trim() };
   } catch (err) {
     return { ok: false, error: (err as Error).message };
+  }
+}
+
+/**
+ * Report (never fix) checkout paths on a node not owned by the service user (issue #189).
+ * Runs the read-only probe in src/ownership.ts over SSH.
+ */
+export async function probeOwnership(nodeHost: string, cwd: string, serviceUser: string): Promise<OwnershipReport | { ok: false; error: string }> {
+  const cmd = ownershipProbeCommand(cwd, serviceUser);
+  if (!cmd) return { ok: false, error: `unsafe or invalid service user name ${JSON.stringify(String(serviceUser).slice(0, 40))}` };
+  try {
+    const { stdout } = await execFileP("ssh", [...sshPrefix(nodeHost, SSH_ARGS), cmd], { timeout: 60_000 });
+    return parseOwnership(stdout, serviceUser, cwd);
+  } catch (err) {
+    return { ok: false, error: (err as Error).message.slice(0, 300) };
   }
 }
 
