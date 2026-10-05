@@ -608,11 +608,19 @@ export default definePluginEntry({
           const ackCheck = parseAcknowledge(p.acknowledge);
           if (!ackCheck.ok) return jsonResult({ ok: false, error: ackCheck.error });
           const names = new Set(opencodeTargets.flatMap((n) => [n.displayName, n.nodeId].filter((x): x is string => !!x)));
-          const inFlight = (await loadLedger(rootDir))
-            .filter((r) => r.state === "running" && names.has(r.node) && r.cwd === p.cwd)
-            .map((r) => ({ runId: r.runId, node: r.node, cwd: r.cwd, ...(r.spec?.scope ? { scope: r.spec.scope } : {}), ...(r.runCwd ? { isolated: true } : {}) }));
+          // Issue #196: only genuinely-running entries at query time are conflict evidence;
+          // finished ledger entries ride as informational recentlyFinished, never as overlap.
+          const { capacityInputFromLedger } = await import("./capacity.js");
+          const { staleAfter: capacityStaleAfter } = await import("./capacity.js");
+          const gateInput = capacityInputFromLedger(await loadLedger(rootDir) as never, {
+            nodeNames: [...names],
+            cwd: p.cwd,
+            excludeRunId: undefined,
+            now: Date.now(),
+            staleAfterMs: capacityStaleAfter(cfg.capacity),
+          });
           const gate = evaluateDesignGate(specCheck.spec, {
-            inFlight,
+            inFlight: gateInput.inFlight,
             isolated: (p.isolation ?? cfg.isolation ?? "none") === "clone",
             bounds: { ...(cfg.project?.maxScopePatterns ? { maxScopePatterns: cfg.project.maxScopePatterns } : {}), ...(cfg.project?.maxAcceptanceItems ? { maxAcceptanceItems: cfg.project.maxAcceptanceItems } : {}) },
           }, ackCheck.acks);
@@ -1278,11 +1286,21 @@ export default definePluginEntry({
         const ackCheck = parseAcknowledge(p.acknowledge);
         if (!ackCheck.ok) return jsonResult({ ok: false, error: ackCheck.error });
         const { loadLedger } = await import("./ledger.js");
+        // Issue #196: the design_check tool reconciles live-at-query-time, same as the dispatch gate.
+        const { capacityInputFromLedger } = await import("./capacity.js");
+        const { staleAfter: capacityStaleAfter } = await import("./capacity.js");
+        const gateInput = p.node && p.cwd
+          ? capacityInputFromLedger(await loadLedger(api.rootDir ?? process.cwd()) as never, {
+              nodeNames: undefined,   // node filter applied below (p.node is one name or id)
+              cwd: p.cwd,
+              now: Date.now(),
+              staleAfterMs: capacityStaleAfter(cfg.capacity),
+            })
+          : { inFlight: [], recentlyFinished: [] };
         const inFlight = p.node && p.cwd
-          ? (await loadLedger(api.rootDir ?? process.cwd()))
-              .filter((r) => r.state === "running" && r.node === p.node && r.cwd === p.cwd)
-              .map((r) => ({ runId: r.runId, node: r.node, cwd: r.cwd, ...(r.spec?.scope ? { scope: r.spec.scope } : {}), ...(r.runCwd ? { isolated: true } : {}) }))
+          ? gateInput.inFlight.filter((r) => r.node === p.node)
           : [];
+        const recentlyFinished = p.node && p.cwd ? gateInput.recentlyFinished : [];
         const gate = evaluateDesignGate(specCheck.spec, {
           inFlight,
           isolated: (p.isolation ?? cfg.isolation ?? "none") === "clone",
