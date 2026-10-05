@@ -151,6 +151,8 @@ Enable in `openclaw.json`:
 
 The plugin bundles a **skill** (`skills/opencode-fleet/SKILL.md`) that teaches agents when/how to use the fleet — it installs automatically with the plugin.
 
+**New here?** Start with [docs/quickstart.md](docs/quickstart.md) (nothing to a verified, synced change). Installing, configuring and troubleshooting: [docs/operators.md](docs/operators.md).
+
 ## Config
 
 | Key | Default | Description |
