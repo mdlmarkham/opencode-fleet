@@ -243,8 +243,48 @@ export interface ProvisionRequest {
    * target's parent directory.
    */
   serviceUser?: string;
+  /**
+   * Issue #189: a git identity set in the checkout's LOCAL config (only when it has none), so commits the
+   * worker makes are distinguishable from a person's in review. Applied on the SSH unpack path only.
+   */
+  workerIdentity?: WorkerIdentity;
 }
 
+export interface WorkerIdentity {
+  name: string;
+  email: string;
+}
+
+const IDENT_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$/;
+const IDENT_EMAIL_RE = /^[A-Za-z0-9._+-]{1,64}@[A-Za-z0-9][A-Za-z0-9.-]{0,100}$/;
+
+/** Validate an identity before it reaches a shell. Returns an error message, or null when fine. */
+export function validateWorkerIdentity(id: unknown): string | null {
+  if (typeof id !== "object" || id === null) return "workerIdentity must be {name, email}";
+  const { name, email } = id as { name?: unknown; email?: unknown };
+  if (typeof name !== "string" || !IDENT_NAME_RE.test(name)) return "workerIdentity.name must be 1-64 of letters, digits, space, . _ - (starting with a letter or digit)";
+  if (typeof email !== "string" || !IDENT_EMAIL_RE.test(email)) return "workerIdentity.email must look like name@host with letters, digits and . _ + - only";
+  return null;
+}
+
+/** The identity for a node from the operator's `workerGitIdentity` config (undefined when not configured). */
+export function resolveWorkerIdentity(cfg: { name?: string; email?: string } | undefined, nodeName: string): WorkerIdentity | undefined {
+  if (!cfg) return undefined;
+  const host = nodeName.replace(/[^A-Za-z0-9.-]/g, "-").replace(/^[^A-Za-z0-9]+/, "").slice(0, 60) || "node";
+  return { name: cfg.name ?? "fleet-worker", email: cfg.email ?? `fleet-worker@${host}.invalid` };
+}
+
+/**
+ * Shell fragment: set user.name/user.email in the checkout's LOCAL git config, each only when the
+ * checkout has none, so a repo's own configured identity is never overwritten. Per-checkout, never
+ * global. Run BEFORE the ownership hand-over, so the config file ends up owned by the worker.
+ */
+export function workerIdentityCommand(cwd: string, id: WorkerIdentity): string {
+  const err = validateWorkerIdentity(id);
+  if (err) throw new Error(err);
+  const set = (key: string, value: string): string => `{ git -C ${shq(cwd)} config --local --get ${key} >/dev/null 2>&1 || git -C ${shq(cwd)} config --local ${key} ${shq(value)}; }`;
+  return `${set("user.name", id.name)} && ${set("user.email", id.email)}`;
+}
 
 const USER_RE = /^[A-Za-z_][A-Za-z0-9_.-]{0,31}$/;
 
@@ -578,6 +618,9 @@ export async function provisionToNode(
       stableOriginCommand(req.cwd, stableOrigin),
       req.commit ? `cd ${shq(req.cwd)} && git checkout -q ${shq(req.commit)}` : "",
       `cd ${shq(req.cwd)} && git gc --prune=now 2>/dev/null`,
+      // Issue #189: the worker's git identity goes in BEFORE the hand-over, so the config it
+      // writes is owned by the worker afterwards like everything else.
+      req.workerIdentity ? workerIdentityCommand(req.cwd, req.workerIdentity) : "",
       // Issue #71: hand the checkout to the worker principal and verify it.
       ownershipCommand(req.cwd, req.serviceUser),
       // Issue #14: set safe.directory for the landing principal right after

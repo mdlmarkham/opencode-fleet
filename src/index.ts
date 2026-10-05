@@ -48,6 +48,8 @@ interface FleetConfig {
   defaultTimeoutMs?: number;
   /** Dispatch target policy (issue #168). */
   dispatch?: { defaultTarget?: "all" };
+  /** Opt-in (issue #189): commits made in a provisioned checkout carry this identity (set in the checkout's local git config, only when it has none). */
+  workerGitIdentity?: { name?: string; email?: string };
   apertureUrl?: string;
   /** Shared workspace root on nodes (default: /home/<serviceUser>/fleet when all targets share one service user). */
   fleetRoot?: string;
@@ -98,6 +100,15 @@ export default definePluginEntry({
         type: "number",
         default: 1800000,
         description: "Default wall-clock timeout for a fleet_dispatch run, ms (30 minutes). The idle watchdog (maxIdleMs, default 120000) is the primary hung-run guard; this is the backstop. A run ended by either limit reports which one in `endedBy`.",
+      },
+      workerGitIdentity: {
+        type: "object",
+        additionalProperties: false,
+        description: "Opt-in (issue #189): fleet_provision sets this git identity in each provisioned checkout's LOCAL config (only when the checkout has none), so worker-authored commits are distinguishable from a person's in review. Defaults name `fleet-worker`, email `fleet-worker@<node>.invalid`. SSH-provisioned nodes only; a channel-provisioned node is not changed.",
+        properties: {
+          name: { type: "string", description: "Git author/committer name." },
+          email: { type: "string", description: "Git author/committer email." },
+        },
       },
       dispatch: {
         type: "object",
@@ -2154,7 +2165,7 @@ export default definePluginEntry({
       },
       execute: async (toolCallId, params, signal) => {
         const p = params as { repo: string; cwd?: string; nodes?: string[]; branch?: string; commit?: string; setup?: string };
-        const { createRepoBundle, provisionToNode, cleanupBundle } = await import("./provision.js");
+        const { createRepoBundle, provisionToNode, cleanupBundle, resolveWorkerIdentity } = await import("./provision.js");
         // Issue #34: refuse an arbitrary-shell `setup` unless the operator allows it.
         const setupCheck = checkSetup(p.setup ?? "", cfg.allowSetupCommands === true);
         if (!setupCheck.ok) return jsonResult({ ok: false, error: setupCheck.error });
@@ -2219,6 +2230,8 @@ export default definePluginEntry({
               allowSetupCommands: cfg.allowSetupCommands === true,
               serviceUser: (node as { member?: { serviceUser?: string; user?: string } }).member?.serviceUser
                 ?? (node as { member?: { user?: string } }).member?.user,
+              // Issue #189: opt-in distinct worker git identity (local to the checkout, never overwriting one).
+              ...(cfg.workerGitIdentity ? { workerIdentity: resolveWorkerIdentity(cfg.workerGitIdentity, String(node.displayName ?? node.nodeId)) } : {}),
             },
             channelInvoke,
           );

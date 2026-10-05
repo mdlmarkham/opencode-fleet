@@ -36,7 +36,28 @@ operator step.
 - A missing directory, a directory with no `.git`, an unknown service user, or unparseable output
   is an **error**, never a clean checkout.
 
-## Not done here
+## Worker git identity (opt-in)
 
-- A distinct worker git identity, so worker-authored commits are distinguishable from the
-  supervisor's in review (still open on #189).
+Set `workerGitIdentity` in the plugin config (`{}` for the defaults, or `{name, email}`) and
+`fleet_provision` writes a git identity into each provisioned checkout's **local** config, so
+commits the worker makes are distinguishable from a person's in review. Defaults: name
+`fleet-worker`, email `fleet-worker@<node>.invalid` (the `.invalid` TLD cannot be a real address).
+
+- Each of `user.name` / `user.email` is set **only when the checkout does not already have it**:
+  a repo's own configured identity is never overwritten. Global and system git config are never
+  touched.
+- It is applied before the ownership hand-over, so the config file is worker-owned afterwards.
+- Values are validated before they reach a shell.
+- SSH-provisioned nodes only: a node provisioned over the node channel (no SSH) is not changed.
+
+## `safe.directory`
+
+`fleet_provision` already sets `safe.directory` for the checkout at `--system` scope when it
+provisions (issue #14), so the one-time manual step in item 2 above is only needed for a checkout
+that was staged by hand.
+
+## Not done
+
+- An ownership warning at dispatch time. The dispatch cwd check already proves the worker can enter
+  the checkout; a full ownership scan on every dispatch would add an ssh round trip each time, so it
+  stays a `fleet_cleanup` report.
