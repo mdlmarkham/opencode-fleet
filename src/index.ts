@@ -2352,7 +2352,7 @@ export default definePluginEntry({
       name: "fleet_cleanup",
       label: "Fleet Cleanup",
       description:
-        "Keep fleet nodes tidy: run git GC on checkouts to prevent bloat and report disk usage. Node-side git bundles stage in per-run PRIVATE state dirs and every provision/sync run cleans its own staging (issue #63), so nothing is swept on other runs' behalf. Run periodically to avoid node bloat.",
+        "Keep fleet nodes tidy: run git GC on checkouts to prevent bloat, report disk usage, and (with cwd) report paths in the checkout not owned by the node's service user (`ownership`; report only, root-side staging poisons ownership: see docs/STAGING.md). Node-side git bundles stage in per-run PRIVATE state dirs and every provision/sync run cleans its own staging (issue #63), so nothing is swept on other runs' behalf. Run periodically to avoid node bloat.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -2382,7 +2382,22 @@ export default definePluginEntry({
         const results: Record<string, unknown> = {};
         for (const node of targets) {
           const host = node.remoteIp ?? node.displayName ?? node.nodeId;
-          const entry: Record<string, unknown> = await cleanupNode(host, p.cwd);
+          // Issue #189: report (never fix) checkout paths the worker's service user does not own. This runs
+          // BEFORE cleanupNode: its `git gc` runs as the SSH login user and would itself leave root-owned
+          // files in .git, so measuring afterwards would report damage this very call just did.
+          // Only member.serviceUser counts: member.user is the SSH login user (often root), not the worker.
+          let ownership: unknown;
+          if (p.cwd) {
+            const svcUser = (node as { member?: { serviceUser?: string } }).member?.serviceUser;
+            if (svcUser) {
+              const { probeOwnership } = await import("./provision.js");
+              ownership = await probeOwnership(host, p.cwd, svcUser);
+            } else {
+              ownership = { ok: false, error: "no serviceUser configured for this node (member.serviceUser), so ownership was not checked" };
+            }
+          }
+          const entry: Record<string, unknown> = await cleanupNode(host, p.cwd, (node as { member?: { serviceUser?: string } }).member?.serviceUser);
+          if (ownership !== undefined) entry.ownership = ownership;
           // Issue #63: prune finished runs from the node's private state dir.
           const pruneDays = p.pruneOlderThanDays ?? 7;
           if (pruneDays > 0) {

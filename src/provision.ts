@@ -31,6 +31,7 @@ import { mkdtemp, rm, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { shq } from "./shell.js";
+import { ownershipProbeCommand, parseOwnership, type OwnershipReport } from "./ownership.js";
 import { SSH_ARGS, scpPrefix, scpRemote, sshPrefix } from "./ssh.js";
 import { ID_RE } from "./guard.js";
 import { checkSetup } from "./policy.js";
@@ -412,8 +413,12 @@ export function parseRemoteStageDir(id: string, out: string): string {
  * Manager-side: run git GC on a node checkout and remove stale bundles to
  * keep the worker tidy and avoid bloat.
  */
-export async function cleanupNode(nodeHost: string, cwd?: string): Promise<{ ok: boolean; detail?: string; error?: string }> {
+export async function cleanupNode(nodeHost: string, cwd?: string, serviceUser?: string): Promise<{ ok: boolean; detail?: string; error?: string }> {
   try {
+    // Issue #189: `git gc` as the SSH login user (often root) leaves root-owned files in .git, the
+    // poisoning this repo documents. With a known service user, run the checkout work as that user.
+    const asService = (script: string): string =>
+      serviceUser !== undefined && USER_RE.test(serviceUser) ? `sudo -n -u ${shq(serviceUser)} -H bash -c ${shq(script)}` : script;
     const cmds = [
       // Issue #63: NO public /tmp bundle sweep. Node-side bundles stage in a
       // per-run PRIVATE dir under the node's fleet state dir, and every
@@ -421,7 +426,7 @@ export async function cleanupNode(nodeHost: string, cwd?: string): Promise<{ ok:
       // are no leftovers to sweep. A wildcard sweep here would delete OTHER
       // runs' (and other users') files.
       // GC the checkout if provided (light GC; aggressive is too slow).
-      cwd ? `cd ${shq(cwd)} && git gc --prune=now 2>/dev/null` : "",
+      cwd ? asService(`cd ${shq(cwd)} && git gc --prune=now 2>/dev/null`) : "",
       // Report disk usage of the checkout.
       cwd ? `du -sh ${shq(cwd)} 2>/dev/null` : "",
     ]
@@ -433,6 +438,21 @@ export async function cleanupNode(nodeHost: string, cwd?: string): Promise<{ ok:
     return { ok: true, detail: stdout.trim() };
   } catch (err) {
     return { ok: false, error: (err as Error).message };
+  }
+}
+
+/**
+ * Report (never fix) checkout paths on a node not owned by the service user (issue #189).
+ * Runs the read-only probe in src/ownership.ts over SSH.
+ */
+export async function probeOwnership(nodeHost: string, cwd: string, serviceUser: string): Promise<OwnershipReport | { ok: false; error: string }> {
+  const cmd = ownershipProbeCommand(cwd, serviceUser);
+  if (!cmd) return { ok: false, error: `unsafe or invalid service user name ${JSON.stringify(String(serviceUser).slice(0, 40))}` };
+  try {
+    const { stdout } = await execFileP("ssh", [...sshPrefix(nodeHost, SSH_ARGS), cmd], { timeout: 60_000 });
+    return parseOwnership(stdout, serviceUser, cwd);
+  } catch (err) {
+    return { ok: false, error: (err as Error).message.slice(0, 300) };
   }
 }
 
