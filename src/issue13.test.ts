@@ -52,7 +52,7 @@ describe("issue #13 layer 3: fleet_sync destination branch", () => {
 
   it("passes a pinned destination only when the caller explicitly named one", () => {
     // SSH path: 6th arg is `p.branch` (undefined when defaulted).
-    expect(index).toContain("syncFromNode(host, p.cwd, p.repo, p.branch ?? \"main\", undefined, p.branch, cfg.sync)");
+    expect(index).toContain("syncFromNode(host, p.cwd, p.repo, p.branch ?? \"main\", undefined, p.branch, cfg.sync, expectedHead)");
     // Channel path: destBranch carries the raw (possibly undefined) caller value.
     expect(index).toContain("destBranch: p.branch,");
   });

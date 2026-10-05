@@ -702,6 +702,8 @@ export async function syncFromNode(
   prebuilt?: { mode: "from-base64"; base64: string; branch?: string; base?: string; workerBranch?: string; destBranch?: string },
   destBranchPinned?: string,
   syncPolicy?: Partial<SyncPolicy>,
+  /** Issue #177: refuse to push unless the worker branch's tip in the bundle is exactly this sha (the reviewed head). */
+  extra?: { expectedHead?: string },
 ): Promise<ProvisionResult & { synced?: boolean; uncommittedFiles?: number; detail?: string; redirectedFrom?: string;
   /** Issue #152: parsed origin state of the node checkout (SSH path preflight). */
   originPreflight?: OriginPreflight;
@@ -847,6 +849,20 @@ export async function syncFromNode(
           detail: "refusing to report success when the worker branch is absent from the bundle (fail-closed)",
         };
       }
+
+    // Issue #177: the review gate binds a PASS to one sha, so publish only that sha.
+    if (extra?.expectedHead !== undefined) {
+      const { stdout: tipOut } = await execFileP("git", ["-C", cloneDir, "rev-parse", bundleRef], { timeout: 30_000 });
+      if (tipOut.trim().toLowerCase() !== extra.expectedHead.trim().toLowerCase()) {
+        return {
+          ok: false,
+          cwd,
+          branch: destBranch,
+          commit: "head-mismatch",
+          error: `the worker bundle's "${workerBranch}" tip is ${tipOut.trim().slice(0, 12)}, not the reviewed head ${extra.expectedHead.slice(0, 12)}; refusing to publish unreviewed commits`,
+        };
+      }
+    }
       {
         const applied = await applyPolicy(cloneDir, workerBranch, destBranch, bundleRef, branch);
         if ("refused" in applied) return { ...applied.refused, viaChannel: true };
@@ -1094,6 +1110,20 @@ export async function syncFromNode(
         error: `worker bundle did not contain branch "${workerBranch}"`,
         detail: "refusing to report success when the worker branch is absent from the bundle (fail-closed)",
       };
+    }
+
+    // Issue #177: the review gate binds a PASS to one sha, so publish only that sha.
+    if (extra?.expectedHead !== undefined) {
+      const { stdout: tipOut } = await execFileP("git", ["-C", cloneDir, "rev-parse", bundleRef], { timeout: 30_000 });
+      if (tipOut.trim().toLowerCase() !== extra.expectedHead.trim().toLowerCase()) {
+        return {
+          ok: false,
+          cwd,
+          branch,
+          commit: "head-mismatch",
+          error: `the worker bundle's "${workerBranch}" tip is ${tipOut.trim().slice(0, 12)}, not the reviewed head ${extra.expectedHead.slice(0, 12)}; refusing to publish unreviewed commits`,
+        };
+      }
     }
     // Resolve the destination branch (issue #13, layer 3). Prefer an explicitly
     // pinned destination when the caller provided one; otherwise publish the
