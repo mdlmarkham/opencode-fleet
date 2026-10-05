@@ -93,13 +93,24 @@ export async function handleOpencodeRunPolicy(
   const nodeId = ctx.node?.nodeId;
   const launches = resolved.op === "run" || resolved.op === "run.start";
 
-  // `expect.command` runs on the node outside the engine's permission system. This
-  // is the one place every launch passes through (tools, direct invocations), so the
-  // operator's rule is enforced here and not only in the tool wrappers.
-  const cmd = (task.expect as { command?: unknown } | null | undefined)?.command;
-  if (launches && cmd !== undefined && cmd !== null) {
-    const check = typeof cmd === "string" ? checkSetup(cmd, opts.allowExpectCommands === true) : { ok: false as const, error: "expect.command must be a string" };
-    if (!check.ok) return { ok: false, message: `invalid expect.command: ${check.error}` };
+  // `expect.command`/`expect.commands` run on the node outside the engine's
+  // permission system. This is the one place every launch passes through
+  // (tools, direct invocations), so the operator's rule is enforced here and
+  // not only in the tool wrappers. Issue #104: EVERY plural entry gets the
+  // same rule — the plural must not bypass what the singular is refused.
+  const expectObj = (task.expect ?? null) as { command?: unknown; commands?: unknown } | null;
+  if (launches && expectObj != null) {
+    if (expectObj.command !== undefined && expectObj.command !== null) {
+      const cmd = expectObj.command;
+      const check = typeof cmd === "string" ? checkSetup(cmd, opts.allowExpectCommands === true) : { ok: false as const, error: "expect.command must be a string" };
+      if (!check.ok) return { ok: false, message: `invalid expect.command: ${check.error}` };
+    }
+    if (Array.isArray(expectObj.commands)) {
+      for (const cmd of expectObj.commands) {
+        const check = typeof cmd === "string" ? checkSetup(cmd, opts.allowExpectCommands === true) : { ok: false as const, error: "expect.commands entries must be strings" };
+        if (!check.ok) return { ok: false, message: `invalid expect.commands entry: ${check.error}` };
+      }
+    }
   }
   const need = launches ? requiredProtocol(task as { harness?: unknown; expect?: unknown; isolation?: unknown; piTools?: unknown; piOffline?: unknown }) : requiredProtocolForOp(resolved.op);
   if (need.version > 0) {
@@ -128,7 +139,9 @@ export async function handleOpencodeRunPolicy(
   // uses its whole budget still returns `verified` instead of timing out mid-gate.
   const baseTimeout = typeof task.timeoutMs === "number" ? task.timeoutMs : undefined;
   const timeoutMs =
-    baseTimeout !== undefined ? relayTimeoutWithGate(baseTimeout, launches && task.expect != null) : undefined;
+    baseTimeout !== undefined
+      ? relayTimeoutWithGate(baseTimeout, launches && task.expect != null, (task.expect ?? undefined) as import("./verify.js").ExpectCheck | undefined)
+      : undefined;
   const result = await ctx.invokeNode({
     // Issue #61: stamp the MINIMUM protocol this request needs, and only when it
     // needs one (already verified against the node above). Plain runs and the
