@@ -14,6 +14,8 @@
  *   starting with `-` cannot be read as a git option.
  */
 
+import { spawn } from "node:child_process";
+
 import { redactSecrets } from "./untrusted.js";
 
 export interface SyncPolicy {
@@ -180,4 +182,62 @@ export function evaluateChange(files: string[], diff: string, policy: SyncPolicy
     };
   }
   return { ok: true };
+}
+
+function gitExec(repoDir: string, args: string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("git", ["-C", repoDir, ...args], { stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    child.stdout.on("data", (c: Buffer) => { out += c.toString(); });
+    let err = "";
+    child.stderr.on("data", (c: Buffer) => { err += c.toString(); });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code === 0) resolve(out);
+      else reject(new Error(`git ${args[0]} exited ${code}: ${err.trim().slice(0, 200)}`));
+    });
+  });
+}
+
+/** The empty tree object every git object database can address; lets us diff a parentless commit against "nothing". */
+const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+/**
+ * Issue #103b: scan the range base..tip COMMIT BY COMMIT, merging and all.
+ * The net diff (`git diff origin/base...tip`) hides a secret that an
+ * intermediate commit ADDS and a later one removes, yet the intermediate
+ * commit survives in the pushed history. It ALSO hides a secret introduced
+ * only by a MERGE commit's resolution (neither parent had it), and the old
+ * `git diff <commit>^!` helper both missed merges and failed on parentless
+ * root commits. So walk `git rev-list --parents base..tip` and diff every
+ * commit against EACH parent (a merge resolution that adds lines neither
+ * parent had shows up against at least one of them), diffing a parentless
+ * commit against the empty tree; scan the introduced lines with the SAME
+ * predicate as the net diff (`countSecretLines`). Throws with the offending
+ * commit when any commit in the range introduces a secret; diff failures are
+ * fatal (fail closed), never swallowed.
+ */
+export async function secretsInCommits(
+  repoDir: string,
+  base: string,
+  tip: string,
+): Promise<void> {
+  // `--parents` prefixes each row with the commit's own parent SHA(s), so we
+  // need no second round-trip per commit: a merge shows up with 2+ parents.
+  const revs = await gitExec(repoDir, ["rev-list", "--parents", `${base}..${tip}`]);
+  for (const row of revs.split("\n").filter(Boolean)) {
+    const [commit, ...parents] = row.split(" ");
+    const against = parents.length ? parents : [EMPTY_TREE];
+    for (const p of against) {
+      const diff = await gitExec(
+        repoDir, ["diff", "--text", "--no-textconv", "--no-ext-diff", "--unified=0", p, commit],
+      );
+      const secrets = countSecretLines(diff);
+      if (secrets > 0) {
+        throw new Error(
+          `commit ${commit.slice(0, 12)} introduces ${secrets} credential-shaped added line(s) (tokens, keys, passwords)`,
+        );
+      }
+    }
+  }
 }
