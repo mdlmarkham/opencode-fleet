@@ -26,7 +26,7 @@
       },
       "defaultTimeoutMs": {
         "type": "number",
-        "default": 300000
+        "default": 1800000
       },
       "nodes": {
         "type": "object",
@@ -67,6 +67,14 @@
               "description": "Max concurrent runs the gateway will start on this node (issue #39). A dispatch at the limit returns a retryable no-capacity result. Overrides capacity.maxConcurrentPerNode."
             }
           }
+        }
+      },
+      "dispatch": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Dispatch target policy (issue #168).",
+        "properties": {
+          "defaultTarget": { "type": "string", "enum": ["all"], "description": "Restore the old behaviour: a fleet_dispatch that names no node runs on EVERY fleet node. Off by default: an unnamed target is refused with the node list; fan-out is explicit (nodes: \"all\") and pick: \"any\" chooses one node with a free slot." }
         }
       },
       "capacity": {

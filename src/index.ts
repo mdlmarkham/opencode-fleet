@@ -2,7 +2,7 @@ import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { buildJsonPluginConfigSchema, jsonResult } from "openclaw/plugin-sdk/core";
 import { join } from "node:path";
 import { shq } from "./shell.js";
-import { buildOpenCodeCommand, parseOpenCodeOutput, parsePiOutput, validateHarnessTransport, validatePiOptions, type OpenCodeTask } from "./opencode.js";
+import { DEFAULT_RUN_TIMEOUT_MS, buildOpenCodeCommand, parseOpenCodeOutput, parsePiOutput, validateHarnessTransport, validatePiOptions, type OpenCodeTask } from "./opencode.js";
 import {
   probeAckRecovery,
   abortStateWrite,
@@ -45,6 +45,8 @@ interface FleetConfig {
   defaultTransport?: "http" | "acp";
   nodePrefixes?: string[];
   defaultTimeoutMs?: number;
+  /** Dispatch target policy (issue #168). */
+  dispatch?: { defaultTarget?: "all" };
   apertureUrl?: string;
   /** Shared workspace root on nodes (default: /home/<serviceUser>/fleet when all targets share one service user). */
   fleetRoot?: string;
@@ -93,8 +95,16 @@ export default definePluginEntry({
       },
       defaultTimeoutMs: {
         type: "number",
-        default: 300000,
-        description: "Default timeout for OpenCode runs, ms.",
+        default: 1800000,
+        description: "Default wall-clock timeout for a fleet_dispatch run, ms (30 minutes). The idle watchdog (maxIdleMs, default 120000) is the primary hung-run guard; this is the backstop. A run ended by either limit reports which one in `endedBy`.",
+      },
+      dispatch: {
+        type: "object",
+        additionalProperties: false,
+        description: "Dispatch target policy (issue #168).",
+        properties: {
+          defaultTarget: { type: "string", enum: ["all"], description: "Restore the old behaviour: a fleet_dispatch that names no node runs on EVERY fleet node. Off by default: an unnamed target is refused with the node list; fan-out is explicit (nodes: \"all\") and pick:\"any\" chooses one node with a free slot." },
+        },
       },
       allowAutoApprove: {
         type: "boolean",
@@ -288,11 +298,11 @@ export default definePluginEntry({
           },
           cwd: { type: "string", description: "Working directory on the target node(s)." },
           nodes: {
-            type: "array",
-            items: { type: "string" },
-            description: "Node display names or ids. Omit for all fleet nodes.",
+            oneOf: [{ type: "array", items: { type: "string" } }, { type: "string", enum: ["all"] }],
+            description: 'Node display names or ids, or "all" to fan the same task out to every fleet node. Required unless `node` or `pick` is given (a fleet with a single node needs none).',
           },
           node: { type: "string", description: "Singular alias for nodes: [node]. Convenience for single-node dispatch." },
+          pick: { type: "string", enum: ["any"], description: 'Let the plugin choose ONE node with a free slot (most free first), from `nodes` when given, else from the whole fleet. Returns a retryable no-capacity result when none is free.' },
           transport: { type: "string", enum: ["http", "acp"], description: "OpenCode transport." },
           harness: { type: "string", enum: ["opencode", "pi"], description: "Worker engine harness." },
           route: {
@@ -347,8 +357,9 @@ export default definePluginEntry({
         const raw = rawParams as {
           prompt?: string;
           cwd: string;
-          nodes?: string[];
+          nodes?: string[] | "all";
           node?: string;
+          pick?: "any";
           transport?: "http" | "acp";
           harness?: "opencode" | "pi";
           route?: { candidates: string[] };
@@ -398,7 +409,21 @@ export default definePluginEntry({
         const list = await api.runtime.nodes.list();
         const nodes = list.nodes ?? [];
         const fleet = (await import("./membership.js")).resolveFleetNodes(nodes, cfg);
-        const nodeFilter = p.node ? [p.node] : p.nodes;
+        // Issue #168: an unnamed target is refused (it used to fan out to every node); fan-out and
+        // single-node picking are explicit.
+        const { targetMode, pickNode, noFreeSlot } = await import("./targeting.js");
+        const { slotLimit: slotLimitFor, staleAfter: staleAfterFor, liveRuns: liveRunsFor } = await import("./capacity.js");
+        const slotRuns = await (await import("./ledger.js")).loadLedger(api.rootDir ?? process.cwd());
+        const slotsOf = (n: (typeof fleet)[number]) => {
+          const lim = slotLimitFor(cfg.capacity, (n as { member?: { maxConcurrent?: unknown } }).member);
+          const { live } = liveRunsFor(slotRuns, [n.displayName, n.nodeId].filter((x): x is string => !!x), Date.now(), staleAfterFor(cfg.capacity));
+          const limit = lim.ok && lim.limit !== undefined ? lim.limit : null;
+          return { node: n.displayName ?? n.nodeId, limit, free: limit === null ? null : Math.max(0, limit - live.length) };
+        };
+        const mode = targetMode({ node: p.node, nodes: p.nodes, pick: p.pick, defaultTarget: cfg.dispatch?.defaultTarget, fleet: fleet.map(slotsOf) });
+        if (mode.mode === "invalid") return jsonResult({ ok: false, error: mode.error });
+        if (mode.mode === "refuse") return jsonResult({ ok: false, error: mode.error, nodes: mode.nodes });
+        const nodeFilter = mode.mode === "explicit" ? mode.names : mode.mode === "pick" && mode.among !== "fleet" ? mode.among : undefined;
         let targets = nodeFilter?.length
           ? fleet.filter((n) => nodeFilter!.includes(n.displayName ?? n.nodeId) || nodeFilter!.includes(n.nodeId))
           : fleet;
@@ -430,6 +455,12 @@ export default definePluginEntry({
           return jsonResult(
             `No fleet nodes found. Paired nodes: ${nodes.map((n) => n.displayName ?? n.nodeId).join(", ") || "none"}`,
           );
+        }
+        if (mode.mode === "pick") {
+          const candidates = targets.map(slotsOf);
+          const chosen = pickNode(candidates);
+          if (!chosen) return jsonResult(noFreeSlot(candidates));
+          targets = targets.filter((n) => (n.displayName ?? n.nodeId) === chosen.node);
         }
 
         const transport = p.transport ?? cfg.defaultTransport ?? "http";
@@ -590,9 +621,21 @@ export default definePluginEntry({
             return jsonResult({ ok: false, error: `design gate (${design.verdict}): fix the objections or acknowledge them with a reason`, design });
           }
         }
+        // Issue #168: success is the exit code unless a gate is given. A dispatch with no verify gate
+        // says so (advise), or is refused (enforce), under the same project.gate setting.
+        const noGate = expectSpec.expect === undefined;
+        if (noGate && gateMode === "enforce") {
+          return jsonResult({ ok: false, error: "project.gate=enforce: this dispatch has no verification gate, so success would be just the process exit code. Pass a `spec` with `verify` (or `expect`), or set project.gate to advise/off." });
+        }
+        const dispatchWarnings: string[] = [];
+        if (p.timeoutMs !== undefined && p.timeoutMs < 600_000 && (specCheck.spec?.acceptance?.length ?? 0) >= 2) {
+          dispatchWarnings.push(`timeoutMs ${p.timeoutMs} is under 10 minutes for a spec with ${specCheck.spec!.acceptance!.length} acceptance criteria; the run will be killed at the limit with the work half-done. Omit timeoutMs for the 30-minute default.`);
+        }
         const results: Record<string, unknown> = {};
         if (skippedNodes.length) results.skipped = skippedNodes;
         if (design && design.verdict !== "accept") results.design = design;
+        if (noGate && gateMode !== "off") results.verification = { gate: "none", note: "no verify gate: success is just the process exit code and is unchecked. Pass a `spec` with `verify` (or `expect`) so a run that exits 0 but did nothing is caught." };
+        if (dispatchWarnings.length) results.warnings = dispatchWarnings;
         // Issue #87, slice 3: surface the opt-in routing decision — only when
         // `route` was requested; the default path adds no field at all.
         if (s1RouteDecision) results.s1 = { route: s1RouteDecision };
@@ -715,7 +758,7 @@ export default definePluginEntry({
             model: p.model,
             agent: p.agent,
             autoApprove: p.autoApprove === true,
-            timeoutMs: p.timeoutMs ?? cfg.defaultTimeoutMs,
+            timeoutMs: p.timeoutMs ?? cfg.defaultTimeoutMs ?? DEFAULT_RUN_TIMEOUT_MS,
             maxIdleMs: p.maxIdleMs,
             maxDurationMs: p.maxDurationMs,
             env: p.env,

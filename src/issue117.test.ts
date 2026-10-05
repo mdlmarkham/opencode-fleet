@@ -131,7 +131,8 @@ describe.skipIf(!entry)("#117: tools", () => {
   });
   it("enforce does not block on nudges alone, and a bad acknowledge is a clear refusal", async () => {
     p = loadPlugin(entry!, { nodes: NODES, config: cfg({ gate: "enforce" }), invoke: ok });
-    expect((await call({ spec: { goal: "g" } }) as { design?: unknown }).design).toBeDefined();
+    // A verify gate is present (enforce refuses ungated dispatches, #168); the other gaps are nudges.
+    expect((await call({ spec: { goal: "g", verify: { command: "scripts/check.sh" } } }) as { design?: unknown }).design).toBeDefined();
     expect(await p.waitForInvoke((c) => c.params.prompt === "__RUN_START__")).toBeDefined();
     expect(await call({ spec: GOOD, acknowledge: "x" })).toMatchObject({ ok: false, error: expect.stringContaining("acknowledge") });
   });
