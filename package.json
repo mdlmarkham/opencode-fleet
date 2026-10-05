@@ -11,7 +11,8 @@
     "plugin:build": "npm run build && openclaw plugins build --entry ./dist/index.js",
     "plugin:validate": "npm run build && openclaw plugins validate --entry ./dist/index.js",
     "test": "vitest run --config ./vitest.config.ts",
-    "calibrate": "npm run build && node dist/calibrate-cli.js"
+    "calibrate": "npm run build && node dist/calibrate-cli.js",
+    "pi:verify": "npm run build && node dist/pi-verify-cli.js"
   },
   "files": [
     "dist",
