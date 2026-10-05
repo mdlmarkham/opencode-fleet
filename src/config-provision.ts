@@ -55,12 +55,16 @@ export interface ConfigProvisionResult {
 /** Remote shell script: merge the deny baseline into the node's opencode.json. */
 function baselineInstallScript(): string {
   // POSIX sh + node -e: reads the existing config (if any), merges, writes
-  // back atomically. The merge is fail-safe: an unparseable config is
-  // replaced by a config holding only the baseline.
+  // back atomically. Fail-safe means REFUSE, not destroy (issue #51 review):
+  // an unparseable config is left untouched and reported as an error — we do
+  // not overwrite the operator's providers/credentials because of a stray
+  // comma. The previous content is also backed up to a .bak first.
   const nodeScript = [
     'const fs=require("fs"),p=process.env.HOME+"/.config/opencode/opencode.json";',
     "let cur=null;",
     'try{cur=JSON.parse(fs.readFileSync(p,"utf8"));}catch(e){cur=null;}',
+    "if(fs.existsSync(p)&&cur===null){process.stderr.write(\"FLEET_BASELINE_REFUSED: existing opencode.json is not valid JSON; left untouched\\n\");process.exit(3);}",
+    'try{fs.copyFileSync(p,p+".bak");}catch(e){}',
     "const {mergeDenyBaseline}=require(process.argv[1]);",
     'fs.writeFileSync(p+".tmp",JSON.stringify(mergeDenyBaseline(cur),null,2)+"\\n");',
     'fs.renameSync(p+".tmp",p);',

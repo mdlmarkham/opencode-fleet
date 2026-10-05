@@ -195,72 +195,35 @@ describe("#51 slice 2: fleet_capabilities reports denyBaseline", () => {
     expect(detect(null)).toBe(false);
   });
 
-  it("detectNodeCapabilities sets denyBaseline (true with a baseline config on disk, false absent/unparseable) using the real function", async () => {
-    const restore = fakeSsh(
-      [
-        "CPU=8",
-        "MEM=31",
-        "DISK=90",
-        "GPU=none",
-        "TOOLS=node,npm,python3",
-        "OPENCODE=1.18.26",
-        "PYVER=Python 3.12.3",
-        "PYVENV=yes",
-        "PYPEP668=yes",
-        "PIPUSER=yes",
-      ].join("\n"),
-    );
+  it("detectNodeCapabilities sets denyBaseline (true with a baseline config on node, false absent/unparseable) using the real function", async () => {
+    const { fakeSshReply } = await import("./testkit/plugin.js");
+    const { setConfig, restore } = fakeSshReply();
     try {
-      // The capabilities code reads ~/.config/opencode/opencode.json of the
-      // MANAGER-side process (this test host). Point HOME at a fixture dir per
-      // case and restore it after.
-      const realHome = process.env.HOME;
-      const base = mkdtempSync(join(tmpdir(), "issue51b-caps-"));
-
-      // Case 1: config WITH the baseline.
-      const withBaselineDir = join(base, "with-baseline");
-      mkdirSync(join(withBaselineDir, ".config", "opencode"), { recursive: true });
-      writeFileSync(
-        join(withBaselineDir, ".config", "opencode", "opencode.json"),
-        JSON.stringify(mergeDenyBaseline({ provider: { p: { models: { m: {} } } } })),
-        "utf8",
-      );
-      process.env.HOME = withBaselineDir;
-      const capsWith = await detectNodeCapabilities("node.example", "with-baseline");
+      // The capabilities code reads the NODE's ~/.config/opencode/opencode.json
+      // over SSH (issue #51 review). Drive the fake ssh output per case instead
+      // of the manager host's HOME, and assert what the manager derives.
+      setConfig(JSON.stringify(mergeDenyBaseline({ provider: { p: { models: { m: {} } } } })));
+      const capsWith = await detectNodeCapabilities("node.example", "with-baseline", "svcuser");
       expect(capsWith.error).toBeUndefined();
       expect(capsWith.models).toEqual(["m"]);
       expect(capsWith.denyBaseline).toBe(true);
 
       // Case 2: config WITHOUT the baseline.
-      const noBaselineDir = join(base, "no-baseline");
-      mkdirSync(join(noBaselineDir, ".config", "opencode"), { recursive: true });
-      writeFileSync(
-        join(noBaselineDir, ".config", "opencode", "opencode.json"),
-        JSON.stringify({ provider: { p: { models: { m: {} } } }, permission: { edit: "ask" } }),
-        "utf8",
-      );
-      process.env.HOME = noBaselineDir;
-      const capsWithout = await detectNodeCapabilities("node.example", "no-baseline");
+      setConfig(JSON.stringify({ provider: { p: { models: { m: {} } } }, permission: { edit: "ask" } }));
+      const capsWithout = await detectNodeCapabilities("node.example", "no-baseline", "svcuser");
       expect(capsWithout.models).toEqual(["m"]);
       expect(capsWithout.denyBaseline).toBe(false);
 
       // Case 3: unparseable config.
-      const badDir = join(base, "bad");
-      mkdirSync(join(badDir, ".config", "opencode"), { recursive: true });
-      writeFileSync(join(badDir, ".config", "opencode", "opencode.json"), "{not json", "utf8");
-      process.env.HOME = badDir;
-      const capsBad = await detectNodeCapabilities("node.example", "bad");
+      setConfig("{not json");
+      const capsBad = await detectNodeCapabilities("node.example", "bad", "svcuser");
       expect(capsBad.denyBaseline).toBe(false);
 
-      // Case 4: absent config entirely.
-      const missingDir = join(base, "missing");
-      mkdirSync(missingDir, { recursive: true });
-      process.env.HOME = missingDir;
-      const capsMissing = await detectNodeCapabilities("node.example", "missing");
+      // Case 4: absent config entirely (remote read fails).
+      setConfig(null);
+      const capsMissing = await detectNodeCapabilities("node.example", "missing", "svcuser");
       expect(capsMissing.models).toBeUndefined();
       expect(capsMissing.denyBaseline).toBe(false);
-
-      process.env.HOME = realHome;
     } finally {
       restore();
     }

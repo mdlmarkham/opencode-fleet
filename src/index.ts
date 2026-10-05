@@ -409,7 +409,9 @@ export default definePluginEntry({
           const skipped: string[] = [];
           for (const node of targets) {
             const host = node.remoteIp ?? node.displayName ?? node.nodeId;
-            const caps = await detectNodeCapabilities(host, node.displayName ?? node.nodeId);
+            const svc = (node as { member?: { serviceUser?: string; user?: string } }).member?.serviceUser
+              ?? (node as { member?: { user?: string } }).member?.user;
+            const caps = await detectNodeCapabilities(host, node.displayName ?? node.nodeId, svc);
             const check = satisfiesConstraints(caps, p.requires);
             if (check.ok) filtered.push(node);
             else skipped.push(`${node.displayName ?? node.nodeId} (${check.reason})`);
@@ -493,7 +495,7 @@ export default definePluginEntry({
         // REFUSED (never appended unparseable), a node without the deny
         // baseline proceeds with a warning. Default behavior (autoApprove not
         // set) never enters this branch — byte-identical dispatch.
-        const autoApproveNodes = new Map<string, { nodeName: string; host: string; probe: { version?: string; helpText?: string } }>();
+        const autoApproveNodes = new Map<string, { nodeName: string; host: string; serviceUser?: string; probe: { version?: string; helpText?: string } }>();
         const autoApproveWarnings: Record<string, string[]> = {};
         if (p.autoApprove === true) {
           const autoUtil = await import("node:util");
@@ -511,16 +513,19 @@ export default definePluginEntry({
           for (const node of targets) {
             const nodeName = node.displayName ?? node.nodeId;
             const host = node.remoteIp ?? nodeName;
+            const svcForNode = (node as { member?: { serviceUser?: string; user?: string } }).member?.serviceUser
+              ?? (node as { member?: { user?: string } }).member?.user;
             if ((node as { invocableCommands?: string[] }).invocableCommands?.includes("opencode.run")) {
               const helpText = await autoProbeSsh(host, "opencode run --help 2>/dev/null || true");
               const version = await autoProbeSsh(host, "opencode --version 2>/dev/null || true");
-              autoApproveNodes.set(nodeName, { nodeName, host, probe: { version, helpText } });
+              autoApproveNodes.set(nodeName, { nodeName, host, serviceUser: svcForNode, probe: { version, helpText } });
             } else {
               const { detectNodeCapabilities } = await import("./capabilities.js");
-              const caps = await detectNodeCapabilities(host, nodeName);
+              const caps = await detectNodeCapabilities(host, nodeName, svcForNode);
               autoApproveNodes.set(nodeName, {
                 nodeName,
                 host,
+                serviceUser: svcForNode,
                 probe: { version: caps.opencode && caps.opencode !== "none" ? caps.opencode : "" },
               });
             }
@@ -617,7 +622,7 @@ export default definePluginEntry({
             const { autoApproveGate } = await import("./deny-baseline.js");
             const { detectNodeCapabilities } = await import("./capabilities.js");
             const capsForBaseline = entry
-              ? await detectNodeCapabilities(entry.host, nodeName).catch(() => null)
+              ? await detectNodeCapabilities(entry.host, nodeName, entry.serviceUser).catch(() => null)
               : null;
             const gate = autoApproveGate({
               autoApprove: true,
@@ -2592,7 +2597,9 @@ export default definePluginEntry({
         const results: Record<string, unknown> = {};
         for (const node of targets) {
           const host = node.remoteIp ?? node.displayName ?? node.nodeId;
-          results[node.displayName ?? node.nodeId] = await detectNodeCapabilities(host, node.displayName ?? node.nodeId);
+          const svc = (node as { member?: { serviceUser?: string; user?: string } }).member?.serviceUser
+            ?? (node as { member?: { user?: string } }).member?.user;
+          results[node.displayName ?? node.nodeId] = await detectNodeCapabilities(host, node.displayName ?? node.nodeId, svc);
         }
         return jsonResult(results);
       },

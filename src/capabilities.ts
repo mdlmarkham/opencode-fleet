@@ -8,10 +8,8 @@
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { readFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import { SSH_ARGS, sshPrefix } from "./ssh.js";
+import { shq } from "./shell.js";
 
 const execFileP = promisify(execFile);
 
@@ -64,7 +62,7 @@ export interface CapabilityConstraint {
 /**
  * Detect capabilities on a node via SSH (manager has SSH access).
  */
-export async function detectNodeCapabilities(nodeHost: string, nodeName: string): Promise<NodeCapabilities> {
+export async function detectNodeCapabilities(nodeHost: string, nodeName: string, serviceUser?: string): Promise<NodeCapabilities> {
   const caps: NodeCapabilities = { node: nodeName };
   try {
     const cmd = [
@@ -138,12 +136,36 @@ export async function detectNodeCapabilities(nodeHost: string, nodeName: string)
     }
 
     // Read the node's OpenCode model catalog, and report whether the deny
-    // baseline is present (issue #51 slice 2). Same file, one read: a missing
-    // or unparseable config leaves models unset and denyBaseline false.
+    // baseline is present (issue #51 slice 2). The config lives on the NODE,
+    // not on the gateway: read it over SSH as the service user (issue #51
+    // review). Reading `homedir()` here reports the MANAGER's config for every
+    // node — false assurance that silences the autoApprove safety warning.
     const { baselinePresent } = await import("./deny-baseline.js");
-    try {
-      const raw = await readFile(join(homedir(), ".config", "opencode", "opencode.json"), "utf8");
-      const cfg = JSON.parse(raw) as { provider?: Record<string, { models?: Record<string, unknown> }> };
+    const readNodeConfig = async (): Promise<unknown | undefined> => {
+      const script = 'cat "$HOME/.config/opencode/opencode.json" 2>/dev/null';
+      const user = serviceUser;
+      const cmd = user
+        ? `sudo -n -u ${shq(user)} -H bash -c ${shq(script)}`
+        : `bash -c ${shq(script)}`;
+      try {
+        const { stdout } = await execFileP(
+          "ssh",
+          [...sshPrefix(nodeHost, SSH_ARGS), cmd],
+          { timeout: 30_000 },
+        );
+        const text = stdout.trim();
+        if (!text) return undefined;
+        return JSON.parse(text) as unknown;
+      } catch {
+        // Remote read failed, node has no config, or it is unparseable — treat
+        // as "no baseline" rather than falling back to the manager's config.
+        return undefined;
+      }
+    };
+    const cfg = (await readNodeConfig()) as
+      | { provider?: Record<string, { models?: Record<string, unknown> }> }
+      | undefined;
+    if (cfg) {
       const models: string[] = [];
       for (const p of Object.values(cfg.provider ?? {})) {
         for (const modelId of Object.keys(p.models ?? {})) {
@@ -152,8 +174,8 @@ export async function detectNodeCapabilities(nodeHost: string, nodeName: string)
       }
       caps.models = models;
       caps.denyBaseline = baselinePresent(cfg);
-    } catch {
-      // No config — models unknown; no deny baseline either.
+    } else {
+      // No reachable/parseable node config — models unknown; no deny baseline.
       caps.denyBaseline = false;
     }
 
