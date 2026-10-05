@@ -105,7 +105,7 @@ export default definePluginEntry({
         type: "string",
         enum: ["none", "clone"],
         default: "none",
-        description: "Default per-run isolation for fleet_dispatch (issue #41). `clone` gives every run its own git clone on branch fleet/<runId> (own .git, hooks disabled), so concurrent runs cannot clobber each other. Needs a protocol-4 node (an older node is refused, never silently run un-isolated).",
+        description: "Default per-run isolation for fleet_dispatch (issue #41). `clone` gives every run its own git clone on branch fleet/<runId> (own .git, hooks disabled), so concurrent runs cannot clobber each other. Needs a protocol-4 node (an older node is refused, never silently run un-isolated). Node support for a level is probed (issue #105) — a node without git cloning cannot honour `clone`.",
       },
       capacity: {
         type: "object",
@@ -316,7 +316,7 @@ export default definePluginEntry({
           maxDurationMs: { type: "number", description: "Kill the run if total runtime exceeds this, ms (stuck-loop guard). Default 600000." },
           async: { type: "boolean", description: "Run detached: returns a run handle immediately (runId + pid); the worker survives relay timeouts and its completion is recorded. Poll with fleet_watch or fleet_run_status. Default true." },
           env: { type: "object", additionalProperties: { type: "string" }, description: "Environment variables for the worker process (per-dispatch environment). Names that execute code or redirect configuration (PATH, HOME, BASH_ENV, NODE_OPTIONS, LD_*, GIT_SSH*, OPENCODE_CONFIG*, ...) are REFUSED: the dispatch fails and names them. Operators can narrow this further (config env.allowOnly / env.extraDeny)." },
-          isolation: { type: "string", enum: ["none", "clone"], description: "Per-run isolation (issue #41). `clone`: the node makes a private git clone of `cwd` (committed state only) at <parent>/.fleet-runs/<runId>/repo on branch fleet/<runId>, runs the worker there, and returns runCwd and branch; pass runCwd to fleet_sync. Detached runs only. A node that predates isolation is refused rather than run in the shared checkout. Default from config `isolation`, else none." },
+          isolation: { type: "string", enum: ["none", "clone"], description: "Per-run isolation (issue #41). `clone`: the node makes a private git clone of `cwd` (committed state only) at <parent>/.fleet-runs/<runId>/repo on branch fleet/<runId>, runs the worker there, and returns runCwd and branch; pass runCwd to fleet_sync. Detached runs only. A node that predates isolation is refused rather than run in the shared checkout. Default from config `isolation`, else none. Issue #105: an explicitly requested level is checked against the node's probed isolation capabilities (fleet_capabilities reports isolationLevels) and REFUSED when the node cannot honour it — never downgraded." },
           expect: {
             type: "object",
             additionalProperties: false,
@@ -644,6 +644,9 @@ export default definePluginEntry({
             ?? (node as { member?: { user?: string } }).member?.user;
           const loginUser = (node as { member?: { user?: string } }).member?.user;
           const sshHost = loginUser ? `${loginUser}@${nodeKey}` : nodeKey;
+          // Issue #105: the same host string the ssh cwd probe uses — the
+          // isolation-capability probe targets the node through one path.
+          const entryHostForCaps = (node as { remoteIp?: string }).remoteIp ?? sshHost;
           let exampleRoot: string | undefined;
           try { exampleRoot = resolveFleetRoot(cfg, [svcUser]); } catch { /* a bad fleetRoot is reported by provisioning */ }
           if (looksWorkerInaccessible(p.cwd, svcUser)) {
@@ -666,6 +669,27 @@ export default definePluginEntry({
           if (isolationMode === "clone" && (transport !== "http" || p.async === false)) {
             results[nodeKey] = { ok: false, error: "isolation \"clone\" needs a detached run (transport http, async not false): the clone is made by the node when the run starts" };
             continue;
+          }
+          // Issue #105 capability probe: an EXPLICIT isolation level must be one
+          // the node can honour. Refuse before ledger/launch — hard, never a
+          // silent downgrade. Absent `isolation` (a config default or none)
+          // keeps today's behavior untouched.
+          if (p.isolation !== undefined && p.isolation !== "none") {
+            const { probeIsolationLevels } = await import("./capabilities.js");
+            const isolationCaps = await probeIsolationLevels(entryHostForCaps, svcUser);
+            if (!isolationCaps.levels.includes(p.isolation)) {
+              const have = isolationCaps.levels.length ? isolationCaps.levels.join(", ") : "none";
+              const why = isolationCaps.error
+                ? ` (capability probe failed: ${isolationCaps.error})`
+                : ` (gitClone=${isolationCaps.gitClone}, bwrap=${isolationCaps.bwrap})`;
+              results[nodeKey] = {
+                ok: false,
+                error:
+                  `refusing to dispatch: node ${nodeName} does not support isolation \"${p.isolation}\"${why}; ` +
+                  `supported levels: ${have}. No run was launched — pick a supported level, extend the node's capabilities, or omit isolation.`,
+              };
+              continue;
+            }
           }
           if (routed.harness !== "pi" && (p.piTools !== undefined || p.piOffline !== undefined || p.piJson !== undefined)) {
             results[nodeKey] = { ok: false, error: "piTools/piOffline/piJson apply to harness=pi only; refusing so the restriction is not silently ignored" };
@@ -2572,7 +2596,7 @@ export default definePluginEntry({
       name: "fleet_capabilities",
       label: "Fleet Capabilities",
       description:
-        "Detect and report each fleet node's capabilities (CPU, RAM, disk, GPU, installed tools, available models, and whether the issue-#51 deny-rule baseline is installed in the node's opencode config, as denyBaseline). Use this to route work to nodes that can handle it, especially when nodes have diverging capabilities.",
+        "Detect and report each fleet node's capabilities (CPU, RAM, disk, GPU, installed tools, available models, and whether the issue-#51 deny-rule baseline is installed in the node's opencode config, as denyBaseline). Issue #105 also reports per-node isolation capabilities: gitClone (a working git), bwrap (bubblewrap present AND usable — a broken install counts as absent), and isolationLevels (e.g. ['clone','bwrap']) — fleet_dispatch refuses an isolation level the node does not list. Use this to route work to nodes that can handle it, especially when nodes have diverging capabilities.",
       parameters: {
         type: "object",
         additionalProperties: false,

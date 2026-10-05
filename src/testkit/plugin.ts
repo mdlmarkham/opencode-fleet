@@ -145,6 +145,38 @@ export function fakeSsh(output: string): () => void {
 }
 
 /**
+ * A stand-in `ssh` emitting genuinely MULTI-LINE stdout (issue #105).Unlike
+ * fakeSsh, whose single `printf '%s\n'` escapes embedded newlines into ONE
+ * literal line, this prints each element of `lines` as its own line — which
+ * the per-line KEY=value capability parser needs — and echoes the remote
+ * command first (real ssh semantics). `failOn` models one remote command
+ * failing (non-zero exit, no output) while other calls to the same node
+ * succeed. Returns a restore function.
+ */
+export function fakeSshMultiline(lines: string[], opts: { exitCode?: number; failOn?: string } = {}): () => void {
+  const dir = mkdtempSync(join(tmpdir(), "fleet-fakesshml-"));
+  mkdirSync(dir, { recursive: true });
+  const failCase = opts.failOn
+    ? `case "$*" in *${JSON.stringify(opts.failOn).slice(1, -1)}*) exit ${opts.exitCode ?? 9} ;; esac\n`
+    : "";
+  const body = [
+    "#!/bin/sh",
+    failCase,
+    'printf \'%s\\n\' "$1" 2>/dev/null || true', // remote command echo
+    ...lines.map((l) => `printf '%s\\n' ${JSON.stringify(l)}`),
+    `exit ${opts.exitCode ?? 0}`,
+  ].join("\n");
+  writeFileSync(join(dir, "ssh"), body + "\n", { mode: 0o755 });
+  writeFileSync(join(dir, "scp"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  const prev = process.env.PATH;
+  process.env.PATH = `${dir}:${prev}`;
+  return () => {
+    process.env.PATH = prev;
+    rmSync(dir, { recursive: true, force: true });
+  };
+}
+
+/**
  * Like `fakeSsh`, but the stand-in `ssh` prints the contents of the file named
  * by the `FAKE_SSH_REPLY_FILE` env var when the joined remote command mentions
  * `opencode.json`, and prints `FAKE_SSH_FACTS` otherwise (or exits non-zero when
