@@ -2211,11 +2211,14 @@ export default definePluginEntry({
         if (!gate.allow) return jsonResult({ ok: false, error: gate.reason, verified: gate.verified, ...(gate.runId ? { runId: gate.runId } : {}) });
         // Issue #178: the review gate. A PASS recorded for exactly this head, or no publish.
         let reviewNote: Record<string, unknown> = {};
+        let expectedHead: { expectedHead: string } | undefined;
         if (cfg.sync?.requireReview === true) {
           const { loadReviews, reviewGate } = await import("./review.js");
           const rg = reviewGate(await loadReviews(api.rootDir ?? process.cwd()), p.head ?? "");
           if (!rg.allow) return jsonResult({ ok: false, error: `sync.requireReview is set: ${rg.reason}`, review: rg.status, ...(p.head === undefined ? { hint: "pass `head` (the full sha being published)" } : {}) });
           reviewNote = { review: "PASS", reviewId: rg.record?.id };
+          // The PASS is for this exact sha: syncFromNode refuses a bundle whose tip is anything else.
+          expectedHead = { expectedHead: p.head!.toLowerCase() };
         }
         const gateNote = gate.reason ? { verifiedNote: gate.reason, verified: gate.verified } : { verified: gate.verified };
 
@@ -2263,12 +2266,12 @@ export default definePluginEntry({
             // feature-branch worker publishes its own commits instead of the base.
             workerBranch: typeof bundlePl.branch === "string" ? bundlePl.branch : undefined,
             destBranch: p.branch,
-          }, undefined, cfg.sync);
+          }, undefined, cfg.sync, expectedHead);
           return jsonResult({ ...r, ...gateNote, ...reviewNote, viaChannel: true });
         }
 
         const { syncFromNode } = await import("./provision.js");
-        const r = await syncFromNode(host, p.cwd, p.repo, p.branch ?? "main", undefined, p.branch, cfg.sync);
+        const r = await syncFromNode(host, p.cwd, p.repo, p.branch ?? "main", undefined, p.branch, cfg.sync, expectedHead);
         return jsonResult({ ...r, ...gateNote, ...reviewNote });
       },
     });
