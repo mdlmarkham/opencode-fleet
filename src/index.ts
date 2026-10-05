@@ -11,7 +11,7 @@ import {
   type AckRecoveryOutcome,
 } from "./recovery.js";
 import { SSH_ARGS, setSshOptions, sshPrefix } from "./ssh.js";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { quoteUntrusted, sanitizeQuestion } from "./untrusted.js";
 import { checkSetup, partitionEnv } from "./policy.js";
 import { handleOpencodeRun, type FleetOpenCodeTask } from "./node/handler.js";
@@ -63,7 +63,7 @@ interface FleetConfig {
   /** S1 decision layer (issue #79): backend, mode (default shadow), thresholds, egress opt-in. Validated by parseS1Config. */
   s1?: unknown;
   /** fleet_sync publish policy (issue #33). */
-  sync?: { protectedBranches?: string[]; allowDirectPush?: string[]; allowSensitivePaths?: boolean; sensitivePaths?: string[]; requireVerified?: boolean; blockOnScopeViolation?: boolean };
+  sync?: { protectedBranches?: string[]; allowDirectPush?: string[]; allowSensitivePaths?: boolean; sensitivePaths?: string[]; requireVerified?: boolean; blockOnScopeViolation?: boolean; requireReview?: boolean };
   /** Dispatch env refinements: allowOnly makes injection allowlist-only; extraDeny adds refused names. */
   env?: { allowOnly?: string[]; extraDeny?: string[] };
   /** SSH client policy for manager-to-node commands. */
@@ -178,6 +178,7 @@ export default definePluginEntry({
           protectedBranches: { type: "array", items: { type: "string" }, default: ["main", "master"] },
           allowDirectPush: { type: "array", items: { type: "string" }, default: [] },
           blockOnScopeViolation: { type: "boolean", default: false, description: "Refuse fleet_sync for a run that changed files outside its declared spec.scope, or whose scope was never checked (issue #104). Override per call with allowScopeViolations." },
+          requireReview: { type: "boolean", default: false, description: "Refuse fleet_sync unless a fleet_review PASS is recorded for the exact head sha passed as `head` (issue #178). A PASS for an older sha does not count." },
           requireVerified: { type: "boolean", default: false, description: "Refuse fleet_sync for work with no verification result (a run that did not use expect/spec.verify). A run whose gate FAILED is always refused unless allowUnverified is passed." },
           allowSensitivePaths: { type: "boolean", default: false, description: "Allow worker changes to CI/CODEOWNERS paths." },
           sensitivePaths: { type: "array", items: { type: "string" }, default: [], description: "Extra path globs treated as sensitive (e.g. ci/**), added to the built-in list." },
@@ -1285,6 +1286,44 @@ export default definePluginEntry({
     });
 
     api.registerTool({
+      name: "fleet_review",
+      label: "Fleet Review",
+      description:
+        "Review gate (issue #177). action=record stores a structured review verdict bound to one head sha; PASS needs executed-command evidence. action=check says whether a head has a PASS (what sync.requireReview enforces). Does not spawn the reviewer.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          action: { type: "string", enum: ["record", "check"] },
+          headSha: { type: "string", description: "Full 40-hex commit sha reviewed (record) or about to be merged (check)." },
+          verdict: { type: "string", enum: ["PASS", "FAIL", "BLOCKED"], description: "BLOCKED = the reviewer could not run its tools. Never record PASS for that." },
+          reviewer: { type: "string", description: "Who ran the review." },
+          author: { type: "string", description: "Who wrote the change; must differ from reviewer." },
+          pr: { type: "integer" },
+          evidence: { type: "object", properties: { commands: { type: "array", items: { type: "object", properties: { command: { type: "string" }, exitCode: { type: "integer" }, outputTail: { type: "string" } }, required: ["command", "exitCode"] } } } },
+          findings: { type: "array", items: { type: "object", properties: { severity: { type: "string", enum: ["blocking", "major", "minor", "nit"] }, summary: { type: "string" }, file: { type: "string" } }, required: ["severity", "summary"] } },
+          contractChange: { type: "boolean" },
+          note: { type: "string" },
+        },
+        required: ["action", "headSha"],
+      },
+      execute: async (_toolCallId, params) => {
+        const p = params as Record<string, unknown>;
+        const rootDir = api.rootDir ?? process.cwd();
+        const { validateReview, appendReview, loadReviews, reviewGate } = await import("./review.js");
+        if (p.action === "check") {
+          const g = reviewGate(await loadReviews(rootDir), String(p.headSha ?? ""), typeof p.pr === "number" ? p.pr : undefined);
+          return jsonResult({ ok: true, allow: g.allow, status: g.status, ...(g.reason ? { reason: g.reason } : {}), ...(g.record ? { reviewId: g.record.id, reviewedAt: g.record.recordedAt } : {}) });
+        }
+        if (p.action !== "record") return jsonResult({ ok: false, error: "action must be record or check" });
+        const v = validateReview(p, new Date(), `rv-${randomUUID().slice(0, 8)}`);
+        if (!v.ok) return jsonResult({ ok: false, error: v.error });
+        await appendReview(rootDir, v.record);
+        return jsonResult({ ok: true, reviewId: v.record.id, verdict: v.record.verdict, headSha: v.record.headSha });
+      },
+    });
+
+    api.registerTool({
       name: "fleet_run_report",
       label: "Fleet Run Report",
       description:
@@ -1329,22 +1368,7 @@ export default definePluginEntry({
       },
     });
 
-    api.registerTool({
-      name: "fleet_run_status",
-      label: "Fleet Run Status",
-      description:
-        "Poll a detached fleet run: liveness, state (running/finished/aborted), exit code, and final output when complete. Reconciles the run ledger on terminal state. Use with the runId returned by an async fleet_dispatch; also detects the issue-#6 inconsistent state (ledger says running, no live process, no completion record).",
-      parameters: {
-        type: "object",
-        additionalProperties: false,
-        properties: {
-          node: { type: "string", description: "Node display name or id." },
-          runId: { type: "string", description: "The fleet run id from the async dispatch result." },
-          includeOutput: { type: "boolean", description: "Include the worker's final output when the run is finished (default true)." },
-        },
-        required: ["node", "runId"],
-      },
-      execute: async (toolCallId, params, signal) => {
+    const runStatusExecute = async (toolCallId: string, params: unknown, signal?: AbortSignal) => {
         const p = params as { node: string; runId: string; includeOutput?: boolean };
         const list = await api.runtime.nodes.list();
         const node = (list.nodes ?? []).find((n) => n.displayName === p.node || n.nodeId === p.node);
@@ -1468,6 +1492,104 @@ export default definePluginEntry({
               }
             : {}),
           output,
+        });
+      };
+
+    api.registerTool({
+      name: "fleet_run_status",
+      label: "Fleet Run Status",
+      description:
+        "Poll a detached fleet run: liveness, state (running/finished/aborted), exit code, and final output when complete. Reconciles the run ledger on terminal state. Use with the runId returned by an async fleet_dispatch; also detects the issue-#6 inconsistent state (ledger says running, no live process, no completion record).",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          node: { type: "string", description: "Node display name or id." },
+          runId: { type: "string", description: "The fleet run id from the async dispatch result." },
+          includeOutput: { type: "boolean", description: "Include the worker's final output when the run is finished (default true)." },
+        },
+        required: ["node", "runId"],
+      },
+      execute: runStatusExecute,
+    });
+
+    api.registerTool({
+      name: "fleet_await",
+      label: "Fleet Await",
+      description:
+        "Wait for a set of detached runs in ONE call instead of polling fleet_run_status. Polls inside the plugin with backoff, reconciles the ledger as each run finishes, and returns when all are terminal or timeoutMs passes (default 120s, max 600s). On timeout it returns the finished runs plus `pending`: call again, do not loop on fleet_run_status.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          runIds: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 25, description: "Run ids from async dispatches (max 25)." },
+          node: { type: "string", description: "Node for every run id. Omit to use each run's node from the ledger." },
+          timeoutMs: { type: "number", description: "Max wait, ms (default 120000, max 600000)." },
+          pollMs: { type: "number", description: "Initial poll interval, ms (default 2000, grows to 15000)." },
+        },
+        required: ["runIds"],
+      },
+      execute: async (_toolCallId, params, signal, onUpdate) => {
+        const p = params as { runIds?: unknown; node?: string; timeoutMs?: number; pollMs?: number };
+        const { awaitRuns, MAX_AWAIT_RUNS } = await import("./await.js");
+        const ids = Array.isArray(p.runIds) ? p.runIds.filter((x): x is string => typeof x === "string" && x !== "") : [];
+        if (ids.length === 0) return jsonResult({ ok: false, error: "runIds must be a non-empty array of run ids" });
+        const unique = [...new Set(ids)];
+        if (unique.length > MAX_AWAIT_RUNS) return jsonResult({ ok: false, error: `at most ${MAX_AWAIT_RUNS} runs per call; got ${unique.length}` });
+        const { loadLedger } = await import("./ledger.js");
+        const ledger = await loadLedger(api.rootDir ?? process.cwd());
+        const runs: Array<{ runId: string; node: string }> = [];
+        const unknown: Array<{ runId: string; error: string }> = [];
+        for (const runId of unique) {
+          const node = p.node ?? ledger.find((r) => r.runId === runId)?.node;
+          if (!node) unknown.push({ runId, error: "unknown run id: not in the ledger and no node given" });
+          else runs.push({ runId, node });
+        }
+        const decodeStatus = (res: unknown): Record<string, unknown> => {
+          const r = res as { details?: unknown; content?: Array<{ text?: string }> };
+          if (r?.details && typeof r.details === "object") return r.details as Record<string, unknown>;
+          const text = r?.content?.[0]?.text;
+          if (typeof text === "string") {
+            try { return JSON.parse(text) as Record<string, unknown>; } catch { throw new Error(text.slice(0, 200)); }
+          }
+          throw new Error("unreadable status");
+        };
+        const r = await awaitRuns(runs, { timeoutMs: p.timeoutMs, pollMs: p.pollMs }, {
+          signal,
+          poll: async (run) => decodeStatus(await runStatusExecute("await", { node: run.node, runId: run.runId, includeOutput: false }, signal)),
+          onSettled: (o, remaining) => {
+            onUpdate?.({
+              content: [{ type: "text", text: `run ${o.runId} ${String(o.snapshot?.state ?? o.snapshot?.status ?? o.error ?? "settled")}; ${remaining} still running` }],
+              details: { progress: "run-settled" },
+              progress: { text: `${o.runId} done, ${remaining} pending`, visibility: "channel", privacy: "public" },
+            });
+          },
+        });
+        const results: Record<string, unknown> = {};
+        for (const u of unknown) results[u.runId] = { terminal: true, error: u.error };
+        for (const o of r.outcomes) {
+          const s = o.snapshot ?? {};
+          results[o.runId] = {
+            node: o.node,
+            terminal: o.terminal,
+            ...(o.error ? { error: o.error } : {}),
+            state: s.state ?? s.status ?? (o.terminal ? "unknown" : "running"),
+            ...(typeof s.exitCode === "number" ? { exitCode: s.exitCode } : {}),
+            verified: typeof s.verified === "boolean" ? s.verified : null,
+            ...(s.scopeViolations !== undefined ? { scopeViolations: s.scopeViolations } : {}),
+            ...(typeof s.note === "string" ? { note: s.note } : {}),
+          };
+        }
+        const pending = r.outcomes.filter((o) => !o.terminal).map((o) => o.runId);
+        return jsonResult({
+          ok: true,
+          allTerminal: r.allTerminal,
+          timedOut: r.timedOut,
+          ...(r.aborted ? { aborted: true } : {}),
+          waitedMs: r.waitedMs,
+          runs: results,
+          pending,
+          ...(pending.length ? { hint: "Still running: call fleet_await again with the pending run ids. Do not loop on fleet_run_status." } : {}),
         });
       },
     });
@@ -2062,13 +2184,14 @@ export default definePluginEntry({
           cwd: { type: "string", description: "Working directory on the node." },
           repo: { type: "string", description: "Git URL the manager can access." },
           allowScopeViolations: { type: "boolean", description: "Publish even though the run changed files outside its declared scope (or its scope was never checked) and sync.blockOnScopeViolation is set. Does not bypass a failed verification gate. Off by default." },
+          head: { type: "string", description: "Full 40-hex sha of the commit being published. Required when sync.requireReview is set: a fleet_review PASS must exist for exactly this sha." },
           allowUnverified: { type: "boolean", description: "Publish even though the latest fleet run on this node and checkout FAILED its verification gate (or, with sync.requireVerified, has none). Off by default." },
           branch: { type: "string", description: "Clone BASE branch: a branch that already EXISTS on origin, checked out so the worker's changes can be applied on top of it (default main). NOT the destination — the destination is resolved from the worker's own branch (or from a pinned destination set internally); a protected destination is redirected to `fleet/<name>` and reported as `redirectedFrom`." },
         },
         required: ["node", "cwd", "repo"],
       },
       execute: async (toolCallId, params, signal) => {
-        const p = params as { node: string; cwd: string; repo: string; branch?: string; allowUnverified?: boolean; allowScopeViolations?: boolean };
+        const p = params as { node: string; cwd: string; repo: string; branch?: string; head?: string; allowUnverified?: boolean; allowScopeViolations?: boolean };
         const list = await api.runtime.nodes.list();
         const nodes = list.nodes ?? [];
         const node = nodes.find((n) => n.displayName === p.node || n.nodeId === p.node);
@@ -2085,6 +2208,14 @@ export default definePluginEntry({
           { allowUnverified: p.allowUnverified === true, requireVerified: cfg.sync?.requireVerified === true, blockOnScopeViolation: cfg.sync?.blockOnScopeViolation === true, allowScopeViolations: p.allowScopeViolations === true },
         );
         if (!gate.allow) return jsonResult({ ok: false, error: gate.reason, verified: gate.verified, ...(gate.runId ? { runId: gate.runId } : {}) });
+        // Issue #178: the review gate. A PASS recorded for exactly this head, or no publish.
+        let reviewNote: Record<string, unknown> = {};
+        if (cfg.sync?.requireReview === true) {
+          const { loadReviews, reviewGate } = await import("./review.js");
+          const rg = reviewGate(await loadReviews(api.rootDir ?? process.cwd()), p.head ?? "");
+          if (!rg.allow) return jsonResult({ ok: false, error: `sync.requireReview is set: ${rg.reason}`, review: rg.status, ...(p.head === undefined ? { hint: "pass `head` (the full sha being published)" } : {}) });
+          reviewNote = { review: "PASS", reviewId: rg.record?.id };
+        }
         const gateNote = gate.reason ? { verifiedNote: gate.reason, verified: gate.verified } : { verified: gate.verified };
 
         // SSH-free node: bundle on the worker via the node channel, pull the
@@ -2132,12 +2263,12 @@ export default definePluginEntry({
             workerBranch: typeof bundlePl.branch === "string" ? bundlePl.branch : undefined,
             destBranch: p.branch,
           }, undefined, cfg.sync);
-          return jsonResult({ ...r, ...gateNote, viaChannel: true });
+          return jsonResult({ ...r, ...gateNote, ...reviewNote, viaChannel: true });
         }
 
         const { syncFromNode } = await import("./provision.js");
         const r = await syncFromNode(host, p.cwd, p.repo, p.branch ?? "main", undefined, p.branch, cfg.sync);
-        return jsonResult({ ...r, ...gateNote });
+        return jsonResult({ ...r, ...gateNote, ...reviewNote });
       },
     });
 
