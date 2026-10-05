@@ -36,9 +36,10 @@ const iterateSrc = indexSrc.slice(
   indexSrc.indexOf("name: \"fleet_iterate\""),
   indexSrc.indexOf("name: \"fleet_watch\""),
 );
-// The fleet_run_status tool block (final result object).
+// The fleet_run_status implementation (final result object). Issue #180 hoisted it into
+// `runStatusExecute` so fleet_await can share it; the pin follows the function.
 const runStatusSrc = indexSrc.slice(
-  indexSrc.indexOf("name: \"fleet_run_status\""),
+  indexSrc.indexOf("const runStatusExecute"),
   indexSrc.indexOf("name: \"fleet_answer\""),
 );
 

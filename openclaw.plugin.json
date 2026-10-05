@@ -325,6 +325,7 @@
       "fleet_run_report",
       "fleet_capacity",
       "fleet_review",
+      "fleet_await",
       "fleet_design_check",
       "fleet_project_show",
       "fleet_board"
