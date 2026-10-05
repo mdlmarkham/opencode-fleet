@@ -72,7 +72,7 @@ interface FleetConfig {
   /** S1 decision layer (issue #79): backend, mode (default shadow), thresholds, egress opt-in. Validated by parseS1Config. */
   s1?: unknown;
   /** fleet_sync publish policy (issue #33). */
-  sync?: { protectedBranches?: string[]; allowDirectPush?: string[]; allowSensitivePaths?: boolean; sensitivePaths?: string[]; requireVerified?: boolean; blockOnScopeViolation?: boolean; requireReview?: boolean };
+  sync?: { protectedBranches?: string[]; allowDirectPush?: string[]; allowSensitivePaths?: boolean; sensitivePaths?: string[]; requireVerified?: boolean; blockOnScopeViolation?: boolean; requireReview?: boolean; requireReviewSource?: "spawned" };
   /** Dispatch env refinements: allowOnly makes injection allowlist-only; extraDeny adds refused names. */
   env?: { allowOnly?: string[]; extraDeny?: string[] };
   /** SSH client policy for manager-to-node commands. */
@@ -216,6 +216,7 @@ export default definePluginEntry({
           allowDirectPush: { type: "array", items: { type: "string" }, default: [] },
           blockOnScopeViolation: { type: "boolean", default: false, description: "Refuse fleet_sync for a run that changed files outside its declared spec.scope, or whose scope was never checked (issue #104). Override per call with allowScopeViolations." },
           requireReview: { type: "boolean", default: false, description: "Refuse fleet_sync unless a fleet_review PASS is recorded for the exact head sha passed as `head` (issue #178). A PASS for an older sha does not count." },
+          requireReviewSource: { type: "string", enum: ["spawned"], description: "With requireReview: only a PASS collected from an independent reviewer run (fleet_review prepare + collect) counts; a PASS the caller merely recorded does not (issue #177)." },
           requireVerified: { type: "boolean", default: false, description: "Refuse fleet_sync for work with no verification result (a run that did not use expect/spec.verify). A run whose gate FAILED is always refused unless allowUnverified is passed." },
           allowSensitivePaths: { type: "boolean", default: false, description: "Allow worker changes to CI/CODEOWNERS paths." },
           sensitivePaths: { type: "array", items: { type: "string" }, default: [], description: "Extra path globs treated as sensitive (e.g. ci/**), added to the built-in list." },
@@ -1430,8 +1431,14 @@ export default definePluginEntry({
         type: "object",
         additionalProperties: false,
         properties: {
-          action: { type: "string", enum: ["record", "check"] },
-          headSha: { type: "string", description: "Full 40-hex commit sha reviewed (record) or about to be merged (check)." },
+          action: { type: "string", enum: ["record", "check", "prepare", "collect"], description: "prepare: mint the reviewer task for a head (you then run it with fleet_dispatch on a checkout at that sha). collect: read the finished reviewer run, verify it, and record a `spawned` verdict." },
+          headSha: { type: "string", description: "Full 40-hex commit sha reviewed (record, prepare) or about to be merged (check). Not needed for collect." },
+          runId: { type: "string", description: "collect: the reviewer run (its prompt carries the REVIEW-TOKEN from prepare)." },
+          node: { type: "string", description: "collect: the node the reviewer run ran on." },
+          base: { type: "string", description: "prepare: git ref to diff against (e.g. origin/master)." },
+          buildCommand: { type: "string", description: "prepare: build command the reviewer should run (default npm run build)." },
+          testCommand: { type: "string", description: "prepare: test command the reviewer should run (default npm test)." },
+          requireSource: { type: "string", enum: ["spawned"], description: "check: only a PASS collected from a reviewer run counts." },
           verdict: { type: "string", enum: ["PASS", "FAIL", "BLOCKED"], description: "BLOCKED = the reviewer could not run its tools. Never record PASS for that." },
           reviewer: { type: "string", description: "Who ran the review." },
           author: { type: "string", description: "Who wrote the change; must differ from reviewer." },
@@ -1441,17 +1448,69 @@ export default definePluginEntry({
           contractChange: { type: "boolean" },
           note: { type: "string" },
         },
-        required: ["action", "headSha"],
+        required: ["action"],
       },
-      execute: async (_toolCallId, params) => {
+      execute: async (_toolCallId, params, signal) => {
         const p = params as Record<string, unknown>;
         const rootDir = api.rootDir ?? process.cwd();
         const { validateReview, appendReview, loadReviews, reviewGate } = await import("./review.js");
+        if (p.action === "prepare") {
+          const { newNonce, buildReviewerPrompt, addPending } = await import("./review-spawn.js");
+          const head = String(p.headSha ?? "").toLowerCase();
+          if (!/^[0-9a-f]{40}$/.test(head)) return jsonResult({ ok: false, error: "headSha must be the full 40-hex commit sha to review" });
+          if (p.pr !== undefined && (typeof p.pr !== "number" || !Number.isInteger(p.pr) || p.pr < 1)) return jsonResult({ ok: false, error: "pr must be a positive integer" });
+          const refOk = (v: unknown): boolean => v === undefined || (typeof v === "string" && /^[A-Za-z0-9._\/-]{1,100}$/.test(v));
+          const cmdOk = (v: unknown): boolean => v === undefined || (typeof v === "string" && /^[A-Za-z0-9 ._\/:=@+-]{1,200}$/.test(v));
+          if (!refOk(p.base)) return jsonResult({ ok: false, error: "base must be a plain git ref" });
+          if (!cmdOk(p.buildCommand) || !cmdOk(p.testCommand)) return jsonResult({ ok: false, error: "buildCommand/testCommand must be plain commands (letters, digits, space and . _ / : = @ + -)" });
+          const nonce = newNonce();
+          const author = typeof p.author === "string" && p.author.trim() ? p.author.trim().slice(0, 100) : undefined;
+          await addPending(rootDir, nonce, { headSha: head, ...(typeof p.pr === "number" ? { pr: p.pr } : {}), ...(author ? { author } : {}), createdAt: Date.now() });
+          const prompt = buildReviewerPrompt({ headSha: head, ...(typeof p.pr === "number" ? { pr: p.pr } : {}), ...(p.base ? { base: String(p.base) } : {}), ...(p.buildCommand ? { buildCommand: String(p.buildCommand) } : {}), ...(p.testCommand ? { testCommand: String(p.testCommand) } : {}) }, nonce);
+          return jsonResult({ ok: true, nonce, prompt, next: [`provision a checkout at ${head} on a node that is NOT the author's worker (fleet_provision with commit)`, "run the prompt there with fleet_dispatch (harness of your choice), then fleet_await it", `then call fleet_review {action:"collect", node, runId}`], note: "The nonce is single-use and expires in 24 hours." });
+        }
+        if (p.action === "collect") {
+          const { peekPending, takePending, parseReviewerOutput, unexecutedClaims, headBinding } = await import("./review-spawn.js");
+          const { loadLedger } = await import("./ledger.js");
+          const entry = (await loadLedger(rootDir)).find((r) => r.runId === p.runId);
+          if (!entry) return jsonResult({ ok: false, error: "unknown runId: not in the ledger" });
+          const nonce = /REVIEW-TOKEN: (rv-[0-9a-f]{16})\b/.exec(entry.prompt ?? "")?.[1];
+          if (!nonce) return jsonResult({ ok: false, error: "that run was not started from a fleet_review prepare task (its prompt has no REVIEW-TOKEN)" });
+          const pending = await peekPending(rootDir, nonce);
+          if (!pending) return jsonResult({ ok: false, error: "the review token is unknown, already used, or expired: run prepare again" });
+          if (typeof p.node === "string" && p.node !== entry.node) return jsonResult({ ok: false, error: `the run was on ${entry.node}, not ${p.node}` });
+          const list = await api.runtime.nodes.list();
+          const node = (list.nodes ?? []).find((n) => n.displayName === entry.node || n.nodeId === entry.node);
+          if (!node) return jsonResult({ ok: false, error: `node ${entry.node} not found` });
+          const call = async (params: Record<string, unknown>) => payloadOf(await api.runtime.nodes.invoke({ nodeId: node.nodeId, command: "opencode.run", params, timeoutMs: 30_000, signal }));
+          const st = await call({ prompt: "__RUN_STATUS__", cwd: "/", transport: "http", runId: entry.runId, report: true });
+          if (!st.finishedAt) return jsonResult({ ok: false, error: "the reviewer run has not finished", status: st.alive ? "running" : "no-completion-record" });
+          const manifest = (st.manifest as { commands?: Array<{ tool?: string; input?: string }> } | undefined)?.commands ?? [];
+          const res = await call({ prompt: "__RUN_RESULT__", cwd: "/", transport: "http", runId: entry.runId });
+          const parsed = parseReviewerOutput(String(res.result ?? ""));
+          if (!parsed.ok) return jsonResult({ ok: false, error: parsed.error });
+          const report = parsed.report;
+          const claimed = (report.commands ?? []).map((c) => String(c.command ?? ""));
+          if (String(report.verdict).toUpperCase() === "PASS") {
+            const bind = headBinding(report, pending.headSha, manifest);
+            if (!bind.ok) return jsonResult({ ok: false, error: bind.error });
+            const missing = unexecutedClaims(claimed, manifest);
+            if (missing.length) return jsonResult({ ok: false, error: `the reviewer claims commands that are not in the run's executed-command manifest: ${missing.map((m) => m.slice(0, 80)).join(" | ")}` });
+          }
+          const v = validateReview(
+            { verdict: report.verdict, headSha: pending.headSha, reviewer: `worker:${entry.node}/${entry.runId}`, ...(pending.author ? { author: pending.author } : {}), ...(pending.pr ? { pr: pending.pr } : {}), evidence: { commands: report.commands ?? [] }, findings: report.findings, ...(typeof report.contractChange === "boolean" ? { contractChange: report.contractChange } : {}) },
+            new Date(), `rv-${randomUUID().slice(0, 8)}`, { source: "spawned", runId: entry.runId, node: entry.node },
+          );
+          if (!v.ok) return jsonResult({ ok: false, error: v.error });
+          if (!(await takePending(rootDir, nonce))) return jsonResult({ ok: false, error: "the review token was already used" });
+          await appendReview(rootDir, v.record);
+          return jsonResult({ ok: true, reviewId: v.record.id, verdict: v.record.verdict, headSha: v.record.headSha, source: "spawned", runId: entry.runId });
+        }
         if (p.action === "check") {
-          const g = reviewGate(await loadReviews(rootDir), String(p.headSha ?? ""), typeof p.pr === "number" ? p.pr : undefined);
+          const g = reviewGate(await loadReviews(rootDir), String(p.headSha ?? ""), typeof p.pr === "number" ? p.pr : undefined, p.requireSource === "spawned" ? { requireSource: "spawned" } : {});
           return jsonResult({ ok: true, allow: g.allow, status: g.status, ...(g.reason ? { reason: g.reason } : {}), ...(g.record ? { reviewId: g.record.id, reviewedAt: g.record.recordedAt } : {}) });
         }
-        if (p.action !== "record") return jsonResult({ ok: false, error: "action must be record or check" });
+        if (p.action !== "record") return jsonResult({ ok: false, error: "action must be record, check, prepare or collect" });
         const v = validateReview(p, new Date(), `rv-${randomUUID().slice(0, 8)}`);
         if (!v.ok) return jsonResult({ ok: false, error: v.error });
         await appendReview(rootDir, v.record);
@@ -2446,7 +2505,7 @@ export default definePluginEntry({
         let expectedHead: { expectedHead: string } | undefined;
         if (cfg.sync?.requireReview === true) {
           const { loadReviews, reviewGate } = await import("./review.js");
-          const rg = reviewGate(await loadReviews(api.rootDir ?? process.cwd()), p.head ?? "");
+          const rg = reviewGate(await loadReviews(api.rootDir ?? process.cwd()), p.head ?? "", undefined, cfg.sync?.requireReviewSource === "spawned" ? { requireSource: "spawned" } : {});
           if (!rg.allow) return jsonResult({ ok: false, error: `sync.requireReview is set: ${rg.reason}`, review: rg.status, ...(p.head === undefined ? { hint: "pass `head` (the full sha being published)" } : {}) });
           reviewNote = { review: "PASS", reviewId: rg.record?.id };
           // The PASS is for this exact sha: syncFromNode refuses a bundle whose tip is anything else.
