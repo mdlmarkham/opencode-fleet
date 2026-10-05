@@ -88,6 +88,23 @@ describe("#180: awaitRuns", () => {
     expect(maxPerNode).toBe(1);
   });
 
+  it('until:"any" returns as soon as one run is terminal and leaves the rest pending (not timed out)', async () => {
+    const c = clock();
+    const r = await awaitRuns(runs, { timeoutMs: 60_000, pollMs: 1000, until: "any" }, {
+      now: c.now, sleep: c.sleep,
+      poll: async (run) => (run.runId === "c" && c.at() >= 2000 ? { state: "finished", exitCode: 0, finishedAt: "t" } : { state: "running", alive: true }),
+    });
+    expect(r).toMatchObject({ allTerminal: false, timedOut: false, aborted: false });
+    expect(r.outcomes.filter((o) => o.terminal).map((o) => o.runId)).toEqual(["c"]);
+    expect(c.at()).toBeLessThan(10_000);
+  });
+
+  it('until:"any" with nothing finishing still times out', async () => {
+    const c = clock();
+    const r = await awaitRuns(runs, { timeoutMs: 3_000, pollMs: 1000, until: "any" }, { now: c.now, sleep: c.sleep, poll: async () => ({ state: "running", alive: true }) });
+    expect(r).toMatchObject({ allTerminal: false, timedOut: true });
+  });
+
   it("stops promptly when aborted", async () => {
     const ctl = new AbortController();
     const c = clock();
@@ -149,6 +166,15 @@ describe.skipIf(!loaded)("#180: fleet_await tool", () => {
     expect(r.runs.a.terminal).toBe(true);
     expect(r.runs.b).toMatchObject({ terminal: false, state: "running" });
     expect(r.hint).toContain("fleet_await");
+  });
+
+  it('until:"any" through the tool: one finished run returns early with the other pending', async () => {
+    p = setup(1_000_000);
+    await upsertRun(p.rootDir, entry("a"));
+    await upsertRun(p.rootDir, entry("b"));
+    const r = await p.call("fleet_await", { runIds: ["a", "b"], timeoutMs: 20_000, pollMs: 50, until: "any" });
+    expect(r).toMatchObject({ ok: true, allTerminal: false, timedOut: false, pending: ["b"] });
+    expect(r.runs.a.terminal).toBe(true);
   });
 
   it("an unknown run id settles with an error instead of hanging; bad input is refused", async () => {

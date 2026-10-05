@@ -33,7 +33,7 @@ export interface AckRecoveryOutcome {
 export const ACK_PROBE_TIMEOUT_MS = 20_000;
 
 export const ACK_CONFIRMED_NOTE =
-  "Launch ack timed out, but the run IS on the node (probe confirmed). Poll with fleet_run_status/fleet_watch; do NOT re-dispatch.";
+  "Launch ack timed out, but the run IS on the node (probe confirmed). Wait with fleet_await (not a fleet_run_status loop) or fleet_watch; do NOT re-dispatch.";
 export const ACK_ABSENT_NOTE =
   "Launch was NOT confirmed AND no run was found on the node. Safe to re-dispatch.";
 export const ACK_INCONCLUSIVE_NOTE =
