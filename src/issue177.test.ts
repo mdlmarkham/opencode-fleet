@@ -24,6 +24,17 @@ describe("#177: validateReview", () => {
     expect(validateReview({ ...base, evidence: { commands: [] } })).toMatchObject({ ok: false });
     expect(validateReview({ ...base, evidence: { commands: [{ ...ok, exitCode: 1 }] } })).toMatchObject({ ok: false });
   });
+  it("refuses a PASS whose evidence contains ANY failed command, even next to a passing one (#184)", () => {
+    const mixed = { ...base, evidence: { commands: [{ command: "scripts/verify.sh", exitCode: 1, outputTail: "FAIL" }, ok] } };
+    const r = validateReview(mixed);
+    expect(r).toMatchObject({ ok: false });
+    expect(r.ok === false && r.error).toContain("scripts/verify.sh");
+    expect(r.ok === false && r.error).toContain("exit 1");
+    // Order must not matter.
+    expect(validateReview({ ...base, evidence: { commands: [ok, { command: "npm run build", exitCode: 2, outputTail: "" }] } })).toMatchObject({ ok: false });
+    // The same evidence is fine for a FAIL, which is the honest verdict for it.
+    expect(validateReview({ ...mixed, verdict: "FAIL", findings: [{ severity: "blocking", summary: "verify fails" }] }).ok).toBe(true);
+  });
   it("refuses a PASS carrying a blocking or major finding; minor/nit is fine", () => {
     expect(validateReview({ ...base, findings: [{ severity: "major", summary: "x" }] })).toMatchObject({ ok: false });
     expect(validateReview({ ...base, findings: [{ severity: "nit", summary: "x" }] }).ok).toBe(true);
@@ -107,6 +118,14 @@ describe.skipIf(!loaded)("#177/#178: tools", () => {
     expect(await p!.call("fleet_review", { action: "record", ...base })).toMatchObject({ ok: true, verdict: "PASS" });
     expect(await p!.call("fleet_review", { action: "check", headSha: A })).toMatchObject({ allow: true, status: "PASS" });
     expect(await p!.call("fleet_review", { action: "check", headSha: B, pr: 7 })).toMatchObject({ allow: false, status: "STALE" });
+  });
+
+  it("a PASS with a failed evidence command is refused through the tool, and the head stays unreviewed (#184)", async () => {
+    load({ requireReview: true });
+    const mixed = { action: "record", ...base, evidence: { commands: [{ command: "scripts/verify.sh", exitCode: 1, outputTail: "FAIL" }, ok] } };
+    expect(await p!.call("fleet_review", mixed)).toMatchObject({ ok: false, error: expect.stringContaining("failed command") });
+    expect(await p!.call("fleet_review", { action: "check", headSha: A })).toMatchObject({ allow: false, status: "NONE" });
+    expect(await sync({ head: A })).toMatchObject({ ok: false, review: "NONE" });
   });
 
   it("sync.requireReview refuses with no head, no review, a stale head and a BLOCKED review", async () => {
