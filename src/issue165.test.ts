@@ -21,8 +21,11 @@
  *   - judgeProgress absent/false => byte-identical behaviour (decide() is
  *     never called, no fields added to the launch path).
  */
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildProgressQuestion, evaluateProgress, DEFAULT_PROGRESS_THRESHOLD } from "./progressJudge.js";
+import { loadEntry, loadPlugin, nodeReply, type FakeNode, type Loaded } from "./testkit/plugin.js";
+
+const entry = await loadEntry();
 
 // ---------------------------------------------------------------------------
 // Default arguments for evaluateProgress — every field optional except the
@@ -190,4 +193,40 @@ describe("issue #165: progress judge fail-safety", () => {
     expect(r.judgeUsed).toBe(true);
     expect(r.s1Estimates).toEqual([0.6, 0.6]);
   });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #165 review: TOOL-LEVEL wiring tests. These drive the REAL fleet_iterate
+// tool (not the pure helper), so reverting the index.ts wiring makes them FAIL.
+// A fake node returns a run result that never succeeds, forcing iterations.
+// ---------------------------------------------------------------------------
+describe.skipIf(!entry)("#165 wiring: fleet_iterate judgeProgress (tool level)", () => {
+  let p: Loaded | undefined;
+  const NODES: FakeNode[] = [{ nodeId: "n-dev2", displayName: "dev2", connected: true, invocableCommands: ["opencode.run"] } as unknown as FakeNode];
+
+  afterEach(() => { p?.dispose(); p = undefined; });
+
+  // Every iteration reports the SAME failure => string-diff would escalate; we
+  // assert judgeProgress is off by default (no S1 field anywhere in the result).
+  it("judgeProgress absent => no S1 fields in the result (byte-identical)", async () => {
+    let n = 0;
+    p = loadPlugin(entry!, { nodes: NODES, invoke: () => nodeReply({ ok: false, summary: "still failing " + (n++), error: "boom" }) });
+    const r = await p.call("fleet_iterate", { node: "dev2", cwd: "/w/p", prompt: "do it", maxIterations: 2 });
+    expect(r.s1ProgressEstimates).toBeUndefined();
+    expect(r.s1ShadowProgress).toBeUndefined();
+  }, 30_000);
+
+  it("judgeProgress on with NO expect => a judgeWarning is surfaced in the result", async () => {
+    p = loadPlugin(entry!, { nodes: NODES, config: { s1: { mode: "shadow" } }, invoke: () => nodeReply({ ok: false, summary: "failing", error: "boom" }) });
+    const r = await p.call("fleet_iterate", { node: "dev2", cwd: "/w/p", prompt: "do it", maxIterations: 2, judgeProgress: true });
+    expect(String(r.judgeWarning ?? "")).toMatch(/no .*expect/i);
+  }, 30_000);
+
+  it("invalid progressThreshold is rejected before any launch", async () => {
+    p = loadPlugin(entry!, { nodes: NODES, invoke: () => nodeReply({ ok: false, summary: "x" }) });
+    const r = await p.call("fleet_iterate", { node: "dev2", cwd: "/w/p", prompt: "do it", judgeProgress: true, progressThreshold: 2 });
+    expect(r.ok).toBe(false);
+    expect(String(r.error)).toMatch(/progressThreshold/);
+    expect(p.invokes).toEqual([]);
+  }, 30_000);
 });

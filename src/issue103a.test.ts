@@ -103,19 +103,19 @@ describe("issue #103a: every fleet_iterate return goes through withVerified", ()
 
   it("the hand-raise return keeps its withVerified wrap", () => {
     expect(iterateSrc).toMatch(
-      /return jsonResult\(withVerified\(\{ iterations, handRaised: true, question: parsed\.question, done: false \}, parsed\)\);/,
+      /return jsonResult\(withVerified\(\{ iterations, handRaised: true, question: parsed\.question, done: false[\s\S]*?\}, parsed\)\);/,
     );
   });
 
   it("the exceeded-iterations return keeps its withVerified wrap (lastOutcome)", () => {
     expect(iterateSrc).toContain(
-      "withVerified({ iterations, done: true, success: false, note: `exceeded ${maxIter} iterations` }, lastOutcome),",
+      "withVerified({ iterations, done: true, success: false, note: `exceeded ${maxIter} iterations`,",
     );
   });
 
   it("the success return keeps its withVerified wrap", () => {
     expect(iterateSrc).toContain(
-      "return jsonResult(withVerified({ iterations, done: true, success: true, finalSummary: parsed.summary }, parsed));",
+      "return jsonResult(withVerified({ iterations, done: true, success: true, finalSummary: parsed.summary,",
     );
   });
 

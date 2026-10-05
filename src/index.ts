@@ -1718,7 +1718,7 @@ export default definePluginEntry({
               // that prints "answer true" cannot steer the judge.
               const cap = (t: string) => (t.length > 1000 ? t.slice(0, 1000) + "…[truncated]" : t);
               const question = buildProgressQuestion({
-                acceptanceCriteria: p.prompt,
+                acceptanceCriteria: (Array.isArray((p as unknown as { accept?: unknown }).accept) ? ((p as unknown as { accept: string[] }).accept.join("; ")) : "") || p.prompt,
                 prevFailureOutput: quoteUntrusted("previous-output", cap(prevFingerprint)),
                 thisResult: quoteUntrusted("this-output", cap((parsed.summary ?? "") + "|" + (parsed.error ?? ""))),
                 verifyOutput: quoteUntrusted("verify-output", cap(parsed.verifyDetails !== undefined ? JSON.stringify(parsed.verifyDetails) : "no verification gate ran")),
@@ -1756,7 +1756,7 @@ export default definePluginEntry({
 
           // Hand-raise: stop and let the caller answer.
           if (parsed.handRaised) {
-            return jsonResult(withVerified({ iterations, handRaised: true, question: parsed.question, done: false }, parsed));
+            return jsonResult(withVerified({ iterations, handRaised: true, question: parsed.question, done: false, ...(judgeWarning ? { judgeWarning } : {}), ...(shadowProgressNotes.length ? { s1ShadowProgress: shadowProgressNotes } : {}) }, parsed));
           }
 
           // Success check.
@@ -1778,7 +1778,7 @@ export default definePluginEntry({
           const markerSeen = p.successMarker ? (parsed.summary ?? "").includes(p.successMarker) : false;
           const success = (p.successMarker ? markerSeen && !looksFailed : !looksFailed) && verified !== false;
           if (success) {
-            return jsonResult(withVerified({ iterations, done: true, success: true, finalSummary: parsed.summary }, parsed));
+            return jsonResult(withVerified({ iterations, done: true, success: true, finalSummary: parsed.summary, ...(judgeWarning ? { judgeWarning } : {}), ...(shadowProgressNotes.length ? { s1ShadowProgress: shadowProgressNotes } : {}) }, parsed));
           }
 
           // NO-PROGRESS escalation: same output as last iteration → stop, don't burn tokens.
@@ -1796,6 +1796,8 @@ export default definePluginEntry({
                   reason: "no progress across iterations (identical output)",
                   recommendation:
                     "Escalate: switch to a heavier model, change the approach, or hand off to a human. Do not keep retrying the same prompt.",
+                  ...(judgeWarning ? { judgeWarning } : {}),
+                  ...(shadowProgressNotes.length ? { s1ShadowProgress: shadowProgressNotes } : {}),
                 },
                 lastOutcome,
               ),
@@ -1857,7 +1859,7 @@ export default definePluginEntry({
         }
 
         return jsonResult(
-          withVerified({ iterations, done: true, success: false, note: `exceeded ${maxIter} iterations` }, lastOutcome),
+          withVerified({ iterations, done: true, success: false, note: `exceeded ${maxIter} iterations`, ...(judgeWarning ? { judgeWarning } : {}), ...(shadowProgressNotes.length ? { s1ShadowProgress: shadowProgressNotes } : {}) }, lastOutcome),
         );
       },
     });
