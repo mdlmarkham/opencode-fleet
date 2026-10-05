@@ -76,33 +76,35 @@ const FIELD_PROMPTS: Record<IntakeField, string> = {
   riskiestAssumptions: "Which assumptions, if wrong, sink the plan? (one per answer)",
 };
 
-/** A criterion is checkable iff it names a command to run or an observation to make. */
+/**
+ * A criterion is checkable iff it names a concrete command to run OR an explicit,
+ * observable form ("observe: <what, where>"). Issue #116 review (defect 4): the
+ * old heuristic accepted any bare verb ("we will check that it is good", "users
+ * will see value"), which let an unmeasurable goal reach `ready`. Now a bare verb
+ * is NOT enough — there must be a command, an exit/HTTP condition, or a named
+ * observation artefact (a log/file/field that shows a value).
+ */
 function checkable(criterion: string): boolean {
   const c = criterion.toLowerCase();
-  const command = /\b(npm (run|test|install)|npx\b|yarn\b|pnpm\b|make\b|cargo build|cargo test|go test|pytest|vitest|tsc\b|node \S|grep\b|curl\b|git (diff|log|status|show)|ls \S|wc -l|exit code|exits? (0|nonzero|successfully)|return code|status code|http [1-5]\d\d)\b/;
-  const observation = /\b(observed?|see|seen|check|verify|inspection|look at|log (shows|contains|line)|output contains|file contains|comment shows|a human|user sees|badge|metric|count of|number of|pr comment)\b/;
-  return command.test(c) || observation.test(c);
+  // A concrete command + an objective outcome, or a status/exit condition.
+  const command = /\b(npm (run|test|install)|npx\b|yarn\b|pnpm\b|make\b|cargo (build|test)|go test|pytest|vitest|tsc\b|node \S|grep\b|curl\b|git (diff|log|status|show)|ls \S|wc -l|exit code|exits? (0|nonzero|successfully)|return code|status code|http [1-5]\d\d)\b/;
+  // An EXPLICIT observation form: `observe:`/`observed:` followed by a value, or a named
+  // artefact that shows a value (a log line with a value, a file/field containing X).
+  const explicitObservation = /\bobserv(e|ed):\s*\S|\b(log|line|output|file|field|report|comment|badge|metric)\b[^.]*\b(shows?|contains?|reads?|reports?|=|:)\s*\S/;
+  // A measurable quantity with a comparison (>=10ms, count of N > 0, at most N).
+  const measurable = /\b(>=|<=|>|<|=)\s*\d|\b(count of|number of|at (least|most)|fewer than|greater than)\b[^.]*\d/;
+  return command.test(c) || explicitObservation.test(c) || measurable.test(c);
 }
 
 // ---------------------------------------------------------------------------
-// Resumable state, keyed by projectId. A plain in-memory map keeps the module
-// pure (no I/O); a durable caller serializes the state object and merges it back
-// with intakeStep.
-// ---------------------------------------------------------------------------
+// PURE state: no module-level storage. The caller owns the state, serializes it
+// if it wants durability, and hands it back to intakeStep each round. This is
+// what makes the "durable caller serializes the state object and merges it back
+// with intakeStep" guarantee actually true (issue #116 review).
 
-const states = new Map<string, IntakeState>();
-
-export function getIntakeState(projectId: string): IntakeState | undefined {
-  return states.get(projectId);
-}
-
-export function clearIntakeState(projectId: string): void {
-  states.delete(projectId);
-}
-
-/** Build (and store) a state from one round of answers without asking for the next round. */
-export function buildIntakeState(projectId: string, answers: IntakeAnswers): IntakeState {
-  return intakeStep({ projectId }, answers).state;
+/** Start an empty intake state for a project (pure; nothing is stored). */
+export function buildIntakeState(projectId: string, answers: IntakeAnswers = {}): IntakeState {
+  return intakeStep({ projectId, state: { projectId, schemaVersion: PROJECT_SCHEMA_VERSION, answers: {} } }, answers).state;
 }
 
 /** Charters are single-line texts; a multi-line answer would parse as extra bullets, so flatten it. */
@@ -115,8 +117,8 @@ const plainYamlScalar = (s: string): string => (/^[A-Za-z0-9][A-Za-z0-9 _.-]*$/.
  * return the next round of questions: only still-missing or insufficient fields. Items marked
  * `deferred: ...` are recorded as deferrals, never as answers and never silently accepted.
  */
-export function intakeStep(input: { projectId: string; name?: string }, answers: IntakeAnswers): IntakeStep {
-  const state: IntakeState = states.get(input.projectId) ?? { projectId: input.projectId, schemaVersion: PROJECT_SCHEMA_VERSION, answers: {} };
+export function intakeStep(input: { projectId: string; name?: string; state?: IntakeState }, answers: IntakeAnswers): IntakeStep {
+  const state: IntakeState = input.state ?? { projectId: input.projectId, schemaVersion: PROJECT_SCHEMA_VERSION, answers: {} };
   const name = input.name === undefined ? undefined : singleLine(input.name);
   if (name !== undefined && name !== "" && name.length <= 100) state.name = name;
   const deferred: IntakeDeferrals = { ...(state.deferred ?? {}) };
@@ -162,8 +164,14 @@ export function intakeStep(input: { projectId: string; name?: string }, answers:
     if (bounded.length === 0) insufficient.push(field);
   }
   state.deferred = Object.keys(deferred).length > 0 ? deferred : undefined;
-  states.set(state.projectId, state);
   const held = holds(state);
+  // Issue #116 review (defect 1): a deferral is cleared the moment the field holds — an
+  // answered field must not stay 'deferred'/risky.
+  if (state.deferred) {
+    const kept: IntakeDeferrals = {};
+    for (const f of INTAKE_FIELDS) if (state.deferred[f] !== undefined && !held[f]) kept[f] = state.deferred[f];
+    state.deferred = Object.keys(kept).length > 0 ? kept : undefined;
+  }
   return {
     state,
     questions: INTAKE_FIELDS.filter((f) => !held[f] && state.deferred?.[f] === undefined),
@@ -194,7 +202,11 @@ function holds(state: IntakeState): Record<IntakeField, boolean> {
  */
 export function intakeVerdict(state: IntakeState): IntakeVerdict {
   const held = holds(state);
-  const deferrals = state.deferred ?? {};
+  // A held field is never 'missing' even if a stale deferral lingers (defence in depth,
+  // issue #116 review defect 1).
+  const deferrals = Object.fromEntries(
+    Object.entries(state.deferred ?? {}).filter(([f]) => !held[f as IntakeField]),
+  ) as IntakeDeferrals;
   const missing = INTAKE_FIELDS.filter((f) => (MANDATORY.has(f) && !held[f]) || deferrals[f] !== undefined);
   const risks: string[] = [];
   for (const f of missing) if (deferrals[f] !== undefined) risks.push(`risk (${f}): deferred by the user — ${deferrals[f]}`);

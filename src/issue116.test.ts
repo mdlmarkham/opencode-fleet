@@ -5,7 +5,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { parseCharter } from "./project.js";
-import { buildIntakeState, clearIntakeState, getIntakeState, intakeStep, intakeVerdict, renderCharter, type IntakeAnswers } from "./intake.js";
+import { buildIntakeState, intakeStep, intakeVerdict, renderCharter, type IntakeAnswers } from "./intake.js";
 
 const full: IntakeAnswers = {
   goal: "Ship a plugin that validates PR descriptions against the charter.",
@@ -59,18 +59,29 @@ describe("#116: intake push-back (completeness)", () => {
     const s = { projectId: "p7" } as const;
     const first = intakeStep(s, { goal: "Set up intake" });
     expect(first.questions).toEqual(["users", "constraints", "nonGoals", "successCriteria", "riskiestAssumptions"]);
-    const second = intakeStep(first.state, { users: ["ops"], nonGoals: ["no UI"], successCriteria: ["npm test passes"] });
+    const second = intakeStep({ projectId: "p7", state: first.state }, { users: ["ops"], nonGoals: ["no UI"], successCriteria: ["npm test passes"] });
     expect(second.questions).toEqual(["constraints", "riskiestAssumptions"]);
   });
 });
 
 describe("#116: deferred items become risks, never silently accepted", () => {
   it("deferred-only gap => risky-but-proceed with the deferred item surfaced as a risk", () => {
-    const state = withDeferred(stateOf("p8", full), "constraints", "operator said: defer the offline check");
+    // Defer a field that does NOT hold (users is empty) — a held field must never stay deferred
+    // (issue #116 review defect 1).
+    const state = withDeferred(stateOf("p8", { ...full, users: [] }), "users", "operator said: defer the offline check");
     const risky = intakeVerdict(state);
     expect(risky.verdict).toBe("risky-but-proceed");
-    expect(risky.missing).toContain("constraints");
+    expect(risky.missing).toContain("users");
     expect(risky.risks.some((r) => r.includes("offline check"))).toBe(true);
+  });
+  it("an answered field CLEARS its deferral (issue #116 review defect 1)", () => {
+    // Defer `constraints`, then answer it: the verdict must become ready, with no stale risk.
+    const deferredOnly = withDeferred(stateOf("p8b", { ...full, constraints: [] }), "constraints", "deferred: check later");
+    expect(intakeVerdict(deferredOnly).verdict).toBe("risky-but-proceed");
+    const answered = intakeStep({ projectId: "p8b", state: deferredOnly }, { constraints: ["offline-first, no network calls"] });
+    const v = intakeVerdict(answered.state);
+    expect(v.verdict).toBe("ready");
+    expect(v.missing).toEqual([]);
   });
   it("a unfulfilled hold is NOT satisfied by deferral: risk is present, never accepted silently", () => {
     const state = withDeferred(stateOf("p9", { ...full, users: [] }), "users", "deferred: who uses it is TBD");
@@ -106,19 +117,25 @@ describe("#116: charter round-trip (render => parseCharter)", () => {
   });
 });
 
-describe("#116: resumable state keyed by projectId", () => {
-  it("answers persist keyed by projectId and clearIntakeState drops them", () => {
-    intakeStep({ projectId: "p12" }, { goal: "Persist me" });
-    expect(getIntakeState("p12")?.answers.goal).toBe("Persist me");
-    clearIntakeState("p12");
-    expect(getIntakeState("p12")).toBeUndefined();
+describe("#116: PURE resumable state (no module-level storage)", () => {
+  it("intakeStep is pure: the state is threaded in and out, and a SERIALISED round-trip resumes", () => {
+    const first = intakeStep({ projectId: "p12" }, { goal: "Persist me" });
+    // Serialise and revive under an id the module has never seen — the reviewer's defect 2.
+    const revived = JSON.parse(JSON.stringify(first.state));
+    const second = intakeStep({ projectId: "p12", state: revived }, { users: ["ops"] });
+    expect(second.state.answers.goal).toBe("Persist me");
+    expect(second.state.answers.users).toEqual(["ops"]);
   });
-  it("a second round merges into the first (resumable)", () => {
+  it("a second round merges into the first (resumable), taking the state as a value", () => {
     const first = intakeStep({ projectId: "p13" }, { goal: "Resume me" });
-    const second = intakeStep({ projectId: "p13" }, { users: ["later"] });
+    const second = intakeStep({ projectId: "p13", state: first.state }, { users: ["later"] });
     expect(second.state.answers.goal).toBe("Resume me");
     expect(second.state.answers.users).toEqual(["later"]);
     expect(second.questions).toEqual(["constraints", "nonGoals", "successCriteria", "riskiestAssumptions"]);
-    clearIntakeState("p13");
+  });
+  it("there is no hidden global store: same projectId, a fresh empty state starts empty", () => {
+    intakeStep({ projectId: "p14" }, { goal: "Ephemeral" });
+    const fresh = buildIntakeState("p14");
+    expect(fresh.answers.goal).toBeUndefined();
   });
 });
