@@ -4,7 +4,7 @@
  *
  * What this module guarantees, and what it does not:
  *  - A PASS must carry evidence: at least one executed command with exit code 0 and an output
- *    tail. A reviewer that could not run its tools is BLOCKED, never a PASS.
+ *    tail, and every recorded command must have succeeded (#184). A reviewer that could not run its tools is BLOCKED, never a PASS.
  *  - A PASS cannot carry an open blocking/major finding.
  *  - A record is bound to a full 40-hex head sha; a PASS for another sha is not a PASS for this
  *    one (a push invalidates it).
@@ -111,6 +111,12 @@ export function validateReview(raw: ReviewInput, now: Date = new Date(), id: str
   if (verdict === "PASS") {
     if (!commands.some((c) => c.exitCode === 0)) {
       return { ok: false, error: "a PASS needs evidence: at least one executed command (e.g. the build or test run) with exitCode 0 and its output tail. A reviewer that could not run its tools must record BLOCKED, not PASS" };
+    }
+    // One passing command must not paper over a failed one (issue #184): every recorded command
+    // has to have succeeded, so a failed verify run cannot sit next to `echo ok`.
+    const failed = commands.filter((c) => c.exitCode !== 0);
+    if (failed.length > 0) {
+      return { ok: false, error: `a PASS cannot carry a failed command (${failed.map((c) => `\`${c.command.slice(0, 60)}\` exit ${c.exitCode}`).join(", ")}): re-run and record the real result, or record FAIL` };
     }
     const open = findings.filter((f) => f.severity === "blocking" || f.severity === "major");
     if (open.length > 0) return { ok: false, error: `a PASS cannot carry ${open.length} open blocking/major finding(s); record FAIL` };
