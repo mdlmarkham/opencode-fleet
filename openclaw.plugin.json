@@ -239,6 +239,11 @@
             "default": false,
             "description": "Refuse fleet_sync for a run that changed files outside its declared spec.scope, or whose scope was never checked (issue #104). Override per call with allowScopeViolations."
           },
+          "requireReview": {
+            "type": "boolean",
+            "default": false,
+            "description": "Refuse fleet_sync unless a fleet_review PASS is recorded for the exact head sha passed as `head` (issue #178). A PASS for an older sha does not count."
+          },
           "requireVerified": {
             "type": "boolean",
             "default": false,
@@ -319,6 +324,7 @@
       "fleet_run_status",
       "fleet_run_report",
       "fleet_capacity",
+      "fleet_review",
       "fleet_design_check",
       "fleet_project_show",
       "fleet_board"

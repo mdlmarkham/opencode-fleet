@@ -11,7 +11,7 @@ import {
   type AckRecoveryOutcome,
 } from "./recovery.js";
 import { SSH_ARGS, setSshOptions, sshPrefix } from "./ssh.js";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { quoteUntrusted, sanitizeQuestion } from "./untrusted.js";
 import { checkSetup, partitionEnv } from "./policy.js";
 import { handleOpencodeRun, type FleetOpenCodeTask } from "./node/handler.js";
@@ -63,7 +63,7 @@ interface FleetConfig {
   /** S1 decision layer (issue #79): backend, mode (default shadow), thresholds, egress opt-in. Validated by parseS1Config. */
   s1?: unknown;
   /** fleet_sync publish policy (issue #33). */
-  sync?: { protectedBranches?: string[]; allowDirectPush?: string[]; allowSensitivePaths?: boolean; sensitivePaths?: string[]; requireVerified?: boolean; blockOnScopeViolation?: boolean };
+  sync?: { protectedBranches?: string[]; allowDirectPush?: string[]; allowSensitivePaths?: boolean; sensitivePaths?: string[]; requireVerified?: boolean; blockOnScopeViolation?: boolean; requireReview?: boolean };
   /** Dispatch env refinements: allowOnly makes injection allowlist-only; extraDeny adds refused names. */
   env?: { allowOnly?: string[]; extraDeny?: string[] };
   /** SSH client policy for manager-to-node commands. */
@@ -178,6 +178,7 @@ export default definePluginEntry({
           protectedBranches: { type: "array", items: { type: "string" }, default: ["main", "master"] },
           allowDirectPush: { type: "array", items: { type: "string" }, default: [] },
           blockOnScopeViolation: { type: "boolean", default: false, description: "Refuse fleet_sync for a run that changed files outside its declared spec.scope, or whose scope was never checked (issue #104). Override per call with allowScopeViolations." },
+          requireReview: { type: "boolean", default: false, description: "Refuse fleet_sync unless a fleet_review PASS is recorded for the exact head sha passed as `head` (issue #178). A PASS for an older sha does not count." },
           requireVerified: { type: "boolean", default: false, description: "Refuse fleet_sync for work with no verification result (a run that did not use expect/spec.verify). A run whose gate FAILED is always refused unless allowUnverified is passed." },
           allowSensitivePaths: { type: "boolean", default: false, description: "Allow worker changes to CI/CODEOWNERS paths." },
           sensitivePaths: { type: "array", items: { type: "string" }, default: [], description: "Extra path globs treated as sensitive (e.g. ci/**), added to the built-in list." },
@@ -1283,6 +1284,44 @@ export default definePluginEntry({
     });
 
     api.registerTool({
+      name: "fleet_review",
+      label: "Fleet Review",
+      description:
+        "Review gate (issue #177). action=record stores a structured review verdict bound to one head sha; PASS needs executed-command evidence. action=check says whether a head has a PASS (what sync.requireReview enforces). Does not spawn the reviewer.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          action: { type: "string", enum: ["record", "check"] },
+          headSha: { type: "string", description: "Full 40-hex commit sha reviewed (record) or about to be merged (check)." },
+          verdict: { type: "string", enum: ["PASS", "FAIL", "BLOCKED"], description: "BLOCKED = the reviewer could not run its tools. Never record PASS for that." },
+          reviewer: { type: "string", description: "Who ran the review." },
+          author: { type: "string", description: "Who wrote the change; must differ from reviewer." },
+          pr: { type: "integer" },
+          evidence: { type: "object", properties: { commands: { type: "array", items: { type: "object", properties: { command: { type: "string" }, exitCode: { type: "integer" }, outputTail: { type: "string" } }, required: ["command", "exitCode"] } } } },
+          findings: { type: "array", items: { type: "object", properties: { severity: { type: "string", enum: ["blocking", "major", "minor", "nit"] }, summary: { type: "string" }, file: { type: "string" } }, required: ["severity", "summary"] } },
+          contractChange: { type: "boolean" },
+          note: { type: "string" },
+        },
+        required: ["action", "headSha"],
+      },
+      execute: async (_toolCallId, params) => {
+        const p = params as Record<string, unknown>;
+        const rootDir = api.rootDir ?? process.cwd();
+        const { validateReview, appendReview, loadReviews, reviewGate } = await import("./review.js");
+        if (p.action === "check") {
+          const g = reviewGate(await loadReviews(rootDir), String(p.headSha ?? ""), typeof p.pr === "number" ? p.pr : undefined);
+          return jsonResult({ ok: true, allow: g.allow, status: g.status, ...(g.reason ? { reason: g.reason } : {}), ...(g.record ? { reviewId: g.record.id, reviewedAt: g.record.recordedAt } : {}) });
+        }
+        if (p.action !== "record") return jsonResult({ ok: false, error: "action must be record or check" });
+        const v = validateReview(p, new Date(), `rv-${randomUUID().slice(0, 8)}`);
+        if (!v.ok) return jsonResult({ ok: false, error: v.error });
+        await appendReview(rootDir, v.record);
+        return jsonResult({ ok: true, reviewId: v.record.id, verdict: v.record.verdict, headSha: v.record.headSha });
+      },
+    });
+
+    api.registerTool({
       name: "fleet_run_report",
       label: "Fleet Run Report",
       description:
@@ -2060,13 +2099,14 @@ export default definePluginEntry({
           cwd: { type: "string", description: "Working directory on the node." },
           repo: { type: "string", description: "Git URL the manager can access." },
           allowScopeViolations: { type: "boolean", description: "Publish even though the run changed files outside its declared scope (or its scope was never checked) and sync.blockOnScopeViolation is set. Does not bypass a failed verification gate. Off by default." },
+          head: { type: "string", description: "Full 40-hex sha of the commit being published. Required when sync.requireReview is set: a fleet_review PASS must exist for exactly this sha." },
           allowUnverified: { type: "boolean", description: "Publish even though the latest fleet run on this node and checkout FAILED its verification gate (or, with sync.requireVerified, has none). Off by default." },
           branch: { type: "string", description: "Clone BASE branch: a branch that already EXISTS on origin, checked out so the worker's changes can be applied on top of it (default main). NOT the destination — the destination is resolved from the worker's own branch (or from a pinned destination set internally); a protected destination is redirected to `fleet/<name>` and reported as `redirectedFrom`." },
         },
         required: ["node", "cwd", "repo"],
       },
       execute: async (toolCallId, params, signal) => {
-        const p = params as { node: string; cwd: string; repo: string; branch?: string; allowUnverified?: boolean; allowScopeViolations?: boolean };
+        const p = params as { node: string; cwd: string; repo: string; branch?: string; head?: string; allowUnverified?: boolean; allowScopeViolations?: boolean };
         const list = await api.runtime.nodes.list();
         const nodes = list.nodes ?? [];
         const node = nodes.find((n) => n.displayName === p.node || n.nodeId === p.node);
@@ -2083,6 +2123,14 @@ export default definePluginEntry({
           { allowUnverified: p.allowUnverified === true, requireVerified: cfg.sync?.requireVerified === true, blockOnScopeViolation: cfg.sync?.blockOnScopeViolation === true, allowScopeViolations: p.allowScopeViolations === true },
         );
         if (!gate.allow) return jsonResult({ ok: false, error: gate.reason, verified: gate.verified, ...(gate.runId ? { runId: gate.runId } : {}) });
+        // Issue #178: the review gate. A PASS recorded for exactly this head, or no publish.
+        let reviewNote: Record<string, unknown> = {};
+        if (cfg.sync?.requireReview === true) {
+          const { loadReviews, reviewGate } = await import("./review.js");
+          const rg = reviewGate(await loadReviews(api.rootDir ?? process.cwd()), p.head ?? "");
+          if (!rg.allow) return jsonResult({ ok: false, error: `sync.requireReview is set: ${rg.reason}`, review: rg.status, ...(p.head === undefined ? { hint: "pass `head` (the full sha being published)" } : {}) });
+          reviewNote = { review: "PASS", reviewId: rg.record?.id };
+        }
         const gateNote = gate.reason ? { verifiedNote: gate.reason, verified: gate.verified } : { verified: gate.verified };
 
         // SSH-free node: bundle on the worker via the node channel, pull the
@@ -2130,12 +2178,12 @@ export default definePluginEntry({
             workerBranch: typeof bundlePl.branch === "string" ? bundlePl.branch : undefined,
             destBranch: p.branch,
           }, undefined, cfg.sync);
-          return jsonResult({ ...r, ...gateNote, viaChannel: true });
+          return jsonResult({ ...r, ...gateNote, ...reviewNote, viaChannel: true });
         }
 
         const { syncFromNode } = await import("./provision.js");
         const r = await syncFromNode(host, p.cwd, p.repo, p.branch ?? "main", undefined, p.branch, cfg.sync);
-        return jsonResult({ ...r, ...gateNote });
+        return jsonResult({ ...r, ...gateNote, ...reviewNote });
       },
     });
 
