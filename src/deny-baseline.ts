@@ -382,3 +382,56 @@ export function detectAutoSupport(probe: AutoSupportProbe): boolean {
   }
   return true;
 }
+
+// ---------------------------------------------------------------------------
+// autoApproveGate — the slice-2 dispatch predicate (pure; unit-tested)
+// ---------------------------------------------------------------------------
+
+/** What a dispatch's autoApprove gate needs to know about the node. */
+export interface AutoApproveGateInput {
+  /** The dispatch asked for autoApprove? (false => gate vacuously passes). */
+  autoApprove: boolean;
+  /** Which node the verdict names (defaults to "<node>"; no I/O). */
+  nodeName?: string;
+  /** Probe of the node's opencode build (--version / run --help output). */
+  probe?: AutoSupportProbe;
+  /** True when fleet_capabilities says the node carries the deny baseline. */
+  denyBaseline?: boolean;
+}
+
+/**
+ * The pure decision of the fleet_dispatch autoApprove gate (issue #51 slice 2).
+ *
+ *  - allow true  + supported node  + baseline present => proceed, no warning.
+ *  - allow true  + supported node  + baseline missing => proceed WITH a
+ *    warning (do not break existing flows; the node's own rules apply).
+ *  - allow true  + node does NOT support --auto => refuse with a clear error
+ *    naming the node (never append an unparseable flag).
+ *  - autoApprove not requested (or operator-forbidden, handled elsewhere) =>
+ *    pass with no refusal and no warning; identical to today's behavior.
+ *
+ * Pure: no I/O, no SSH, no process spawn. The wiring in index.ts supplies the
+ * probe and the baseline flag and reports the verdict.
+ */
+export function autoApproveGate(
+  input: AutoApproveGateInput,
+): { ok: true; warning?: string } | { ok: false; error: string } {
+  if (input.autoApprove !== true) return { ok: true };
+  if (!detectAutoSupport(input.probe ?? {})) {
+    return {
+      ok: false,
+      error:
+        `refusing autoApprove: node ${input.nodeName ?? "<node>"} runs an opencode that does not verify support for \`opencode run --auto\` ` +
+        `(no --auto in \`run --help\` and version below ${AUTO_SUPPORT_MIN_VERSION}); the flag would be unparseable there. ` +
+        `Dispatch without autoApprove, or upgrade/verify the node's opencode.`,
+    };
+  }
+  if (input.denyBaseline !== true) {
+    return {
+      ok: true,
+      warning:
+        `node ${input.nodeName ?? "<node>"} has no deny baseline installed; autoApprove rests on the node's own rules`,
+    };
+  }
+  return { ok: true };
+}

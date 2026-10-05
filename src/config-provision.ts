@@ -15,9 +15,10 @@
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { readdir, readFile, mkdir, stat } from "node:fs/promises";
-import { statSync } from "node:fs";
-import { join, basename } from "node:path";
+import { mkdtempSync, statSync } from "node:fs";
+import { mkdtemp, readdir, readFile, mkdir, stat, writeFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, basename, dirname } from "node:path";
 import { SSH_ARGS, scpPrefix, scpRemote, sshPrefix } from "./ssh.js";
 
 const execFileP = promisify(execFile);
@@ -31,6 +32,13 @@ export interface ConfigProvisionRequest {
   skillsDir?: string;
   /** Local opencode.json to ship (optional). */
   opencodeConfigFile?: string;
+  /**
+   * Opt-in (issue #51 slice 2): after shipping, merge the node-side deny-rule
+   * baseline into the node's existing ~/.config/opencode/opencode.json.
+   * Merge-only (never replaces unrelated keys), idempotent; default false so
+   * provisioning behavior is unchanged.
+   */
+  installDenyBaseline?: boolean;
 }
 
 export interface ConfigProvisionResult {
@@ -39,7 +47,110 @@ export interface ConfigProvisionResult {
   globalRules?: boolean;
   skills?: string[];
   opencodeConfig?: boolean;
+  /** Set when the deny baseline was merged into the node's opencode.json. */
+  denyBaselineInstalled?: boolean;
   error?: string;
+}
+
+/** Remote shell script: merge the deny baseline into the node's opencode.json. */
+function baselineInstallScript(): string {
+  // POSIX sh + node -e: reads the existing config (if any), merges, writes
+  // back atomically. Fail-safe means REFUSE, not destroy (issue #51 review):
+  // an unparseable config is left untouched and reported as an error — we do
+  // not overwrite the operator's providers/credentials because of a stray
+  // comma. The previous content is also backed up to a .bak first.
+  const nodeScript = [
+    'const fs=require("fs"),p=process.env.HOME+"/.config/opencode/opencode.json";',
+    "let cur=null;",
+    'try{cur=JSON.parse(fs.readFileSync(p,"utf8"));}catch(e){cur=null;}',
+    "if(fs.existsSync(p)&&cur===null){process.stderr.write(\"FLEET_BASELINE_REFUSED: existing opencode.json is not valid JSON; left untouched\\n\");process.exit(3);}",
+    'try{fs.copyFileSync(p,p+".bak");}catch(e){}',
+    "const {mergeDenyBaseline}=require(process.argv[1]);",
+    'fs.writeFileSync(p+".tmp",JSON.stringify(mergeDenyBaseline(cur),null,2)+"\\n");',
+    'fs.renameSync(p+".tmp",p);',
+  ].join(" ");
+  return "mkdir -p ~/.config/opencode && node -e " + JSON.stringify(nodeScript) +
+    ' "$HOME/.config/opencode/fleet-deny-baseline.cjs"';
+}
+
+/** Emit the baseline data as a copyable CJS module (no imports, pure data). */
+export async function buildBaselineModule(): Promise<string> {
+  const { BASELINE_DENY } = await import("./deny-baseline.js");
+  // Deny maps are frozen plain objects, so JSON.stringify carries them as-is.
+  const cats = Object.entries(BASELINE_DENY)
+    .map(([cat, denies]) => {
+      const pairs = Object.entries(denies)
+        .map(([p, a]) => JSON.stringify(p) + ": " + JSON.stringify(a))
+        .join(", ");
+      return JSON.stringify(cat) + ": {" + pairs + "}";
+    })
+    .join(", ");
+  const MERGE_FN = [
+    "module.exports.mergeDenyBaseline = function mergeDenyBaseline(existing) {",
+    '  var isRec = function (v) { return v !== null && typeof v === "object" && !Array.isArray(v); };',
+    "  var src = isRec(existing) ? existing : {};",
+    "  var srcPerm = isRec(src.permission) ? src.permission : {};",
+    "  var base = module.exports.baselineDeny;",
+    "  var permission = {};",
+    "  var out = Object.assign({}, src, { permission: permission });",
+    "  for (var cat in srcPerm) {",
+    '    if (!Object.prototype.hasOwnProperty.call(srcPerm, cat)) continue;',
+    "    var val = srcPerm[cat];",
+    "    if (isRec(val)) permission[cat] = Object.assign({}, val);",
+    "    else permission[cat] = val;",
+    "  }",
+    "  var keys = Object.keys(base);",
+    "  for (var i = 0; i < keys.length; i++) {",
+    "    var cat2 = keys[i];",
+    "    var denies = base[cat2];",
+    "    var ex = srcPerm[cat2];",
+    '    if (typeof ex === "string") {',
+    '      if (ex === "deny") { permission[cat2] = "deny"; continue; }',
+    '      if (ex === "allow" || ex === "ask") {',
+    '        var m = { "*": ex };',
+    "        for (var p in denies) m[p] = denies[p];",
+    "        permission[cat2] = m;",
+    "        continue;",
+    "      }",
+    "      permission[cat2] = Object.assign({}, denies);",
+    "      continue;",
+    "    }",
+    "    if (isRec(ex)) {",
+    "      var m2 = Object.assign({}, ex);",
+    "      for (var p2 in denies) m2[p2] = denies[p2];",
+    "      permission[cat2] = m2;",
+    "      continue;",
+    "    }",
+    "    permission[cat2] = Object.assign({}, denies);",
+    "  }",
+    "  return out;",
+    "};",
+    "",
+  ].join("\n");
+  return "module.exports.baselineDeny = { " + cats + " };\n" + MERGE_FN;
+}
+
+/** Push the baseline module to the node, then merge it into its opencode.json. */
+async function installDenyBaselineOnNode(
+  nodeHost: string,
+  remotePath: string,
+): Promise<void> {
+  const mod = await buildBaselineModule();
+  const tmpDir = mkdtempSync(join(tmpdir(), "fleet-baseline-"));
+  const localMod = join(tmpDir, "fleet-deny-baseline.cjs");
+  try {
+    await writeFile(localMod, mod, "utf8");
+    await execFileP("scp", [...scpPrefix(), localMod, scpRemote(nodeHost, remotePath)], {
+      timeout: 30_000,
+    });
+    await execFileP(
+      "ssh",
+      [...sshPrefix(nodeHost, SSH_ARGS), baselineInstallScript()],
+      { timeout: 60_000 },
+    );
+  } finally {
+    await rm(tmpDir, { recursive: true, force: true });
+  }
 }
 
 /**
@@ -110,6 +221,15 @@ export async function provisionConfigToNode(
         { timeout: 30_000 },
       );
       result.opencodeConfig = true;
+    }
+
+    // Issue #51 slice 2: OPT-IN deny-baseline install. Merge-only against the
+    // node's existing config: unrelated keys are preserved and re-running is
+    // idempotent. Default (flag absent) leaves this whole block out — the
+    // provisioning result is byte-identical to before.
+    if (req.installDenyBaseline === true) {
+      await installDenyBaselineOnNode(nodeHost, "~/.config/opencode/fleet-deny-baseline.cjs");
+      result.denyBaselineInstalled = true;
     }
 
     return result;

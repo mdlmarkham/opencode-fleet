@@ -131,10 +131,66 @@ export function fakeSsh(output: string): () => void {
   const bin = join(dir, "ssh");
   writeFileSync(bin, `#!/bin/sh\nprintf '%s\\n' ${JSON.stringify(output)}\n`);
   chmodSync(bin, 0o755);
+  // A stand-in scp that just succeeds (issue #51b tests ship baseline modules
+  // over the same faked transport).
+  const scpBin = join(dir, "scp");
+  writeFileSync(scpBin, "#!/bin/sh\nexit 0\n");
+  chmodSync(scpBin, 0o755);
   const prev = process.env.PATH;
   process.env.PATH = `${dir}:${prev}`;
   return () => {
     process.env.PATH = prev;
     rmSync(dir, { recursive: true, force: true });
+  };
+}
+
+/**
+ * Like `fakeSsh`, but the stand-in `ssh` prints the contents of the file named
+ * by the `FAKE_SSH_REPLY_FILE` env var when the joined remote command mentions
+ * `opencode.json`, and prints `FAKE_SSH_FACTS` otherwise (or exits non-zero when
+ * the reply file is absent). This models a node whose config read differs from
+ * its capability-fact probe. Returns a restore function.
+ */
+export function fakeSshReply(): { setConfig: (text: string | null) => void; restore: () => void } {
+  const dir = mkdtempSync(join(tmpdir(), "fleet-fakesshreply-"));
+  mkdirSync(dir, { recursive: true });
+  const bin = join(dir, "ssh");
+  writeFileSync(
+    bin,
+    [
+      "#!/bin/sh",
+      "cmd=\"$*\"",
+      "case \"$cmd\" in",
+      "  *opencode.json*)",
+      "    if [ -n \"$FAKE_SSH_REPLY_FILE\" ] && [ -f \"$FAKE_SSH_REPLY_FILE\" ]; then cat \"$FAKE_SSH_REPLY_FILE\"; else exit 1; fi ;;",
+      "  *) printf '%s\\n' \"$FAKE_SSH_FACTS\" ;;",
+      "esac",
+    ].join("\n") + "\n",
+  );
+  chmodSync(bin, 0o755);
+  const scpBin = join(dir, "scp");
+  writeFileSync(scpBin, "#!/bin/sh\nexit 0\n");
+  chmodSync(scpBin, 0o755);
+  const cfgFile = join(dir, "node-opencode.json");
+  const prev = { PATH: process.env.PATH, facts: process.env.FAKE_SSH_FACTS, reply: process.env.FAKE_SSH_REPLY_FILE };
+  process.env.PATH = `${dir}:${prev.PATH}`;
+  process.env.FAKE_SSH_FACTS = [
+    "CPU=8", "MEM=31", "DISK=90", "GPU=none",
+    "TOOLS=node,npm,python3", "OPENCODE=1.18.26",
+    "PYVER=Python 3.12.3", "PYVENV=yes", "PYPEP668=yes", "PIPUSER=yes",
+  ].join("\n");
+  process.env.FAKE_SSH_REPLY_FILE = "";
+  return {
+    setConfig: (text: string | null) => {
+      if (text === null) { process.env.FAKE_SSH_REPLY_FILE = ""; return; }
+      writeFileSync(cfgFile, text, "utf8");
+      process.env.FAKE_SSH_REPLY_FILE = cfgFile;
+    },
+    restore: () => {
+      process.env.PATH = prev.PATH;
+      if (prev.facts === undefined) delete process.env.FAKE_SSH_FACTS; else process.env.FAKE_SSH_FACTS = prev.facts;
+      if (prev.reply === undefined) delete process.env.FAKE_SSH_REPLY_FILE; else process.env.FAKE_SSH_REPLY_FILE = prev.reply;
+      rmSync(dir, { recursive: true, force: true });
+    },
   };
 }
