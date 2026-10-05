@@ -111,8 +111,8 @@ export interface OpenCodeTask {
 
 export interface OpenCodeRunResult {
   ok: boolean;
-  /** The transport the run used, when known. Issue #103: omit rather than assert
-   * a hard-coded value; consumers already treat an absent transport as default. */
+  /** The transport the run used. Issue #103: never hard-coded — the caller's
+   * real transport wins; an unknown one falls back to the legacy "http". */
   transport?: OpenCodeTransport;
   /** Worker engine that produced this result (issue #30 finding A). */
   harness?: FleetHarness;
@@ -297,6 +297,15 @@ const CONTROL_PLACEHOLDER_RE = /^__RUN_(START|STATUS|RESULT|ABORT)__$/;
  * empty session exits 0) all yield `ok:false`. Without `exec` (legacy callers)
  * it falls back to the old output heuristic.
  */
+/**
+ * Issue #103: the transport/iteration count are NOT hard-coded here — the
+ * caller supplies the ACTUAL values via `exec` (see ExecStatus). With no
+ * caller input the historical defaults (`http`, 1) are used as a fallback so
+ * legacy call sites behave exactly as before.
+ */
+const DEFAULT_PARSED_TRANSPORT: OpenCodeTransport = "http";
+const DEFAULT_PARSED_ITERATIONS = 1;
+
 export function parseOpenCodeOutput(raw: string, exec?: ExecStatus): OpenCodeRunResult {
   // Collect text from NDJSON `text` events.
   const texts: string[] = [];
@@ -357,14 +366,15 @@ export function parseOpenCodeOutput(raw: string, exec?: ExecStatus): OpenCodeRun
 
   return {
     ok,
-    // Issue #103: report the REAL transport/iterations when the caller knows them;
-    // omit rather than assert a hard-coded wrong value.
-    ...(exec?.transport ? { transport: exec.transport } : {}),
+    // Issue #103: report the REAL transport/iterations the caller supplied;
+    // when it does not know them, fall back to the historical http/1 defaults
+    // (backward compatible) rather than omitting or asserting a wrong value.
+    transport: exec?.transport ?? DEFAULT_PARSED_TRANSPORT,
     sessionId,
     summary: handRaised ? summary.replace(/HAND_RAISE\s*[:\-]?\s*/i, "").trim() : summary,
     handRaised,
     question,
-    ...(typeof exec?.iterations === "number" ? { iterations: exec.iterations } : {}),
+    iterations: exec?.iterations ?? DEFAULT_PARSED_ITERATIONS,
     diffSummary: undefined,
     error: error ? redactSecrets(error) : undefined,
   };
@@ -378,7 +388,10 @@ export interface ExecStatus {
   timedOut?: boolean;
   /** True when the node-side watchdog killed the run for idling/exceeding max duration. */
   stuck?: boolean;
-  /** Issue #103: the REAL transport the run used (omit rather than assert a wrong value). */
+  /**
+   * Issue #103: the REAL transport the run used. Never assumed: when the
+   * caller does not know it, the parser falls back to the legacy default.
+   */
   transport?: OpenCodeTransport;
   /** Issue #103: the REAL iteration count when the caller knows it. */
   iterations?: number;
@@ -462,10 +475,13 @@ export function parsePiOutput(raw: string, exec?: ExecStatus): OpenCodeRunResult
   return {
     ok: !failed,
     harness: "pi",
-    ...(exec?.transport ? { transport: exec.transport } : {}),
+    // Issue #103: real transport from the caller, http fallback for legacy calls.
+    transport: exec?.transport ?? DEFAULT_PARSED_TRANSPORT,
     summary: handRaised ? summary.replace(/HAND_RAISE\s*[:\-]?\s*/i, "").trim() : summary,
     handRaised,
     question,
+    // Issue #103: real iteration count from the caller, 1 fallback for legacy calls.
+    iterations: exec?.iterations ?? DEFAULT_PARSED_ITERATIONS,
     ...(error ? { error } : {}),
   };
 }
@@ -547,10 +563,13 @@ function parsePiJsonOutput(raw: string, events: PiEvent[], exec?: ExecStatus): O
   return {
     ok: !failed,
     harness: "pi",
-    ...(exec?.transport ? { transport: exec.transport } : {}),
+    // Issue #103: real transport from the caller, http fallback for legacy calls.
+    transport: exec?.transport ?? DEFAULT_PARSED_TRANSPORT,
     summary: handRaiseMatch ? summary.replace(/HAND_RAISE\s*[:\-]?\s*/i, "").trim() : summary,
     handRaised: Boolean(handRaiseMatch),
     ...(handRaiseMatch ? { question: sanitizeQuestion(handRaiseMatch[1]) } : {}),
+    // Issue #103: real iteration count from the caller, 1 fallback for legacy calls.
+    iterations: exec?.iterations ?? DEFAULT_PARSED_ITERATIONS,
     ...(error ? { error } : {}),
     toolCalls,
     ...(usage ? { usage } : {}),

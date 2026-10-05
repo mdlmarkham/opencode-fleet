@@ -536,7 +536,19 @@ OPS["run.result"] = async ({ task, io, context }: OpCtx) => {
         if (done.verifyDetails) vDetails = done.verifyDetails;
       } catch { /* still running or no marker */ }
       const parsed =
-        harness === "pi" ? parsePiOutput(tail, { exitCode }) : parseOpenCodeOutput(tail, exitCode !== undefined ? { exitCode } : undefined);
+        // Issue #103: pass the REAL transport (and the one-shot call's iteration
+        // count) so the parser never has to assume the legacy default.
+        harness === "pi"
+          ? parsePiOutput(tail, {
+              exitCode,
+              transport: (task.transport as "http" | "acp" | undefined) ?? "http",
+              iterations: 1,
+            })
+          : parseOpenCodeOutput(tail, {
+              ...(exitCode !== undefined ? { exitCode } : {}),
+              transport: (task.transport as "http" | "acp" | undefined) ?? "http",
+              iterations: 1,
+            });
       // Issue #62: attach the gate outcome to the run result (distinct from
       // `ok`, which remains the process exit status) and alongside it for
       // control-plane consumers.
@@ -654,9 +666,23 @@ async function runTask({ task, io, context }: OpCtx): Promise<string> {
       task.maxDurationMs,
     );
     const parsed =
+      // Issue #103: thread the REAL transport (the synchronous run uses
+      // task.transport verbatim) so the parser never hard-codes one.
       task.harness === "pi"
-        ? parsePiOutput(run.output, { exitCode: run.exitCode, timedOut: run.timedOut, stuck: run.stuck })
-        : parseOpenCodeOutput(run.output, { exitCode: run.exitCode, timedOut: run.timedOut, stuck: run.stuck });
+        ? parsePiOutput(run.output, {
+            exitCode: run.exitCode,
+            timedOut: run.timedOut,
+            stuck: run.stuck,
+            transport: (task.transport as "http" | "acp" | undefined) ?? "http",
+            iterations: 1,
+          })
+        : parseOpenCodeOutput(run.output, {
+            exitCode: run.exitCode,
+            timedOut: run.timedOut,
+            stuck: run.stuck,
+            transport: (task.transport as "http" | "acp" | undefined) ?? "http",
+            iterations: 1,
+          });
     // Issue #62: when the dispatch carries an `expect` gate, evaluate it in
     // the run cwd AFTER the worker finished. `verified` is independent of the
     // exit status: a run that exits 0 but produced nothing ends up ok:true

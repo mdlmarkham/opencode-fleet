@@ -1344,6 +1344,9 @@ export default definePluginEntry({
           startedAt: st.startedAt,
           finishedAt: st.finishedAt,
           exitCode: st.exitCode,
+          // Issue #103: surface the engine the run used (from the ledger entry;
+          // "opencode" when unknown — the historical default). Additive field only.
+          harness: entry?.harness ?? "opencode",
           // Issue #62: the verification gate outcome (null = no gate was
           // configured). Do NOT fold it into ok/exitCode — it is a separate
           // signal, but a failed gate means the run must not be trusted.
@@ -1566,9 +1569,12 @@ export default definePluginEntry({
             ? /error|failed|timed out|stuck/i.test(parsed.summary ?? "")
             : parsed.ok === false;
           // Issue #103: `successMarker` is a SUBSTRING match on worker-controlled
-          // text, so a worker can fake success just by printing the marker. Require
-          // the marker AND a real pass signal: the run must not look failed and the
-          // verification gate (if one ran) must not have failed.
+          // text, so a worker can fake success just by printing the marker. The
+          // marker is an ADDITIONAL required condition, NEVER the sole one: it
+          // counts only when ANDed with a real pass signal (`ok !== false`, i.e.
+          // not looksFailed) AND the verification gate did not fail
+          // (`verified !== false`). A worker printing the marker over a failing
+          // run must not be able to fake success.
           const markerSeen = p.successMarker ? (parsed.summary ?? "").includes(p.successMarker) : false;
           const success = (p.successMarker ? markerSeen && !looksFailed : !looksFailed) && verified !== false;
           if (success) {
@@ -1577,15 +1583,23 @@ export default definePluginEntry({
 
           // NO-PROGRESS escalation: same output as last iteration → stop, don't burn tokens.
           if (escalateOnNoProgress && i > 1 && !progress) {
-            return jsonResult({
-              iterations,
-              done: false,
-              success: false,
-              escalated: true,
-              reason: "no progress across iterations (identical output)",
-              recommendation:
-                "Escalate: switch to a heavier model, change the approach, or hand off to a human. Do not keep retrying the same prompt.",
-            });
+            // Issue #103: every return shape goes through withVerified —
+            // `verified`/`verifyDetails` are ALWAYS present here too (null when
+            // no gate ran), matching the helper's contract.
+            return jsonResult(
+              withVerified(
+                {
+                  iterations,
+                  done: false,
+                  success: false,
+                  escalated: true,
+                  reason: "no progress across iterations (identical output)",
+                  recommendation:
+                    "Escalate: switch to a heavier model, change the approach, or hand off to a human. Do not keep retrying the same prompt.",
+                },
+                lastOutcome,
+              ),
+            );
           }
 
           // Re-dispatch with the failure context appended.
