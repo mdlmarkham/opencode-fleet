@@ -3,7 +3,7 @@ import { buildJsonPluginConfigSchema, jsonResult } from "openclaw/plugin-sdk/cor
 import { join } from "node:path";
 import { shq } from "./shell.js";
 import { AWAIT_MISSING_NOTE } from "./await.js";
-import { DEFAULT_RUN_TIMEOUT_MS, buildOpenCodeCommand, parseOpenCodeOutput, parsePiOutput, validateHarnessTransport, validatePiOptions, type OpenCodeTask } from "./opencode.js";
+import { DEFAULT_RUN_TIMEOUT_MS, DEFAULT_WATCH_TIMEOUT_MS, buildOpenCodeCommand, parseOpenCodeOutput, parsePiOutput, validateHarnessTransport, validatePiOptions, type OpenCodeTask } from "./opencode.js";
 import {
   probeAckRecovery,
   abortStateWrite,
@@ -317,7 +317,7 @@ export default definePluginEntry({
           acknowledge: { type: "array", items: { type: "object", additionalProperties: false, properties: { objectionId: { type: "string" }, reason: { type: "string" } }, required: ["objectionId", "reason"] }, description: "Proceed despite design-gate objections (issue #117): each entry names an objection id from a previous verdict and gives a reason. Recorded on the ledger. An operator `block` cannot be acknowledged." },
           piModel: { type: "string", description: "Pi model override (harness=pi); `provider/id` ref, e.g. myprovider/some-model. Falls back to the operator's piDefaultModel config." },
           piTools: { type: "array", items: { type: "string" }, description: "Pi tool allowlist (harness=pi), e.g. ['read','grep','ls'] for a read-only reviewer; [] disables all tools. Omitted = Pi defaults (read, bash, edit, write...). Fails closed: a node whose Pi lacks --tools refuses the run." },
-          piJson: { type: "boolean", description: "Opt-in (harness=pi): run Pi with --mode json (when the node's Pi supports it) so the result carries toolCalls, usage and stopReason and the final message is read from structured events. Default false." },
+          piJson: { type: "boolean", description: "Harness=pi: run Pi with --mode json (when the node's Pi supports it) so the result carries toolCalls, usage and stopReason, the final message is read from structured events, and the audit manifest records commands and usage. Default TRUE (issue #137); pass false for plain text." },
           piOffline: { type: "boolean", description: "Run Pi with --offline (no automatic network activity). Fails closed if the node's Pi lacks the flag." },
           model: { type: "string", description: "Optional model override (must exist on node)." },
           agent: { type: "string", description: "Optional OpenCode agent (build/plan)." },
@@ -755,7 +755,7 @@ export default definePluginEntry({
             piModel,
             ...(p.piTools !== undefined ? { piTools: p.piTools } : {}),
             ...(p.piOffline !== undefined ? { piOffline: p.piOffline } : {}),
-            ...(p.piJson === true ? { piJson: true } : {}),
+            ...(p.piJson !== undefined ? { piJson: p.piJson } : {}),
             model: p.model,
             agent: p.agent,
             autoApprove: p.autoApprove === true,
@@ -1901,7 +1901,7 @@ export default definePluginEntry({
           prompt: { type: "string", description: "The task / goal for OpenCode." },
           model: { type: "string", description: "Optional model override." },
           transport: { type: "string", enum: ["http", "acp"], description: "Transport." },
-          timeoutMs: { type: "number", description: "Per-run timeout, ms." },
+          timeoutMs: { type: "number", description: "Wall-clock limit for this watched run, ms (default 600000 = 10 minutes). fleet_watch is a blocking call: this is the ONLY limit on the run, so pass a larger value for real tasks, or use fleet_dispatch (detached, 30-minute default) plus fleet_await for long ones. A run ended by it reports endedBy." },
           pollMs: { type: "number", description: "Activity poll interval, ms (default 15000)." },
           expect: {
             type: "object",
@@ -1946,7 +1946,7 @@ export default definePluginEntry({
           if (!cmdCheck.ok) return jsonResult({ ok: false, error: `invalid expect.command: ${cmdCheck.error}` });
         }
 
-        const timeoutMs = p.timeoutMs ?? 300_000;
+        const timeoutMs = p.timeoutMs ?? DEFAULT_WATCH_TIMEOUT_MS;
         const pollMs = p.pollMs ?? 15_000;
         const startedAt = Date.now();
 
@@ -1970,9 +1970,16 @@ export default definePluginEntry({
         // Poll activity and stream progress until the dispatch settles.
         let settled = false;
         let lastActivity = "";
+        // The poll sleep ends the moment the run settles, so the tool does not hold its result for up
+        // to a full poll interval after the worker has finished.
+        let wakePoll: (() => void) | undefined;
+        const settle = (): void => { settled = true; wakePoll?.(); };
         const pollLoop = (async () => {
           while (!settled && Date.now() - startedAt < timeoutMs) {
-            await new Promise((r) => setTimeout(r, pollMs));
+            await new Promise<void>((resolve) => {
+              const t = setTimeout(resolve, pollMs);
+              wakePoll = () => { clearTimeout(t); resolve(); };
+            });
             if (settled) break;
             try {
               const inv = await api.runtime.nodes.invoke({
@@ -2005,15 +2012,32 @@ export default definePluginEntry({
           }
         })();
 
-        const result = await dispatchPromise;
-        settled = true;
+        let result: unknown;
+        try {
+          result = await dispatchPromise;
+        } catch (err) {
+          // The relay itself gave up (or the node vanished) before the node reported: say so, so it is
+          // not mistaken for the run's own wall-clock limit.
+          settle();
+          await pollLoop;
+          return jsonResult({
+            done: false,
+            ok: false,
+            endedBy: "watch-relay",
+            error: `the fleet_watch relay to the node failed before the run reported: ${(err as Error).message}`.slice(0, 400),
+            mayStillBeRunning: true,
+            elapsedMs: Date.now() - startedAt,
+            hint: "The run may still be going on the node. Find it with fleet_resume / fleet_status; for long tasks use fleet_dispatch + fleet_await.",
+          });
+        }
+        settle();
         await pollLoop;
 
         const payload = (result as { payload?: unknown }).payload;
         const parsed =
           typeof payload === "string"
-            ? (JSON.parse(payload) as { ok?: boolean; summary?: string; handRaised?: boolean; question?: string; error?: string; verified?: boolean; verifyDetails?: unknown })
-            : ((payload as { ok?: boolean; summary?: string; handRaised?: boolean; question?: string; error?: string; verified?: boolean; verifyDetails?: unknown } | undefined) ?? {});
+            ? (JSON.parse(payload) as { ok?: boolean; summary?: string; handRaised?: boolean; question?: string; error?: string; endedBy?: string; verified?: boolean; verifyDetails?: unknown })
+            : ((payload as { ok?: boolean; summary?: string; handRaised?: boolean; question?: string; error?: string; endedBy?: string; verified?: boolean; verifyDetails?: unknown } | undefined) ?? {});
         const watchedVerified = typeof parsed.verified === "boolean" ? parsed.verified : null;
 
         onUpdate?.({
@@ -2034,7 +2058,11 @@ export default definePluginEntry({
               summary: parsed.summary,
               handRaised: parsed.handRaised,
               question: parsed.question,
-              error: parsed.error,
+              // Issue #190: name the limit that fired. For a watched (blocking) run the only wall-clock
+              // limit is this call's own timeoutMs, so say that instead of a bare "wall-clock limit".
+              error: parsed.endedBy === "wall-clock" && parsed.error ? `${parsed.error} (fleet_watch's own timeoutMs: ${Math.round(timeoutMs / 1000)}s${p.timeoutMs === undefined ? ", the default" : ""})` : parsed.error,
+              ...(parsed.endedBy ? { endedBy: parsed.endedBy } : {}),
+              ...(parsed.endedBy === "wall-clock" ? { timeoutMs, hint: "Pass a larger timeoutMs to fleet_watch, or use fleet_dispatch (30-minute default, detached) + fleet_await for long tasks." } : {}),
               elapsedMs: Date.now() - startedAt,
               ...(watchedVerified === false
                 ? {
@@ -2354,18 +2382,22 @@ export default definePluginEntry({
         const results: Record<string, unknown> = {};
         for (const node of targets) {
           const host = node.remoteIp ?? node.displayName ?? node.nodeId;
-          const entry: Record<string, unknown> = await cleanupNode(host, p.cwd);
-          // Issue #189: report (never fix) checkout paths the worker's service user does not own.
+          // Issue #189: report (never fix) checkout paths the worker's service user does not own. This runs
+          // BEFORE cleanupNode: its `git gc` runs as the SSH login user and would itself leave root-owned
+          // files in .git, so measuring afterwards would report damage this very call just did.
+          // Only member.serviceUser counts: member.user is the SSH login user (often root), not the worker.
+          let ownership: unknown;
           if (p.cwd) {
-            const svcUser = (node as { member?: { serviceUser?: string; user?: string } }).member?.serviceUser
-              ?? (node as { member?: { user?: string } }).member?.user;
+            const svcUser = (node as { member?: { serviceUser?: string } }).member?.serviceUser;
             if (svcUser) {
               const { probeOwnership } = await import("./provision.js");
-              entry.ownership = await probeOwnership(host, p.cwd, svcUser);
+              ownership = await probeOwnership(host, p.cwd, svcUser);
             } else {
-              entry.ownership = { ok: false, error: "no service user configured for this node (member.serviceUser / user), so ownership was not checked" };
+              ownership = { ok: false, error: "no serviceUser configured for this node (member.serviceUser), so ownership was not checked" };
             }
           }
+          const entry: Record<string, unknown> = await cleanupNode(host, p.cwd, (node as { member?: { serviceUser?: string } }).member?.serviceUser);
+          if (ownership !== undefined) entry.ownership = ownership;
           // Issue #63: prune finished runs from the node's private state dir.
           const pruneDays = p.pruneOlderThanDays ?? 7;
           if (pruneDays > 0) {

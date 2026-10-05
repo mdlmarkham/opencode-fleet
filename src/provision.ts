@@ -413,8 +413,12 @@ export function parseRemoteStageDir(id: string, out: string): string {
  * Manager-side: run git GC on a node checkout and remove stale bundles to
  * keep the worker tidy and avoid bloat.
  */
-export async function cleanupNode(nodeHost: string, cwd?: string): Promise<{ ok: boolean; detail?: string; error?: string }> {
+export async function cleanupNode(nodeHost: string, cwd?: string, serviceUser?: string): Promise<{ ok: boolean; detail?: string; error?: string }> {
   try {
+    // Issue #189: `git gc` as the SSH login user (often root) leaves root-owned files in .git, the
+    // poisoning this repo documents. With a known service user, run the checkout work as that user.
+    const asService = (script: string): string =>
+      serviceUser !== undefined && USER_RE.test(serviceUser) ? `sudo -n -u ${shq(serviceUser)} -H bash -c ${shq(script)}` : script;
     const cmds = [
       // Issue #63: NO public /tmp bundle sweep. Node-side bundles stage in a
       // per-run PRIVATE dir under the node's fleet state dir, and every
@@ -422,7 +426,7 @@ export async function cleanupNode(nodeHost: string, cwd?: string): Promise<{ ok:
       // are no leftovers to sweep. A wildcard sweep here would delete OTHER
       // runs' (and other users') files.
       // GC the checkout if provided (light GC; aggressive is too slow).
-      cwd ? `cd ${shq(cwd)} && git gc --prune=now 2>/dev/null` : "",
+      cwd ? asService(`cd ${shq(cwd)} && git gc --prune=now 2>/dev/null`) : "",
       // Report disk usage of the checkout.
       cwd ? `du -sh ${shq(cwd)} 2>/dev/null` : "",
     ]

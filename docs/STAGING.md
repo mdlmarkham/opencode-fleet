@@ -23,10 +23,18 @@ checkout back to the worker (`chown -R` as its last step, issue #71); this runbo
 `fleet_cleanup { nodes: [...], cwd: "<checkout>" }` returns, per node, an `ownership` report: how
 many worktree and `.git` paths are not owned by the node's service user, with a warning and the
 exact `chown` to run. It is **report-only**: the fix is a privileged `chown -R`, which stays an
-operator step. It needs the node's `serviceUser` (or `user`) in the `nodes` config, and it reads
-as the SSH login user, so a login user that cannot read part of the tree undercounts; run it as a
-user that can (typically root) when in doubt. An unknown service user or an unparseable probe is
-reported as an error, never as a clean checkout.
+operator step.
+
+- It needs the node's **`serviceUser`** in the `nodes` config. The login `user` is deliberately
+  not used as a fallback: it is the SSH login (often root), not the worker, and measuring against it
+  can read a poisoned checkout as clean or propose a `chown` back to root.
+- The probe runs **as the service user** (`sudo -n -u <serviceUser>`), the same pattern as the cwd
+  and install checks, so a tree under the service user's private home is fully readable. If
+  `sudo -n` is not allowed for the login user, the report says it could not read the probe.
+- It runs **before** the `git gc` in the same call, and that `gc` now runs as the service user too
+  (it used to run as the login user and left root-owned files in `.git`).
+- A missing directory, a directory with no `.git`, an unknown service user, or unparseable output
+  is an **error**, never a clean checkout.
 
 ## Not done here
 
