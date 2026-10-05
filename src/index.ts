@@ -1889,6 +1889,7 @@ export default definePluginEntry({
             type: "boolean",
             description: "Escalate (stop + report) when consecutive iterations produce identical output (no progress). Default true.",
           },
+          judgeProgress: { type: "boolean", description: "Issue #165 (SHADOW): after each round, ask S1 whether it is strictly closer to done and log the estimate beside the string-diff baseline for calibration. Changes nothing about the loop. Needs `expect` and a configured `s1`; default off." },
           expect: {
             type: "object",
             additionalProperties: false,
@@ -1914,11 +1915,16 @@ export default definePluginEntry({
           timeoutMs?: number;
           successMarker?: string;
           noProgressEscalate?: boolean;
+          judgeProgress?: boolean;
           expect?: { files?: string[]; command?: string; commands?: string[]; timeoutMs?: number };
         };
         const list = await api.runtime.nodes.list();
         const node = (list.nodes ?? []).find((n) => n.displayName === p.node || n.nodeId === p.node);
         if (!node) return jsonResult(`Node "${p.node}" not found.`);
+        // Issue #165: with no gate there is nothing objective to compare rounds on.
+        if (p.judgeProgress === true && p.expect === undefined) {
+          return jsonResult({ ok: false, error: "judgeProgress needs an `expect` verification gate: without one there is nothing objective to judge progress against" });
+        }
 
         // Issue #62 review (coverage gap): fleet_iterate accepts the same
         // optional verification gate as fleet_dispatch, validated up front and
@@ -1947,6 +1953,12 @@ export default definePluginEntry({
         const iterations: Array<{ iter: number; summary?: string; handRaised?: boolean; question?: string; error?: string; verified?: boolean | null; progress?: boolean }> = [];
         let currentPrompt = p.prompt;
         let prevFingerprint = "";
+        const labelRun = (success: boolean, verified: boolean | null, iterations: number): void => {
+          if (p.judgeProgress !== true || cfg.s1 == null) return;
+          void import("./progress-judge.js").then((m) => m.recordProgressLabel(judgeKey, { verified, success, iterations }, api.rootDir ?? process.cwd())).catch(() => { /* best effort */ });
+        };
+        let prevRound: { summary?: string; error?: string; verified: boolean | null } | undefined;
+        const judgeKey = `iter-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
         // Last iteration's parsed outcome, in scope after the loop exits.
         let lastOutcome: { verified?: boolean; verifyDetails?: unknown } | null = null;
         // Issue #39 (budget slice): each iteration is a run seed counted against the same
@@ -2012,6 +2024,16 @@ export default definePluginEntry({
           const progress = i === 1 ? true : fingerprint !== prevFingerprint;
           prevFingerprint = fingerprint;
 
+          // Issue #165 (shadow): record S1's view of this round next to the baseline's. Fire-and-forget;
+          // nothing below reads it.
+          if (p.judgeProgress === true && cfg.s1 != null && i > 1 && prevRound) {
+            const previous = prevRound;
+            void import("./progress-judge.js")
+              .then((m) => m.recordProgressShadow(cfg.s1, { goal: p.prompt, previous, current: { summary: parsed.summary, error: parsed.error, verified } }, { runKey: judgeKey, iter: i, baselineProgress: progress }, api.rootDir ?? process.cwd()))
+              .catch(() => { /* never breaks the loop */ });
+          }
+          prevRound = { summary: parsed.summary, error: parsed.error, verified };
+
           iterations.push({
             iter: i,
             summary: parsed.summary,
@@ -2046,11 +2068,13 @@ export default definePluginEntry({
           const markerSeen = p.successMarker ? (parsed.summary ?? "").includes(p.successMarker) : false;
           const success = (p.successMarker ? markerSeen && !looksFailed : !looksFailed) && verified !== false;
           if (success) {
+            labelRun(true, verified, i);
             return jsonResult(withVerified({ iterations, done: true, success: true, finalSummary: parsed.summary }, parsed));
           }
 
           // NO-PROGRESS escalation: same output as last iteration → stop, don't burn tokens.
           if (escalateOnNoProgress && i > 1 && !progress) {
+            labelRun(false, verified, i);
             // Issue #103: every return shape goes through withVerified —
             // `verified`/`verifyDetails` are ALWAYS present here too (null when
             // no gate ran), matching the helper's contract.
@@ -2090,6 +2114,7 @@ export default definePluginEntry({
           ].join("\n");
         }
 
+        labelRun(false, prevRound?.verified ?? null, iterations.length);
         return jsonResult(
           withVerified({ iterations, done: true, success: false, note: `exceeded ${maxIter} iterations` }, lastOutcome),
         );
