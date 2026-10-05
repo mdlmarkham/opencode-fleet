@@ -13,6 +13,16 @@
  * Sync back:
  *   1. Worker creates a bundle of its changes
  *   2. Manager pulls the bundle, applies, and pushes to GitHub with its creds
+ *
+ * Issue #152: `git clone <bundle>` leaves the checkout's `origin` pointing at
+ * the TRANSIENT staging path (…/state/xfer-<id>/bundle) that is deleted right
+ * after provisioning — so every later `git fetch`/`pull` on the node failed
+ * with "does not appear to be a git repository" and the node silently ran
+ * against a stale base with no usable upstream. The node unpack path now
+ * resets `origin` to a STABLE remote (the manager's known repo URL), installs
+ * a clearly-marked placeholder when no stable remote is determinable, and a
+ * preflight reports the checkout's real origin state in the result — an
+ * unfetchable origin is never silently ignored.
  */
 
 import { execFile } from "node:child_process";
@@ -59,6 +69,153 @@ export function normalizeRepo(repo: string): string {
     }
     // Unknown shape — hand it back unchanged rather than guessing.
     return r;
+}
+
+/**
+ * Issue #152: the placeholder remote left on a node checkout when NO stable
+ * repo URL is known. It names the situation plainly (a bundle-provisioned
+ * checkout with no persistent upstream) and lives under an invalid scheme so
+ * any accidental fetch/push fails fast with a legible reason instead of
+ * pointing at a transient path that silently rots.
+ */
+export const UNSET_ORIGIN_PLACEHOLDER = "fleet://unset-origin/issue152";
+
+/**
+ * Issue #152: whether a git remote URL points at TRANSIENT provisioning
+ * staging rather than a persistent upstream. Covers both transient shapes the
+ * plugin creates: the per-run private staging dir's bundle
+ * (`<state>/xfer-<id>/bundle`, the issue-#63 layout both provision paths use)
+ * and the channel accumulation bundle (`<state>/xfer-<id>.bundle`). Used to
+ * DETECT the bug and to guard the preflight against "verifying" an origin
+ * that is about to vanish.
+ */
+export function isTransientGitPath(url: string): boolean {
+  const u = url.trim().replace(/\/+$/, "");
+  if (/\/xfer-[A-Za-z0-9_-]{1,64}\/bundle(?:\.git)?$/.test(u)) return true;
+  if (/\/xfer-[A-Za-z0-9_-]{1,64}\.bundle$/.test(u)) return true;
+  return false;
+}
+
+/**
+ * Issue #152: the stable remote for a provisioned checkout.
+ *
+ * The bundle is the transport, never the upstream: the manager knows the real
+ * repo URL (the `repo` argument it cloned from), so the node's `origin` must
+ * be that. A transient bundle path is refused; an empty value yields undefined
+ * so the caller installs the placeholder and REPORTS it. The shorthand form
+ * `owner/repo` is normalized to the HTTPS GitHub URL the manager would clone,
+ * so the remote survives staging cleanup even when the caller passed the
+ * shorthand.
+ */
+export function stableOriginFor(repo: string): string | undefined {
+  const r = repo.trim();
+  if (!r) return undefined;
+  const url = normalizeRepo(r);
+  if (isTransientGitPath(url)) return undefined;
+  return url;
+}
+
+/**
+ * Issue #152: shell fragment that points a checkout's `origin` at a STABLE
+ * remote. Runs on the node right after the bundle clone (whose origin is the
+ * transient staging bundle by construction): rewrites `origin` to `repoUrl`
+ * when known, otherwise installs the clearly-marked placeholder — the doomed
+ * xfer path is never left in place. Values are shell-quoted.
+ */
+export function stableOriginCommand(cwd: string, repoUrl?: string): string {
+  const url = repoUrl ?? UNSET_ORIGIN_PLACEHOLDER;
+  return [
+    `cd ${shq(cwd)}`,
+    `&& { git remote set-url origin ${shq(url)} 2>/dev/null`,
+    `|| git remote add origin ${shq(url)}; }`,
+    `;`,
+    // Sentinels, not bare output: the unpack chain's stdout is parsed
+    // downstream (the commit SHA is its last hex line), so bare values here
+    // would leak into the provisioned `commit` field (issue #152).
+    `echo "---FLEET_STABLE_ORIGIN=$(git remote get-url origin 2>/dev/null)"`,
+  ].join(" ");
+}
+
+/** Marker echoed by stableOriginCommand() with the effective origin URL. */
+export const STABLE_ORIGIN_SENTINEL = "---FLEET_STABLE_ORIGIN=";
+
+/** The effective origin URL from stableOriginCommand() output (null when unparseable or empty). */
+export function parseStableOriginSentinel(out: string): string | null {
+  const line = out.split("\n").reverse().find((l) => l.includes(STABLE_ORIGIN_SENTINEL));
+  if (!line) return null;
+  const v = line.slice(line.indexOf(STABLE_ORIGIN_SENTINEL) + STABLE_ORIGIN_SENTINEL.length).trim();
+  return v.length ? v : null;
+}
+
+/**
+ * Issue #152 preflight: shell fragment that reports the checkout's REMOTE
+ * STATE as machine-readable sentinels — the effective origin URL and whether
+ * that origin is FETCHABLE (`git ls-remote origin` succeeds). Never aborts the
+ * surrounding chain: the caller decides what the sentinels mean (see
+ * parseOriginPreflight).
+ */
+export function originPreflightCommand(cwd: string): string {
+  // One fully-valid single-line shell conditional: every `then`/`else` body is
+  // `;`-terminated (a bare `then;`/`… else` across fragment joins is a shell
+  // syntax error, which would silently blank the preflight report).
+  return [
+    `cd ${shq(cwd)}`,
+    `ORIGIN=$(git remote get-url origin 2>/dev/null || echo "")`,
+    `echo "---FLEET_ORIGIN=$ORIGIN"`,
+    `if [ -n "$ORIGIN" ]; then if git ls-remote origin >/dev/null 2>&1; then echo "---FLEET_ORIGIN_RC=0"; else echo "---FLEET_ORIGIN_RC=$?"; fi; else echo "---FLEET_ORIGIN_RC=none"; fi`,
+  ].join("; ");
+}
+
+/** Parsed node-side remote state for the issue #152 preflight. */
+export interface OriginPreflight {
+  /** The checkout's effective origin URL ("" when it has none). */
+  origin: string;
+  /** true: `git ls-remote origin` succeeded; false: it failed; null: no origin exists. */
+  fetchable: boolean | null;
+  /** True when origin points at a transient provisioning staging path. */
+  transient: boolean;
+  /** Set when the preflight found a problem it could not repair (visible, never silent). */
+  warning?: string;
+}
+
+export function parseOriginPreflight(out: string): OriginPreflight {
+  const origin = out.match(/^---FLEET_ORIGIN=(.*)$/m)?.[1]?.trim() ?? "";
+  const rcRaw = out.match(/^---FLEET_ORIGIN_RC=(\S+)$/m)?.[1];
+  return {
+    origin,
+    fetchable: rcRaw === undefined ? null : rcRaw === "none" ? null : rcRaw === "0",
+    transient: isTransientGitPath(origin),
+  };
+}
+
+/**
+ * Issue #152 preflight, LOCAL form (real git, for checkouts the manager can
+ * reach directly — tests, same-host nodes): verifies the checkout's `origin`
+ * is a stable, FETCHABLE remote via `git ls-remote origin`, naming a transient
+ * provisioning staging path when that is what origin points at. ok=false means
+ * the checkout has no usable upstream; `detail` says why.
+ */
+export async function checkOriginReachable(
+  repoPath: string,
+): Promise<{ ok: boolean; origin: string; stable: boolean; detail?: string }> {
+  let origin = "";
+  try {
+    origin = (await execFileP("git", ["-C", repoPath, "remote", "get-url", "origin"], { timeout: 15_000 })).stdout.trim();
+  } catch {
+    return { ok: false, origin: "", stable: false, detail: `no readable origin remote on ${repoPath}` };
+  }
+  if (!origin) {
+    return { ok: false, origin: "", stable: false, detail: `no origin remote configured on ${repoPath}` };
+  }
+  if (isTransientGitPath(origin)) {
+    return { ok: false, origin, stable: false, detail: `origin on ${repoPath} points at a transient provisioning staging path (${origin}) that will not survive cleanup (issue #152)` };
+  }
+  try {
+    await execFileP("git", ["-C", repoPath, "ls-remote", "origin"], { timeout: 60_000 });
+    return { ok: true, origin, stable: true };
+  } catch (err) {
+    return { ok: false, origin, stable: false, detail: `git ls-remote origin failed on ${repoPath}: ${((err as Error).message.split("\n")[0] || "").slice(0, 300)}` };
+  }
 }
 
 export interface ProvisionRequest {
@@ -134,6 +291,19 @@ export interface ProvisionResult {
   viaChannel?: boolean;
   /** Result of the optional repo-declared setup step (issue #19). */
   setup?: { ran: boolean; command?: string; ok?: boolean; output?: string; error?: string };
+  /**
+   * Issue #152: the STABLE remote the node checkout's `origin` was pointed at
+   * (the manager's repo URL), replacing the transient bundle path a bare
+   * `git clone <bundle>` leaves behind. The placeholder value
+   * `fleet://unset-origin/issue152` means no stable URL was determinable.
+   */
+  stableOrigin?: string;
+  /** Issue #152: true when no stable repo URL was known and the placeholder was installed instead. */
+  originUnset?: boolean;
+  /** Issue #152: present only when the node's origin needs operator attention. */
+  originWarning?: string;
+  /** Issue #152: parsed origin state reported by the preflight (when run). */
+  originPreflight?: OriginPreflight;
 }
 
 /**
@@ -144,6 +314,8 @@ export async function createRepoBundle(req: ProvisionRequest): Promise<{
   bundlePath: string;
   branch: string;
   commit: string;
+  /** Issue #152: the stable repo URL the node checkout's `origin` is set to. */
+  stableOrigin?: string;
   error?: string;
 }> {
   const work = await mkdtemp(join(tmpdir(), "fleet-provision-"));
@@ -155,7 +327,12 @@ export async function createRepoBundle(req: ProvisionRequest): Promise<{
     // Clone with manager credentials (uses ambient gh/git auth).
     // Full clone (no --depth) so the bundle carries complete history the
     // worker can traverse.
-    await execFileP("git", ["clone", "--branch", branch, "--", normalizeRepo(req.repo), cloneDir], {
+    const repoUrl = normalizeRepo(req.repo);
+    // Issue #152: the clone URL — not the transient bundle path — is the only
+    // upstream the node checkout may keep pointing at after staging cleanup.
+    const stableOrigin = stableOriginFor(repoUrl);
+    if (!stableOrigin) throw new Error(`repo ${JSON.stringify(req.repo.slice(0, 120))} resolves to a transient path, not a stable remote`);
+    await execFileP("git", ["clone", "--branch", branch, "--", repoUrl, cloneDir], {
       timeout: 300_000,
     });
 
@@ -169,7 +346,7 @@ export async function createRepoBundle(req: ProvisionRequest): Promise<{
       timeout: 120_000,
     });
 
-    return { bundlePath, branch, commit };
+    return { bundlePath, branch, commit, stableOrigin };
   } catch (err) {
     return { bundlePath: "", branch: req.branch ?? "main", commit: "", error: (err as Error).message };
   }
@@ -364,10 +541,21 @@ export async function provisionToNode(
     // aggressive GC is too slow for large repos and belongs in fleet_cleanup.
     // Uses the node channel when the bundle arrived via channel (SSH-free
     // nodes, e.g. Windows) or when SSH unpack fails.
+    // Issue #152: the bundle clone leaves `origin` at the transient staging
+    // bundle path that is DELETED right after this call — so every later
+    // `git fetch`/`pull` on the node would fail. `stableOriginCommand` runs
+    // right after the clone and repoints `origin` at the manager's known repo
+    // URL (or the issue-#152 placeholder when none is known): the bundle is a
+    // one-shot fetch source, never the upstream.
+    const stableOrigin = stableOriginFor(req.repo);
+    if (!stableOrigin) throw new Error(`repo ${JSON.stringify(req.repo.slice(0, 120))} resolves to a transient path, not a stable remote`);
     const unpackCmd = [
       `rm -rf ${shq(req.cwd)}`,
       `mkdir -p ${shq(req.cwd)}`,
       `git clone -q ${shq(remoteBundle)} ${shq(req.cwd)}`,
+      // Issue #152: repair `origin` INSIDE the fresh checkout BEFORE any later
+      // step could rely on it; the commit checkout still follows the clone.
+      stableOriginCommand(req.cwd, stableOrigin),
       req.commit ? `cd ${shq(req.cwd)} && git checkout -q ${shq(req.commit)}` : "",
       `cd ${shq(req.cwd)} && git gc --prune=now 2>/dev/null`,
       // Issue #71: hand the checkout to the worker principal and verify it.
@@ -380,8 +568,12 @@ export async function provisionToNode(
 
     let unpackOut = "";
     if (shippedViaChannel && channelInvoke) {
+      // Issue #152: the channel __UNPACK__ op now receives the stable repo URL
+      // and installs it as `origin` right after the bundle clone (the node's
+      // handler mirrors the SSH-path repair). The manager repairs the SSH path
+      // itself; here we hand the node what it needs.
       const res = (await channelInvoke(
-        { prompt: "__UNPACK__", cwd: req.cwd, transport: "http", transferId, commit: req.commit, sha256: bundleSha256 },
+        { prompt: "__UNPACK__", cwd: req.cwd, transport: "http", transferId, commit: req.commit, sha256: bundleSha256, stableOrigin },
         180_000,
       )) as { payload?: unknown };
       const pl = typeof res?.payload === "string" ? JSON.parse(res.payload) : (res?.payload ?? {});
@@ -391,7 +583,28 @@ export async function provisionToNode(
       const { stdout } = await execFileP("ssh", [...sshPrefix(nodeHost, SSH_ARGS), unpackCmd], {
         timeout: 120_000,
       });
-      unpackOut = stdout.trim();
+      // The chain ends with `git rev-parse HEAD`, so the last stdout line is
+      // the commit SHA; intermediate sentinel lines (safe.directory, the
+      // stable-origin echo) stay out of the reported `commit` field — same
+      // shape the channel path returns.
+      unpackOut = stdout.trim().split("\n").pop() ?? "";
+      // Issue #152 preflight/repair: read back the node's post-provision origin
+      // state. A transient `xfer-*` staging path still in place (e.g. a node
+      // predating the repair) is repaired NOW, to the stable remote — never
+      // silently left pointing at staging that cleanup is about to delete.
+      try {
+        const { stdout: preOut } = await execFileP("ssh", [...sshPrefix(nodeHost, SSH_ARGS), originPreflightCommand(req.cwd)], {
+          timeout: 30_000,
+        });
+        const pre = parseOriginPreflight(preOut);
+        if (pre.transient) {
+          await execFileP("ssh", [...sshPrefix(nodeHost, SSH_ARGS), stableOriginCommand(req.cwd, stableOrigin)], {
+            timeout: 30_000,
+          });
+        }
+      } catch {
+        // Best-effort: the provision itself (clone+unpack) already succeeded.
+      }
     }
 
     // Optional repo-declared setup step (issue #19): run the repo's own
@@ -437,11 +650,16 @@ export async function provisionToNode(
       }
     }
 
+    // Issue #152: report the origin we left behind. A stable URL (or the
+    // placeholder when none was known) is the ONLY value a provisioned node
+    // may keep pointing at after the transient staging bundle is deleted.
     return {
       ok: true,
       cwd: req.cwd,
       branch: req.branch ?? "main",
       commit: unpackOut,
+      stableOrigin,
+      ...(stableOrigin === UNSET_ORIGIN_PLACEHOLDER ? { originUnset: true, originWarning: `no stable repo URL is known for this checkout; origin was set to the placeholder ${UNSET_ORIGIN_PLACEHOLDER} — pass a repo URL with fleet_provision so the node can pull updates` } : {}),
       ...(shippedViaChannel ? { viaChannel: true } : {}),
       ...(setupResult ? { setup: setupResult } : {}),
     };
@@ -484,7 +702,11 @@ export async function syncFromNode(
   prebuilt?: { mode: "from-base64"; base64: string; branch?: string; base?: string; workerBranch?: string; destBranch?: string },
   destBranchPinned?: string,
   syncPolicy?: Partial<SyncPolicy>,
-): Promise<ProvisionResult & { synced?: boolean; uncommittedFiles?: number; detail?: string; redirectedFrom?: string }> {
+): Promise<ProvisionResult & { synced?: boolean; uncommittedFiles?: number; detail?: string; redirectedFrom?: string;
+  /** Issue #152: parsed origin state of the node checkout (SSH path preflight). */
+  originPreflight?: OriginPreflight;
+  /** Issue #152: set when the preflight found a transient origin and repaired it. */
+  originRepairedTo?: string; }> {
   const policy = resolvePolicy(syncPolicy);
   for (const [kind, v] of [["branch", branch], ["destination branch", destBranchPinned]] as const) {
     if (v !== undefined && !isSafeBranchName(v)) {
@@ -554,7 +776,33 @@ export async function syncFromNode(
   // Issue #63: node-side staging, resolved ON the node inside the SSH path —
   // a per-run PRIVATE dir under the node's fleet state dir (or "" if unset).
   let remoteStageDir = "";
+  // Issue #152: preflight result for the node checkout's origin (SSH path only;
+  // the from-base64 path runs on the manager and reads no node remotes).
+  let originPreflight: OriginPreflight | undefined;
+  let originRepair: string | undefined;
   try {
+    // Issue #152 preflight/repair (SSH path): a checkout provisioned by an
+    // older manager can still carry the DEAD transient staging origin, which
+    // makes every `git fetch`/`pull` fail and fleet_resume reads misleading.
+    // BEFORE any node reads, detect a transient `xfer-*` origin, WARN, and
+    // repair it to the stable repo URL this sync already knows.
+    if (prebuilt?.mode !== "from-base64") {
+      const { stdout: preOut } = await execFileP("ssh", [...sshPrefix(nodeHost, SSH_ARGS), originPreflightCommand(cwd)], {
+        timeout: 30_000,
+      });
+      originPreflight = parseOriginPreflight(preOut);
+      if (originPreflight.transient) {
+        const stable = stableOriginFor(repo);
+        await execFileP("ssh", [...sshPrefix(nodeHost, SSH_ARGS), stableOriginCommand(cwd, stable)], {
+          timeout: 30_000,
+        });
+        originRepair = stable ?? UNSET_ORIGIN_PLACEHOLDER;
+      } else if (originPreflight.fetchable === false) {
+        // Not transient, but unfetchable (dead remote, networkless URL): WARN
+        // instead of silently proceeding against an unusable upstream.
+        originPreflight.warning = `origin on ${nodeHost}:${cwd} (${originPreflight.origin}) is not fetchable; workers cannot pull updates from it`;
+      }
+    }
     if (prebuilt?.mode === "from-base64") {
       // SSH-free path: the manager already holds the worker's bundle as base64.
       // Guard: an empty/whitespace payload means the worker's __BUNDLE__ step
@@ -927,6 +1175,8 @@ export async function syncFromNode(
         commit: "no-changes",
         synced: false,
         uncommittedFiles: uncommitted,
+        ...(originPreflight ? { originPreflight } : {}),
+        ...(originRepair ? { originRepairedTo: originRepair } : {}),
         detail: `worker branch "${workerBranch}" carried no commits new to origin/${destBranch} — nothing pushed`,
       };
     }
@@ -939,6 +1189,8 @@ export async function syncFromNode(
       synced: true,
       ...(redirectedFrom ? { redirectedFrom } : {}),
       uncommittedFiles: uncommitted,
+      ...(originPreflight ? { originPreflight } : {}),
+      ...(originRepair ? { originRepairedTo: originRepair } : {}),
       detail: uncommitted > 0
           ? `committed ${uncommitted} uncommitted file(s) on node, then pushed worker branch "${destBranch}"`
           : `pushed worker branch "${destBranch}"`,
