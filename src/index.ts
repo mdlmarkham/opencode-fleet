@@ -645,8 +645,10 @@ export default definePluginEntry({
           const loginUser = (node as { member?: { user?: string } }).member?.user;
           const sshHost = loginUser ? `${loginUser}@${nodeKey}` : nodeKey;
           // Issue #105: the same host string the ssh cwd probe uses — the
-          // isolation-capability probe targets the node through one path.
-          const entryHostForCaps = (node as { remoteIp?: string }).remoteIp ?? sshHost;
+          // isolation-capability probe targets the node through one path
+          // (`loginUser@nodeKey` when a login user is set), as the worker
+          // principal (`svcUser`) runs there (issue #164).
+          const entryHostForCaps = sshHost;
           let exampleRoot: string | undefined;
           try { exampleRoot = resolveFleetRoot(cfg, [svcUser]); } catch { /* a bad fleetRoot is reported by provisioning */ }
           if (looksWorkerInaccessible(p.cwd, svcUser)) {
