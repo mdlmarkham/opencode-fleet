@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { fakeSsh, loadEntry, loadPlugin, nodeReply, type Loaded } from "./testkit/plugin.js";
+import { fakeSshMultiline, loadEntry, loadPlugin, nodeReply, type Loaded } from "./testkit/plugin.js";
 import { loadLedger } from "./ledger.js";
 
 const entry = await loadEntry();
@@ -11,7 +11,11 @@ it.skipIf(!process.env.CI)("CI: the plugin entry loads, so the isolation tool te
 describe.skipIf(!entry)("fleet_dispatch isolation (tool level)", () => {
   let p: Loaded | undefined;
   let restore: (() => void) | undefined;
-  beforeEach(() => { restore = fakeSsh("FLEET_CWD=ok"); });
+  // Issue #105: the fake node now also models a working git clone (the
+  // dispatch-time isolation-capability probe reads GITCLONE= from the same
+  // fake ssh — real newlines, which fakeSsh cannot emit). Bwrap is absent
+  // (no echo => unusable), matching a clone-only node.
+  beforeEach(() => { restore = fakeSshMultiline(["FLEET_CWD=ok", "GITCLONE=yes"]); });
   afterEach(() => { p?.dispose(); p = undefined; restore?.(); });
   const NODES = [{ nodeId: "n-dev2", displayName: "dev2", connected: true, invocableCommands: ["opencode.run"] }];
   const cfg = (extra: Record<string, unknown> = {}) => ({ nodes: { dev2: { roles: ["worker"], ssh: false } }, ...extra });

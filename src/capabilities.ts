@@ -43,6 +43,24 @@ export interface NodeCapabilities {
     /** True when PEP 668 marks the system env externally-managed. */
     externallyManaged?: boolean;
   };
+  /**
+   * Isolation capabilities (issue #105 capability probe). Both booleans and
+   * the `isolationLevels` list are derived from the SAME single SSH fact pass
+   * as the rest of the record — the probe command echoes GITCLONE/BWRAP facts
+   * alongside CPU/MEM/etc.
+   */
+  /** True when the node has a working `git` (probed via `git --version`). */
+  gitClone?: boolean;
+  /**
+   * True when `bwrap` is present AND usable (probed via `bwrap --version`;
+   * a present-but-broken binary — non-zero exit — counts as absent).
+   */
+  bwrap?: boolean;
+  /**
+   * Isolation levels the node can honour: "clone" when gitClone, "bwrap" only
+   * when bwrap is usable. Derived from the booleans above by deriveIsolationLevels.
+   */
+  isolationLevels?: string[];
   error?: string;
 }
 
@@ -65,6 +83,13 @@ export interface CapabilityConstraint {
 export async function detectNodeCapabilities(nodeHost: string, nodeName: string, serviceUser?: string): Promise<NodeCapabilities> {
   const caps: NodeCapabilities = { node: nodeName };
   try {
+    // Isolation facts default to UNSUPPORTED (issue #105): a probe that never
+    // got the echo (partial transcript, older node) must surface an explicit
+    // false — a missing fact is never reported as a capability.
+    caps.gitClone = false;
+    caps.bwrap = false;
+    // One SSH pass collects every node fact (issues #19, #105): the whole
+    // chain is a single command, so the isolation probes add no round-trip.
     const cmd = [
       `echo "CPU=$(nproc)"`,
       `echo "MEM=$(free -g | awk '/Mem:/{print $2}')"`,
@@ -77,6 +102,14 @@ export async function detectNodeCapabilities(nodeHost: string, nodeName: string,
       `echo "PYVENV=$(python3 -c 'import ensurepip' 2>/dev/null && echo yes || echo no)"`,
       `echo "PYPEP668=$(python3 -c 'import sysconfig,os; p=sysconfig.get_path("stdlib"); f=os.path.join(p,"EXTERNALLY-MANAGED"); print("yes" if os.path.exists(f) else "no")' 2>/dev/null || echo unknown)"`,
       `echo "PIPUSER=$(python3 -m pip --version >/dev/null 2>&1 && echo yes || echo no)"`,
+      // Isolation capability facts (issue #105 capability probe). Part of the
+      // SAME single SSH pass as every other fact — the whole chain is one
+      // command, so no second round-trip: GITCLONE probes that git exists and
+      // works (`--version`); BWRAP probes that bwrap exists AND runs cleanly
+      // (a present-but-broken binary exits non-zero, so it counts as absent —
+      // usable-ness, not mere presence).
+      `echo "GITCLONE=$(git --version >/dev/null 2>&1 && echo yes || echo no)"`,
+      `echo "BWRAP=$(bwrap --version >/dev/null 2>&1 && echo yes || echo no)"`,
     ].join(" && ");
     const { stdout } = await execFileP("ssh", [...sshPrefix(nodeHost, SSH_ARGS), cmd], {
       timeout: 30_000,
@@ -117,6 +150,12 @@ export async function detectNodeCapabilities(nodeHost: string, nodeName: string,
           break;
         case "PIPUSER":
           break;
+        case "GITCLONE":
+          caps.gitClone = val === "yes";
+          break;
+        case "BWRAP":
+          caps.bwrap = val === "yes";
+          break;
       }
     }
 
@@ -134,6 +173,10 @@ export async function detectNodeCapabilities(nodeHost: string, nodeName: string,
         py.pipStrategy = "none";
       }
     }
+
+    // Isolation levels (issue #105 capability probe): derived from the SAME
+    // probed facts (gitClone/bwrap) via the shared pure helper.
+    caps.isolationLevels = deriveIsolationLevels(caps.gitClone ?? false, caps.bwrap ?? false);
 
     // Read the node's OpenCode model catalog, and report whether the deny
     // baseline is present (issue #51 slice 2). The config lives on the NODE,
@@ -182,6 +225,59 @@ export async function detectNodeCapabilities(nodeHost: string, nodeName: string,
     return caps;
   } catch (err) {
     return { node: nodeName, error: (err as Error).message };
+  }
+}
+
+/**
+ * The isolation levels a node supports from the probed booleans (issue #105).
+ *
+ * Pure so the derivation rule is unit-testable without a node. "clone" needs a
+ * working git clone; "bwrap" ONLY when bubblewrap is present AND usable — a
+ * present-but-broken bwrap is as good as absent (fleet_dispatch refuses an
+ * isolation level the node cannot actually honour, never downgrades).
+ */
+export function deriveIsolationLevels(gitClone: boolean, bwrap: boolean): string[] {
+  const levels: string[] = [];
+  if (gitClone) levels.push("clone");
+  if (bwrap) levels.push("bwrap");
+  return levels;
+}
+
+/**
+ * Read the isolation facts out of a fake/real probe transcript (issue #105).
+ *
+ * Pure and independent of the full parse: `GITCLONE=yes|no`, `BWRAP=yes|no`.
+ * A missing echo counts as "no" (the fact was not collected — treat as
+ * unsupported rather than assuming support).
+ */
+export function parseIsolationFacts(output: string): { gitClone: boolean; bwrap: boolean } {
+  const val = (key: string): boolean => {
+    const line = output.split("\n").find((l) => l.includes(`${key}=`));
+    if (!line) return false;
+    return line.slice(line.indexOf(`${key}=`) + key.length + 1).trim() === "yes";
+  };
+  return { gitClone: val("GITCLONE"), bwrap: val("BWRAP") };
+}
+
+/**
+ * Probe ONLY the isolation facts over SSH (one round-trip — the same
+ * GITCLONE/BWRAP echoes the full pass uses, just alone). Used by
+ * fleet_dispatch for the issue-#105 capability gate when the per-dispatch
+ * isolation was not already established elsewhere.
+ */
+export async function probeIsolationLevels(nodeHost: string, serviceUser?: string): Promise<{ gitClone: boolean; bwrap: boolean; levels: string[]; error?: string }> {
+  const cmd = [
+    `echo "GITCLONE=$(git --version >/dev/null 2>&1 && echo yes || echo no)"`,
+    `echo "BWRAP=$(bwrap --version >/dev/null 2>&1 && echo yes || echo no)"`,
+  ].join(" && ");
+  try {
+    const { stdout } = await execFileP("ssh", [...sshPrefix(nodeHost, SSH_ARGS), cmd], { timeout: 30_000 });
+    const facts = parseIsolationFacts(stdout);
+    return { ...facts, levels: deriveIsolationLevels(facts.gitClone, facts.bwrap) };
+  } catch (err) {
+    // Unreachable or probe-failing node: refuse to claim levels it may not
+    // have — the caller must fail closed on an explicitly requested level.
+    return { gitClone: false, bwrap: false, levels: [], error: (err as Error).message };
   }
 }
 
