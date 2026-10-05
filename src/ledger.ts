@@ -68,6 +68,30 @@ export interface LedgerEntry {
   scopeViolations?: string[] | null;
   /** Design-gate objections the caller acknowledged to dispatch anyway (issue #117), with their reasons. */
   gateAcknowledged?: Array<{ objectionId: string; reason: string }>;
+  /** What the run spent (issue #39: budget accounting), from its audit manifest when the manager reconciles the finished run: tokens summed, costUsd when the engine reports a cost. Absent for unfinished or pre-budget runs; a run is accounted to the UTC day it STARTED. */
+  usage?: RunUsage;
+  /** The per-dispatch caps the run was admitted under (issue #39): the dispatch override, absent when the config default applied or no budget is configured. */
+  budgetCap?: { perDispatchCostUsd?: number; perDispatchTokens?: number };
+}
+
+/** Usage a finished run is held to, ledger-side: tokens summed, cost kept when reported. */
+export interface RunUsage {
+  /** Engine-reported tokens (input+output+reasoning+cache summed when the manifest splits them). */
+  tokens?: number;
+  /** Engine-reported cost, USD. Engines that report none (Pi) leave this absent. */
+  costUsd?: number;
+}
+
+/**
+ * Read an entry's usage defensively: shape is data that may predate the field or come from an
+ * older node; absent/unknown => zero, never a guess.
+ */
+export function usageOf(entry: { usage?: unknown } | undefined): RunUsage {
+  const u = entry?.usage;
+  if (typeof u !== "object" || u === null || Array.isArray(u)) return {};
+  const rec = u as Record<string, unknown>;
+  const num = (v: unknown): number | undefined => (typeof v === "number" && Number.isFinite(v) && v > 0 ? v : undefined);
+  return { ...(num(rec.tokens) ? { tokens: num(rec.tokens) } : {}), ...(num(rec.costUsd) ? { costUsd: num(rec.costUsd) } : {}) };
 }
 
 const LEDGER_FILE = "fleet-runs.json";
