@@ -252,6 +252,11 @@
             "default": false,
             "description": "Refuse fleet_sync unless a fleet_review PASS is recorded for the exact head sha passed as `head` (issue #178). A PASS for an older sha does not count."
           },
+          "requireReviewSource": {
+            "type": "string",
+            "enum": ["spawned"],
+            "description": "With requireReview: only a PASS collected from an independent reviewer run (fleet_review prepare + collect) counts; a PASS the caller merely recorded does not (issue #177)."
+          },
           "requireVerified": {
             "type": "boolean",
             "default": false,

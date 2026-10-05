@@ -39,7 +39,11 @@ export interface ReviewFinding {
 export interface ReviewRecord {
   id: string;
   recordedAt: string;
-  source: "recorded";
+  /** `recorded`: asserted by the caller. `spawned`: collected from an independent worker run (see review-spawn.ts). */
+  source: "recorded" | "spawned";
+  /** The reviewer run that produced a spawned record. */
+  runId?: string;
+  reviewerNode?: string;
   verdict: ReviewVerdict;
   headSha: string;
   pr?: number;
@@ -65,7 +69,7 @@ const tail = (v: unknown): string => redactSecrets(String(v ?? "")).trim().slice
 export type ReviewInput = Record<string, unknown>;
 
 /** Validate and normalise a submitted review. Never throws. */
-export function validateReview(raw: ReviewInput, now: Date = new Date(), id: string = `rv-${now.getTime().toString(36)}`): { ok: true; record: ReviewRecord } | { ok: false; error: string } {
+export function validateReview(raw: ReviewInput, now: Date = new Date(), id: string = `rv-${now.getTime().toString(36)}`, meta?: { source: "spawned"; runId: string; node: string }): { ok: true; record: ReviewRecord } | { ok: false; error: string } {
   const verdict = String(raw.verdict ?? "").toUpperCase() as ReviewVerdict;
   if (!REVIEW_VERDICTS.includes(verdict)) return { ok: false, error: `verdict must be one of ${REVIEW_VERDICTS.join(", ")}` };
   const headSha = String(raw.headSha ?? "").toLowerCase();
@@ -128,7 +132,8 @@ export function validateReview(raw: ReviewInput, now: Date = new Date(), id: str
     record: {
       id,
       recordedAt: now.toISOString(),
-      source: "recorded",
+      source: meta?.source ?? "recorded",
+      ...(meta ? { runId: meta.runId, reviewerNode: meta.node } : {}),
       verdict,
       headSha,
       ...(pr !== undefined ? { pr } : {}),
@@ -155,13 +160,16 @@ export interface ReviewGate {
  * LATEST record for the sha decides, so a later FAIL or BLOCKED withdraws an earlier PASS.
  * `pr`, when given, scopes the stale diagnosis to that PR's earlier reviews.
  */
-export function reviewGate(records: ReviewRecord[], headSha: string, pr?: number): ReviewGate {
+export function reviewGate(records: ReviewRecord[], headSha: string, pr?: number, opts: { requireSource?: "spawned" } = {}): ReviewGate {
   const head = String(headSha ?? "").toLowerCase();
   if (!SHA.test(head)) return { allow: false, status: "NONE", reason: "a full 40-hex head sha is required to check for a review" };
   const forHead = records.filter((r) => r.headSha === head);
   const latest = forHead[forHead.length - 1];
   if (latest) {
-    if (latest.verdict === "PASS") return { allow: true, status: "PASS", record: latest };
+    if (latest.verdict === "PASS") {
+      if (opts.requireSource === "spawned" && latest.source !== "spawned") return { allow: false, status: "NONE", reason: `the PASS for head ${head.slice(0, 12)} was only recorded by the caller; sync.requireReviewSource is "spawned", so it must come from a collected reviewer run (fleet_review prepare, then collect)`, record: latest };
+      return { allow: true, status: "PASS", record: latest };
+    }
     const why = latest.verdict === "BLOCKED" ? "the reviewer could not run the review (BLOCKED)" : `the review FAILED with ${latest.findings.length} finding(s)`;
     return { allow: false, status: latest.verdict, reason: `${why}; a PASS for head ${head.slice(0, 12)} is required`, record: latest };
   }
