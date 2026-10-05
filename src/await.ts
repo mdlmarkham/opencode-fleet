@@ -154,3 +154,11 @@ export async function awaitRuns(runs: AwaitRun[], opts: { timeoutMs?: number; po
   const satisfied = allTerminal || (opts.until === "any" && outcomes.some((o) => o.terminal));
   return { allTerminal, timedOut: !satisfied && !deps.signal?.aborted, aborted: !satisfied && deps.signal?.aborted === true, waitedMs: now() - started, outcomes };
 }
+
+/**
+ * Appended to the runtime notes that tell an agent to use fleet_await (issue #191). A session that
+ * started before a plugin update keeps its OLD tool list, so it can be told about a tool it does not
+ * have; say what to do then instead of leaving it stuck.
+ */
+export const AWAIT_MISSING_NOTE =
+  "If your tool list has no fleet_await, your session predates a plugin update: start a new session; until then poll fleet_run_status no faster than every 15s.";

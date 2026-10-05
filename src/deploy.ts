@@ -50,10 +50,21 @@ export interface DeployRequest {
   selfCheck?: boolean;
 }
 
+/**
+ * What a caller needs to know to APPLY the build (issue #191). A `plugins reload` of the active
+ * fleet plugin did not settle in the field and left the gateway draining until an owner restart.
+ */
+export const DEPLOY_NOTES: string[] = [
+  "Apply with an owner gateway RESTART issued from outside an agent turn, not `plugins reload opencode-fleet`: a reload of the active plugin has been seen to never settle and leave the gateway draining (issue #191; see docs/DEPLOY.md).",
+  "Sessions started before the restart keep their old tool list and cannot call tools added since: start a new session.",
+];
+
 export interface DeployResult {
   ok: boolean;
   steps: Array<{ step: string; ok: boolean; detail?: string }>;
   gatewayRestartRequired: boolean;
+  /** How to apply the new build safely (issue #191). Present on a successful deploy. */
+  notes?: string[];
   error?: string;
 }
 
@@ -392,7 +403,7 @@ export async function deployPlugin(req: DeployRequest): Promise<DeployResult> {
       ok,
       steps,
       gatewayRestartRequired: true,
-      ...(ok ? {} : { error: "one or more deploy steps failed — see steps" }),
+      ...(ok ? { notes: DEPLOY_NOTES } : { error: "one or more deploy steps failed — see steps" }),
     };
   } catch (err) {
     return { ok: false, steps, gatewayRestartRequired: false, error: (err as Error).message };
