@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { deriveIsolationLevels, parseIsolationFacts, detectNodeCapabilities } from "./capabilities.js";
-import { fakeSshMultiline, loadEntry, loadPlugin, nodeReply, type Loaded } from "./testkit/plugin.js";
+import { fakeSshMultiline, loadEntry, loadPlugin, nodeReply, type FakeNode, type Loaded } from "./testkit/plugin.js";
 import { loadLedger } from "./ledger.js";
 
 /**
@@ -129,10 +132,92 @@ describe("#105: detectNodeCapabilities surfaces the isolation fields (fake ssh, 
   });
 });
 
-describe.skipIf(!process.env.CI)("#105 CI: the plugin entry loads, so the tool-level tests really ran", () => {
-  it("entry", () => {
-    expect(entry).toBeDefined();
-  });
+describe("#164: the isolation-gate probe host matches the cwd probe (loginUser set, remoteIp absent)", () => {
+  let p: Loaded | undefined;
+  let restore: (() => void) | undefined;
+  const NODES: FakeNode[] = [{
+    nodeId: "n-dev2",
+    displayName: "dev2",
+    connected: true,
+    invocableCommands: ["opencode.run"],
+    // The membership `user` (the SSH login user) lives in the CONFIG entry
+    // below — resolveFleetNodes takes `member` from config, not the node
+    // record. Deliberately NO remoteIp on the node record: the broken gate
+    // then probed bare "dev2" while the cwd probe used "walt@dev2".
+  } as unknown as (typeof NODES)[number]];
+  const cfg: Record<string, unknown> = { nodes: { dev2: { roles: ["worker"], ssh: false, user: "walt" } } };
+  const ack = () =>
+    nodeReply({ ok: true, detached: true, runId: "r", pid: 42, isolation: "clone", runCwd: "/w/.fleet-runs/r/repo", branch: "fleet/r", sourceDirty: false });
+  const dispatch = (args: Record<string, unknown>) =>
+    p!.call("fleet_dispatch", { node: "dev2", cwd: "/w/proj", prompt: "do it", ...args });
+  const nodeRes = (res: Record<string, unknown>): Record<string, unknown> => (res.dev2 ?? res["n-dev2"]) as Record<string, unknown>;
+
+  afterEach(() => { p?.dispose(); p = undefined; restore?.(); restore = undefined; });
+
+  /**
+   * A stand-in `ssh` that LOGS the host it was given (one line per call to
+   * `${FLEET_SSH_ARGLOG}`) while answering each probe with a cwd-ok,
+   * isolation-capable transcript. sshPrefix's argv is
+   * [options..., "--", host, remoteCommand], so the host is the arg right
+   * after the first `--` — logged verbatim, whatever the gate chose. This is
+   * the discriminator: with the pre-#164 code the gate's probe ran against
+   * the bare node key, with the fix it runs against `loginUser@nodeKey`.
+   */
+  const fakeSshArgLog = (): (() => void) => {
+    const dir = mkdtempSync(join(tmpdir(), "fleet-fakesshlog-"));
+    const bin = join(dir, "ssh");
+    writeFileSync(
+      bin,
+      [
+        "#!/bin/sh",
+        // Find the first `--`; the NEXT arg is the host (options may reorder,
+        // but sshPrefix guarantees "--" then host then remote command).
+        "for a; do if [ \"$seen\" = 1 ]; then printf '%s\\n' \"$a\" >> \"${FLEET_SSH_ARGLOG:?}\"; break; fi; [ \"$a\" = -- ] && seen=1; done",
+        // The cwd guard runs under sudo as the worker principal and expects
+        // the guard's own output line; then the isolation facts.
+        "printf '%s\\n' 'FLEET_CWD=ok'",
+        "printf '%s\\n' 'GITCLONE=yes'",
+        "printf '%s\\n' 'BWRAP=no'",
+        "exit 0",
+      ].join("\n") + "\n",
+      { mode: 0o755 },
+    );
+    writeFileSync(join(dir, "scp"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const prev = process.env.PATH;
+    process.env.PATH = `${dir}:${prev}`;
+    return () => {
+      process.env.PATH = prev;
+      rmSync(dir, { recursive: true, force: true });
+    };
+  };
+  const argLog = (rootDir: string): string[] => {
+    try { return readFileSync(join(rootDir, "ssh-args.log"), "utf8").split("\n").filter(Boolean); }
+    catch { return []; };
+  };
+
+  it("the gate probes the SAME host string the cwd probe uses (sshHost, not remoteIp-preferred)", async () => {
+    if (!entry) return;
+    restore = fakeSshArgLog();
+    p = loadPlugin(entry!, { nodes: NODES, config: cfg, invoke: () => ack() });
+    process.env.FLEET_SSH_ARGLOG = join(p.rootDir, "ssh-args.log");
+    try {
+      const res = nodeRes(await dispatch({ isolation: "clone" }));
+      const start = await p.waitForInvoke((c) => c.params.prompt === "__RUN_START__");
+      const hosts = argLog(p.rootDir);
+      // Failure context on every assertion, so a regression points at the argv.
+      expect(start, `dispatch result: ${JSON.stringify(res)}`).toBeDefined();
+      expect(start!.params.isolation, `dispatch result: ${JSON.stringify(res)}`).toBe("clone");
+      // The cwd probe and the capability probe both ran against the node's
+      // login-user host — the SAME string for both (issue: gate must probe
+      // the cwd probe's host, not prefer a remoteIp when it is absent, and
+      // not the bare node key when a loginUser is set).
+      const sshUserHost = "walt@dev2";
+      expect(hosts, `ssh argv hosts: ${JSON.stringify(hosts)}`).toContain(sshUserHost);
+      expect(hosts, `ssh argv hosts: ${JSON.stringify(hosts)}`).not.toContain("dev2");
+    } finally {
+      delete process.env.FLEET_SSH_ARGLOG;
+    }
+  }, 30_000);
 });
 
 describe("#105: fleet_dispatch refuses an unsupported isolation level (tool level, fake ssh + fake node)", () => {
