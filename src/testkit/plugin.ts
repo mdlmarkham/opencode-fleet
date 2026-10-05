@@ -131,6 +131,11 @@ export function fakeSsh(output: string): () => void {
   const bin = join(dir, "ssh");
   writeFileSync(bin, `#!/bin/sh\nprintf '%s\\n' ${JSON.stringify(output)}\n`);
   chmodSync(bin, 0o755);
+  // A stand-in scp that just succeeds (issue #51b tests ship baseline modules
+  // over the same faked transport).
+  const scpBin = join(dir, "scp");
+  writeFileSync(scpBin, "#!/bin/sh\nexit 0\n");
+  chmodSync(scpBin, 0o755);
   const prev = process.env.PATH;
   process.env.PATH = `${dir}:${prev}`;
   return () => {

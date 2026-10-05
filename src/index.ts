@@ -487,6 +487,45 @@ export default definePluginEntry({
         if (p.autoApprove === true && cfg.allowAutoApprove === false) {
           return jsonResult({ ok: false, error: "autoApprove is disabled by the operator (allowAutoApprove=false)" });
         }
+        // Issue #51 slice 2: gate autoApprove on what the node's opencode can
+        // actually parse. Probe `run --help` / `--version` per opencode target
+        // and run the pure autoApproveGate predicate: an unsupported --auto is
+        // REFUSED (never appended unparseable), a node without the deny
+        // baseline proceeds with a warning. Default behavior (autoApprove not
+        // set) never enters this branch — byte-identical dispatch.
+        const autoApproveNodes = new Map<string, { nodeName: string; host: string; probe: { version?: string; helpText?: string } }>();
+        const autoApproveWarnings: Record<string, string[]> = {};
+        if (p.autoApprove === true) {
+          const autoUtil = await import("node:util");
+          const autoCp = await import("node:child_process");
+          const autoExecFileP = autoUtil.promisify(autoCp.execFile);
+          const { SSH_ARGS: probeSshArgs } = await import("./ssh.js");
+          const autoProbeSsh = async (host: string, command: string): Promise<string> => {
+            try {
+              const { stdout } = await autoExecFileP("ssh", [...sshPrefix(host, probeSshArgs), command], { timeout: 30_000 });
+              return stdout;
+            } catch (e) {
+              return (e as { stdout?: string }).stdout ?? "";
+            }
+          };
+          for (const node of targets) {
+            const nodeName = node.displayName ?? node.nodeId;
+            const host = node.remoteIp ?? nodeName;
+            if ((node as { invocableCommands?: string[] }).invocableCommands?.includes("opencode.run")) {
+              const helpText = await autoProbeSsh(host, "opencode run --help 2>/dev/null || true");
+              const version = await autoProbeSsh(host, "opencode --version 2>/dev/null || true");
+              autoApproveNodes.set(nodeName, { nodeName, host, probe: { version, helpText } });
+            } else {
+              const { detectNodeCapabilities } = await import("./capabilities.js");
+              const caps = await detectNodeCapabilities(host, nodeName);
+              autoApproveNodes.set(nodeName, {
+                nodeName,
+                host,
+                probe: { version: caps.opencode && caps.opencode !== "none" ? caps.opencode : "" },
+              });
+            }
+          }
+        }
         // Issue #62: validate the optional verification gate up front so a
         // malformed spec is a clear refusal, never a silently-dropped gate.
         const { parseExpectSpec, withVerified, relayTimeoutWithGate } = await import("./verify.js");
@@ -570,10 +609,32 @@ export default definePluginEntry({
         };
         for (const node of opencodeTargets) {
           const runId = newRunId();
+          // Issue #51 slice 2: per-node autoApprove gate. Runs BEFORE any ledger
+          // write so a refusal leaves no run record.
+          const nodeName = node.displayName ?? node.nodeId;
+          if (p.autoApprove === true) {
+            const entry = autoApproveNodes.get(nodeName);
+            const { autoApproveGate } = await import("./deny-baseline.js");
+            const { detectNodeCapabilities } = await import("./capabilities.js");
+            const capsForBaseline = entry
+              ? await detectNodeCapabilities(entry.host, nodeName).catch(() => null)
+              : null;
+            const gate = autoApproveGate({
+              autoApprove: true,
+              nodeName,
+              probe: entry?.probe,
+              denyBaseline: capsForBaseline?.denyBaseline === true,
+            });
+            if (!gate.ok) {
+              results[nodeName] = { ok: false, error: gate.error };
+              continue;
+            }
+            if (gate.warning) autoApproveWarnings[nodeName] = [gate.warning];
+          }
           // Issue #26: refuse an unusable cwd BEFORE recording a run or
           // dispatching. Check as the worker principal; a fast path-only check
           // catches the common /root case without an SSH round trip.
-          const nodeKey = node.displayName ?? node.nodeId;
+          const nodeKey = nodeName;
           const svcUser = (node as { member?: { serviceUser?: string; user?: string } }).member?.serviceUser
             ?? (node as { member?: { user?: string } }).member?.user;
           const loginUser = (node as { member?: { user?: string } }).member?.user;
@@ -781,6 +842,7 @@ export default definePluginEntry({
                   recoveredFromTimeout: true,
                   probe: recovery.verdict,
                   note: recovery.note,
+                  ...(autoApproveWarnings[nodeName] ? { warnings: autoApproveWarnings[nodeName] } : {}),
                 };
                 continue;
               }
@@ -799,6 +861,7 @@ export default definePluginEntry({
                 probe: recovery.verdict,
                 error: nodeRejected ? `launch failed: ${errMsg}` : `launch ack not received: ${errMsg}`,
                 note: recovery.note,
+                ...(autoApproveWarnings[nodeName] ? { warnings: autoApproveWarnings[nodeName] } : {}),
               };
               continue;
             }
@@ -829,6 +892,7 @@ export default definePluginEntry({
                     : {}),
                 ackPending: false,
                 note: "Worker launched detached and survives relay timeouts. Poll with fleet_run_status(runId) or fleet_watch; fleet_resume finds it after interruptions.",
+                ...(autoApproveWarnings[nodeName] ? { warnings: autoApproveWarnings[nodeName] } : {}),
               };
               continue;
             }
@@ -841,6 +905,7 @@ export default definePluginEntry({
               ackPending: true,
               note:
                 "Launch ack not received — the run may not have started. Verify with fleet_run_status(runId) before relying on this handle.",
+              ...(autoApproveWarnings[nodeName] ? { warnings: autoApproveWarnings[nodeName] } : {}),
             };
             continue;
           }
@@ -959,6 +1024,7 @@ export default definePluginEntry({
               runId,
               result: dispatchResult,
               treeState,
+              ...(autoApproveWarnings[nodeName] ? { warnings: autoApproveWarnings[nodeName] } : {}),
               ...(s1Triage ? { s1: { triage: s1Triage } } : {}),
               ...(typeof parsedResult.verified === "boolean" && parsedResult.verified === false
                 ? {
@@ -1897,7 +1963,7 @@ export default definePluginEntry({
       name: "fleet_provision_config",
       label: "Fleet Provision Config",
       description:
-        "Ship OpenCode agent definitions, global rules (AGENTS.md), skills, and opencode.json to fleet nodes so workers work consistently with the manager. The manager holds the source-of-truth config; workers get it via SSH (no worker credentials needed).",
+        "Ship OpenCode agent definitions, global rules (AGENTS.md), skills, and opencode.json to fleet nodes so workers work consistently with the manager. The manager holds the source-of-truth config; workers get it via SSH (no worker credentials needed). Opt-in installDenyBaseline merges the node-side deny-rule baseline (issue #51) into each node's opencode.json — merge-only and idempotent, never overwriting unrelated keys.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -1911,10 +1977,14 @@ export default definePluginEntry({
             type: "string",
             description: "Local dir containing agents/, skills/, AGENTS.md, opencode.json to ship. Defaults to plugin's config dir.",
           },
+          installDenyBaseline: {
+            type: "boolean",
+            description: "OPT-IN (issue #51): after shipping, merge the deny-rule baseline into the node's ~/.config/opencode/opencode.json (union of deny rules; never overwrites unrelated keys; idempotent). Default false — behavior unchanged.",
+          },
         },
       },
       execute: async (toolCallId, params, signal) => {
-        const p = params as { nodes?: string[]; configDir?: string };
+        const p = params as { nodes?: string[]; configDir?: string; installDenyBaseline?: boolean };
         const { provisionConfigToNode, discoverLocalConfig } = await import("./config-provision.js");
         const list = await api.runtime.nodes.list();
         const nodes = list.nodes ?? [];
@@ -1939,7 +2009,10 @@ export default definePluginEntry({
         const results: Record<string, unknown> = {};
         for (const node of targets) {
           const host = node.remoteIp ?? node.displayName ?? node.nodeId;
-          results[node.displayName ?? node.nodeId] = await provisionConfigToNode(host, local);
+          results[node.displayName ?? node.nodeId] = await provisionConfigToNode(host, {
+            ...local,
+            ...(p.installDenyBaseline === true ? { installDenyBaseline: true } : {}),
+          });
         }
         return jsonResult(results);
       },
@@ -2494,7 +2567,7 @@ export default definePluginEntry({
       name: "fleet_capabilities",
       label: "Fleet Capabilities",
       description:
-        "Detect and report each fleet node's capabilities (CPU, RAM, disk, GPU, installed tools, available models). Use this to route work to nodes that can handle it, especially when nodes have diverging capabilities.",
+        "Detect and report each fleet node's capabilities (CPU, RAM, disk, GPU, installed tools, available models, and whether the issue-#51 deny-rule baseline is installed in the node's opencode config, as denyBaseline). Use this to route work to nodes that can handle it, especially when nodes have diverging capabilities.",
       parameters: {
         type: "object",
         additionalProperties: false,

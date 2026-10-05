@@ -25,6 +25,12 @@ export interface NodeCapabilities {
   models?: string[];
   opencode?: string;
   /**
+   * True when the node's opencode config carries the full issue-#51 deny-rule
+   * baseline (checked with baselinePresent against the same opencode.json the
+   * model catalog is read from). false when the config is missing/unparseable.
+   */
+  denyBaseline?: boolean;
+  /**
    * Python environment facts (issue #19). A manager needs these to pick a
    * working dependency-install strategy per node — the fleet nodes differ
    * (PEP 668 vs bare venv), and the same command fails on one of them.
@@ -131,7 +137,10 @@ export async function detectNodeCapabilities(nodeHost: string, nodeName: string)
       }
     }
 
-    // Read the node's OpenCode model catalog.
+    // Read the node's OpenCode model catalog, and report whether the deny
+    // baseline is present (issue #51 slice 2). Same file, one read: a missing
+    // or unparseable config leaves models unset and denyBaseline false.
+    const { baselinePresent } = await import("./deny-baseline.js");
     try {
       const raw = await readFile(join(homedir(), ".config", "opencode", "opencode.json"), "utf8");
       const cfg = JSON.parse(raw) as { provider?: Record<string, { models?: Record<string, unknown> }> };
@@ -142,8 +151,10 @@ export async function detectNodeCapabilities(nodeHost: string, nodeName: string)
         }
       }
       caps.models = models;
+      caps.denyBaseline = baselinePresent(cfg);
     } catch {
-      // No config — models unknown.
+      // No config — models unknown; no deny baseline either.
+      caps.denyBaseline = false;
     }
 
     return caps;
