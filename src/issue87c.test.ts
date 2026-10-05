@@ -497,7 +497,7 @@ function makeEnv(opts: {
   const invokeCalls: InvokeReq[] = [];
   const registered = new Map<string, Tool>();
   const api = {
-    pluginConfig: { nodes: { dev2: { roles: ["worker"], ssh: true, user: "svcuser" } } },
+    pluginConfig: { project: { gate: "off" }, nodes: { dev2: { roles: ["worker"], ssh: true, user: "svcuser" } } },
     rootDir: opts.rootDir,
     registerNodeInvokePolicy: () => {},
     registerTool: (tool: Tool) => {

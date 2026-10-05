@@ -98,7 +98,7 @@ describe.skipIf(!loaded)("#39: tools", () => {
   it("fan-out: a full node is skipped with no-capacity while a free node still runs", async () => {
     p = loadPlugin(loaded!, { nodes: NODES, config: cfg({}, { maxConcurrent: 1 }), invoke: ok });
     await dispatch({ node: "dev2" });
-    const r = await dispatch({});
+    const r = await dispatch({ nodes: "all" });
     expect(r.dev2).toMatchObject({ reason: "no-capacity" });
     expect(r.dev3?.reason).toBeUndefined();
     expect((await loadLedger(p.rootDir)).filter((e) => e.node === "dev3")).toHaveLength(1);

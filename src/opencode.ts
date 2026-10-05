@@ -122,6 +122,8 @@ export interface OpenCodeRunResult {
   iterations?: number;
   durationMs?: number;
   error?: string;
+  /** Which limit ended the run, when one did (issue #168): the wall-clock `timeout`, or the node's idle/duration watchdog. */
+  endedBy?: "wall-clock" | "idle-watchdog";
   /** True when the worker stopped to ask a clarifying question. */
   handRaised?: boolean;
   /** The worker's clarifying question (when handRaised). */
@@ -192,7 +194,7 @@ export function validateHarnessTransport(task: {
  */
 export function buildOpenCodeCommand(task: OpenCodeTask): string {
   const cwd = task.cwd || ".";
-  const timeout = task.timeoutMs ?? 300_000;
+  const timeout = task.timeoutMs ?? DEFAULT_RUN_TIMEOUT_MS;
   const modelFlag = task.model ? ` --model ${shq(task.model)}` : "";
   const agentFlag = task.agent ? ` --agent ${shq(task.agent)}` : "";
   // Issue #30 finding D: `--auto` auto-approves every non-denied permission.
@@ -345,7 +347,7 @@ export function parseOpenCodeOutput(raw: string, exec?: ExecStatus): OpenCodeRun
       error = cdError
         ? (raw.match(/(?:^|\n)(FLEET_ERROR:[^\n]*)/)?.[1] ?? "worker could not enter cwd")
         : timedOut
-          ? `opencode run timed out${exec.exitCode != null ? ` (exit ${exec.exitCode})` : ""}`
+          ? `opencode run timed out at the wall-clock limit${exec.exitCode != null ? ` (exit ${exec.exitCode})` : ""}`
           : stuck
             ? `opencode run killed by watchdog: ${raw.match(/\[stuck:[^\]]*\]/)?.[0] ?? "stuck"}`
             : nonzeroExit
@@ -375,9 +377,17 @@ export function parseOpenCodeOutput(raw: string, exec?: ExecStatus): OpenCodeRun
     handRaised,
     question,
     iterations: exec?.iterations ?? DEFAULT_PARSED_ITERATIONS,
+    ...(endedByOf(raw, exec) ? { endedBy: endedByOf(raw, exec) } : {}),
     diffSummary: undefined,
     error: error ? redactSecrets(error) : undefined,
   };
+}
+
+/** Which limit ended the run, from the raw output and exec status (issue #168). */
+export function endedByOf(raw: string, exec?: { timedOut?: boolean; stuck?: boolean; exitCode?: number | null }): "wall-clock" | "idle-watchdog" | undefined {
+  if (exec?.stuck === true || /(^|\n)\[stuck:/.test(raw)) return "idle-watchdog";
+  if (exec?.timedOut === true || exec?.exitCode === 124 || /(^|\n)\[timeout\]/.test(raw)) return "wall-clock";
+  return undefined;
 }
 
 /** Execution status threaded from the node shell run (issues #30, #35). */
@@ -409,6 +419,9 @@ export type PiExecStatus = ExecStatus;
  * non-zero exit, exit 124 (`timeout`), a node watchdog kill, or a
  * `FLEET_ERROR:` (cd guard) marker all yield `ok:false` with diagnostics.
  */
+/** Wall-clock backstop for a dispatched run (issue #168): real coding tasks outlive the old 5 minutes. The idle watchdog (maxIdleMs) is the primary hung-run guard. */
+export const DEFAULT_RUN_TIMEOUT_MS = 30 * 60_000;
+
 export const PI_TOOL_NAME = /^[a-z][a-z0-9_-]{0,31}$/;
 
 /** Validate the Pi restriction fields; they are interpolated into a shell command, so be strict. */
@@ -464,7 +477,7 @@ export function parsePiOutput(raw: string, exec?: ExecStatus): OpenCodeRunResult
     if (cdError) {
       error = raw.match(/(?:^|\n)(FLEET_ERROR:[^\n]*)/)?.[1] ?? "worker could not enter cwd";
     } else if (timedOut) {
-      error = `pi run timed out${exec?.exitCode != null ? ` (exit ${exec.exitCode})` : ""}`;
+      error = `pi run timed out at the wall-clock limit${exec?.exitCode != null ? ` (exit ${exec.exitCode})` : ""}`;
     } else if (stuck) {
       error = `pi run killed by watchdog: ${raw.match(/\[stuck:[^\]]*\]/)?.[0] ?? "stuck"}`;
     } else {
@@ -482,6 +495,7 @@ export function parsePiOutput(raw: string, exec?: ExecStatus): OpenCodeRunResult
     question,
     // Issue #103: real iteration count from the caller, 1 fallback for legacy calls.
     iterations: exec?.iterations ?? DEFAULT_PARSED_ITERATIONS,
+    ...(endedByOf(raw, exec) ? { endedBy: endedByOf(raw, exec) } : {}),
     ...(error ? { error } : {}),
   };
 }
@@ -555,7 +569,7 @@ function parsePiJsonOutput(raw: string, events: PiEvent[], exec?: ExecStatus): O
   let error: string | undefined;
   if (failed) {
     if (cdError) error = raw.match(/(?:^|\n)(FLEET_ERROR:[^\n]*)/)?.[1] ?? "worker could not enter cwd";
-    else if (timedOut) error = `pi run timed out${exec?.exitCode != null ? ` (exit ${exec.exitCode})` : ""}`;
+    else if (timedOut) error = `pi run timed out at the wall-clock limit${exec?.exitCode != null ? ` (exit ${exec.exitCode})` : ""}`;
     else if (stuck) error = `pi run killed by watchdog: ${raw.match(/\[stuck:[^\]]*\]/)?.[0] ?? "stuck"}`;
     else if (nonzeroExit) error = `pi run exited non-zero (exit ${exec?.exitCode})`;
     else error = `pi run failed: ${providerError ?? `stopReason ${stopReason}`}`;
@@ -570,6 +584,7 @@ function parsePiJsonOutput(raw: string, events: PiEvent[], exec?: ExecStatus): O
     ...(handRaiseMatch ? { question: sanitizeQuestion(handRaiseMatch[1]) } : {}),
     // Issue #103: real iteration count from the caller, 1 fallback for legacy calls.
     iterations: exec?.iterations ?? DEFAULT_PARSED_ITERATIONS,
+    ...(endedByOf(raw, exec) ? { endedBy: endedByOf(raw, exec) } : {}),
     ...(error ? { error } : {}),
     toolCalls,
     ...(usage ? { usage } : {}),

@@ -62,6 +62,9 @@ Ships OpenCode agent definitions, global rules (AGENTS.md), skills, and opencode
 ```text
 fleet_dispatch(prompt: "<task>", cwd: "<provisioned-dir>", nodes: ["dev2"], model: "<model-ref>", requires: {...})
 ```
+- **Name the target:** `nodes: ["dev2"]`, `nodes: "all"` to fan out on purpose, or `pick: "any"` for one node with a free slot. Leaving it out is refused (it used to run the task on every node).
+- **Give it a gate:** pass a `spec` with `verify` (or `expect`). Without one, success is only the process exit code and the result says `verification: {gate: "none"}`.
+- The default run limit is 30 minutes; you rarely need `timeoutMs`. A run killed by a limit says which one in `endedBy`.
 - `model` — allocate a specific LLM (e.g. `aperture-anthropic/deepseek-v4-flash:cloud`). HTTP transport supports per-task `--model`; ACP is config-scoped.
 - `requires` — filter nodes by capability (gpu, minDiskGb, minMemGb, tools, models) so work routes to nodes that can handle it.
 
