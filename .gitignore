@@ -13,5 +13,7 @@ dist/
 # OS
 .DS_Store
 
-# Agent scratch (issue #159)
+# Agent scratch (issues #159, #205): dispatch briefs, including the dot-prefixed fleet_sync convention
+# (.fleet-TASK-39.md). Scoped to *TASK-*.md names so the tracked .fleet/ project record is not ignored.
 TASK-*.md
+.*TASK-*.md
