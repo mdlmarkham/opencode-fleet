@@ -132,6 +132,12 @@ describe("#105: detectNodeCapabilities surfaces the isolation fields (fake ssh, 
   });
 });
 
+describe.skipIf(!process.env.CI)("#105 CI: the plugin entry loads, so the tool-level tests really ran", () => {
+  it("entry", () => {
+    expect(entry).toBeDefined();
+  });
+});
+
 describe("#164: the isolation-gate probe host matches the cwd probe (loginUser set, remoteIp absent)", () => {
   let p: Loaded | undefined;
   let restore: (() => void) | undefined;
@@ -195,8 +201,7 @@ describe("#164: the isolation-gate probe host matches the cwd probe (loginUser s
     catch { return []; };
   };
 
-  it("the gate probes the SAME host string the cwd probe uses (sshHost, not remoteIp-preferred)", async () => {
-    if (!entry) return;
+  it.skipIf(!entry)("the gate probes the SAME host string the cwd probe uses (sshHost, not remoteIp-preferred)", async () => {
     restore = fakeSshArgLog();
     p = loadPlugin(entry!, { nodes: NODES, config: cfg, invoke: () => ack() });
     process.env.FLEET_SSH_ARGLOG = join(p.rootDir, "ssh-args.log");
@@ -307,10 +312,9 @@ describe("#105: fleet_capabilities surfaces the new fields per node (tool level)
   let restore: (() => void) | undefined;
   afterEach(() => { p?.dispose(); p = undefined; restore?.(); restore = undefined; });
 
-  it("each node's result carries gitClone, bwrap and isolationLevels", async () => {
-    if (!entry) return;
+  it.skipIf(!entry)("each node's result carries gitClone, bwrap and isolationLevels", async () => {
     restore = fakeSshMultiline([...CAPS_FACTS, "GITCLONE=yes"]); // no BWRAP echo => absent
-    p = loadPlugin(entry, {
+    p = loadPlugin(entry!, {
       config: { nodes: { dev2: { roles: ["worker"], ssh: false } } },
       nodes: [{ nodeId: "n-dev2", displayName: "dev2", remoteIp: "node.example", connected: true }],
     });
