@@ -24,6 +24,14 @@ policy), so there is nothing here that should hold a drain open by itself; nodes
 process. If a reload hangs again with no agent turn in flight, that is evidence against this
 hypothesis and worth a report with the gateway logs.
 
+What this repo now pins (`src/issue191b.test.ts`), so the hypothesis stays checkable:
+
+- the plugin registers **only tools and a node invoke policy** at load (no services, widgets, gateway
+  methods or CLI) and holds no new handle; adding any other registration fails a test, as a prompt to
+  think about drain;
+- `fleet_await` and `fleet_watch` end promptly when the host aborts the call (they do not wait out
+  their 600s timeouts), so a drain that aborts in-flight tool calls is not held open by this plugin.
+
 Practical rules:
 
 1. Run `fleet_deploy`, then restart the gateway from outside the session that ran it (the restart
