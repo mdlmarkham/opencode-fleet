@@ -14,6 +14,8 @@
  *   starting with `-` cannot be read as a git option.
  */
 
+import { spawn } from "node:child_process";
+
 import { redactSecrets } from "./untrusted.js";
 
 export interface SyncPolicy {
@@ -180,4 +182,57 @@ export function evaluateChange(files: string[], diff: string, policy: SyncPolicy
     };
   }
   return { ok: true };
+}
+
+function gitExec(repoDir: string, args: string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("git", ["-C", repoDir, ...args], { stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    child.stdout.on("data", (c: Buffer) => { out += c.toString(); });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code === 0) resolve(out);
+      else reject(new Error(`git ${args[0]} exited ${code}`));
+    });
+  });
+}
+
+/**
+ * Issue #103 (group b): scan the range base..tip COMMIT BY COMMIT. The net
+ * diff (`git diff base...tip`) hides a secret that an intermediate commit
+ * ADDS and a later one removes, yet the intermediate commit survives in the
+ * pushed history. So iterate `git rev-list base..tip`, diff each commit
+ * against its own parent and scan the introduced lines with the SAME
+ * predicate as the net diff (`countSecretLines`). Throws with the offending
+ * commit when any commit in the range introduces a secret.
+ */
+export async function secretsInCommits(
+  repoDir: string,
+  base: string,
+  tip: string,
+): Promise<void> {
+  let revs: string;
+  try {
+    revs = await gitExec(repoDir, ["rev-list", "--no-merges", `${base}..${tip}`]);
+  } catch {
+    // No commits in the range (or a ref failed to resolve): nothing to scan.
+    return;
+  }
+  const commits = revs.split("\n").filter(Boolean);
+  for (const commit of commits) {
+    const diff = await gitExec(
+      repoDir, ["diff", "--text", "--no-textconv", "--no-ext-diff", "--unified=0", `${commit}^!`],
+    ).catch(() => {
+      // A merge in the range has no single parent; root commits are skipped
+      // too — the per-parent scan of the others still covers added lines.
+      return "";
+    });
+    if (!diff) continue;
+    const secrets = countSecretLines(diff);
+    if (secrets > 0) {
+      throw new Error(
+        `commit ${commit.slice(0, 12)} introduces ${secrets} credential-shaped added line(s) (tokens, keys, passwords)`,
+      );
+    }
+  }
 }

@@ -24,7 +24,7 @@ import { shq } from "./shell.js";
 import { SSH_ARGS, scpPrefix, scpRemote, sshPrefix } from "./ssh.js";
 import { ID_RE } from "./guard.js";
 import { checkSetup } from "./policy.js";
-import { evaluateChange, isSafeBranchName, resolveDestination, resolvePolicy, type SyncPolicy } from "./syncpolicy.js";
+import { evaluateChange, isSafeBranchName, resolveDestination, resolvePolicy, secretsInCommits, type SyncPolicy } from "./syncpolicy.js";
 
 const execFileP = promisify(execFile);
 
@@ -510,6 +510,24 @@ export async function syncFromNode(
     const check = evaluateChange(names.split("\n").filter(Boolean), diff, policy);
     if (!check.ok) {
       return { refused: { ok: false, cwd, branch: d.branch, workerBranch, commit: "policy-refused", synced: false, error: check.error, detail: check.detail } };
+    }
+    // Issue #103b: the net diff hides a secret that an intermediate commit adds
+    // and a later one removes, so also scan the range commit by commit.
+    try {
+      await secretsInCommits(cloneDir, `origin/${base}`, bundleRef);
+    } catch (perCommitErr) {
+      return {
+        refused: {
+          ok: false,
+          cwd,
+          branch: d.branch,
+          workerBranch,
+          commit: "policy-refused",
+          synced: false,
+          error: "worker changes contain credential-shaped text",
+          detail: `${(perCommitErr as Error).message}. Nothing was pushed; review the worker's history.`,
+        },
+      };
     }
     return { dest: d.branch, redirectedFrom: d.redirectedFrom };
   };
