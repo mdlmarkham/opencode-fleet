@@ -21,6 +21,8 @@ import { isSentinelPrompt } from "./protocol.js";
 import { OPCODE_PS_COMMAND, abortRunById, parseActivity, runStatePath, type NodeActivityEntry } from "./node/runtime.js";
 import { isCanonicalBase64 } from "./xfer.js";
 import { runPaths, xferPaths, ensureStateDir, writePrivate } from "./paths.js";
+import { parseBudgetConfig } from "./budget.js";
+import type { RunUsage } from "./ledger.js";
 // Issue #87, slice 3: S1 dispatch wiring. TYPE-ONLY imports here — the S1
 // client/hook modules are loaded (dynamically) only when the caller opts in,
 // so the default dispatch path imports nothing from S1 and never calls it.
@@ -62,6 +64,8 @@ interface FleetConfig {
   /** Deterministic design gate for spec dispatches (issue #117): off | advise (default) | enforce, plus size bounds. */
   /** Concurrency slots (issue #39). */
   capacity?: { maxConcurrentPerNode?: number; staleAfterMs?: number };
+  /** Spend caps (issue #39): per-UTC-day totals from ledger usage + per-dispatch caps. Validated by parseBudgetConfig. */
+  budget?: { dailyCostUsd?: number; dailyTokens?: number; perDispatchCostUsd?: number; perDispatchTokens?: number };
   project?: { gate?: "off" | "advise" | "enforce"; maxScopePatterns?: number; maxAcceptanceItems?: number; roots?: string[]; rules?: unknown[]; requireCharterFields?: string[]; allowRepoBlocking?: boolean };
   /** S1 decision layer (issue #79): backend, mode (default shadow), thresholds, egress opt-in. Validated by parseS1Config. */
   s1?: unknown;
@@ -125,6 +129,17 @@ export default definePluginEntry({
         properties: {
           maxConcurrentPerNode: { type: "integer", minimum: 1, maximum: 64, description: "Default max concurrent runs per node. Unset means unlimited." },
           staleAfterMs: { type: "integer", minimum: 60000, default: 21600000, description: "A run still `running` in the ledger after this long without an update stops holding a slot and is reported as suspected stale." },
+        },
+      },
+      budget: {
+        type: "object",
+        additionalProperties: false,
+        description: "Spend caps (issue #39): daily totals counted per UTC day from ledger usage (recorded from each finished run's audit manifest), plus per-dispatch caps. A dispatch that would exceed a cap is refused with a retryable `budget-exhausted` result (same family as no-capacity). No limits by default.",
+        properties: {
+          dailyCostUsd: { type: "number", minimum: 0, description: "Max total USD/day across the whole fleet (UTC day of run start)." },
+          dailyTokens: { type: "number", minimum: 0, description: "Max total tokens/day across the whole fleet (UTC day of run start)." },
+          perDispatchCostUsd: { type: "number", minimum: 0, description: "Default per-run cost cap, USD. A dispatch param of the same name overrides it." },
+          perDispatchTokens: { type: "number", minimum: 0, description: "Default per-run token cap. A dispatch param of the same name overrides it." },
         },
       },
       project: {
@@ -245,6 +260,11 @@ export default definePluginEntry({
     const cfg = (api.pluginConfig ?? {}) as FleetConfig;
     setSshOptions(cfg.ssh);
 
+    // Issue #39 (budget slice): validate the optional budget block once at load so a
+    // malformed config is a precise, immediate error, never a silently ignored limit.
+    const budgetLoad = parseBudgetConfig(cfg.budget);
+    if (!budgetLoad.ok) throw new Error(`invalid plugin config: ${budgetLoad.error}`);
+
     // ------------------------------------------------------------------
     // Node invoke policy: `opencode.run` (gateway-side permission boundary)
     // ------------------------------------------------------------------
@@ -343,6 +363,8 @@ export default definePluginEntry({
             description: "Optional post-run verification gate (issue #62). After the worker exits, the node checks that every listed file exists and — when given — that the command exits 0, recording verified/verifyDetails on the run result. verified is separate from ok (which stays the process exit status): use it so a run that exits 0 but produced nothing is not trusted as success. Read it from fleet_await or fleet_run_status.",
           },
           ref: { type: "object", additionalProperties: false, properties: { branch: { type: "string", description: "Branch to check out before running." }, commit: { type: "string", description: "Commit SHA to check out before running." } }, description: "Git ref to check out before running. Refused if the checkout has uncommitted changes." },
+          perDispatchCostUsd: { type: "number", minimum: 0, description: "Per-run cost cap for THIS dispatch, USD (issue #39): overrides budget.perDispatchCostUsd when the budget block sets one. Refused with a retryable budget-exhausted result when the day's remaining budget cannot cover it." },
+          perDispatchTokens: { type: "number", minimum: 0, description: "Per-run token cap for THIS dispatch (issue #39): overrides budget.perDispatchTokens. Refused with a retryable budget-exhausted result when the day's remaining budget cannot cover it." },
           requires: {
             type: "object",
             additionalProperties: false,
@@ -386,6 +408,8 @@ export default definePluginEntry({
           expect?: { files?: string[]; command?: string; commands?: string[]; timeoutMs?: number };
           spec?: { goal: string; acceptance?: string[]; verify?: { files?: string[]; command?: string; commands?: string[]; timeoutMs?: number }; scope?: { files: string[] } };
           ref?: { branch?: string; commit?: string };
+          perDispatchCostUsd?: number;
+          perDispatchTokens?: number;
           requires?: {
             gpu?: boolean;
             minDiskGb?: number;
@@ -428,6 +452,21 @@ export default definePluginEntry({
         const mode = targetMode({ node: p.node, nodes: p.nodes, pick: p.pick, defaultTarget: cfg.dispatch?.defaultTarget, fleet: fleet.map(slotsOf) });
         if (mode.mode === "invalid") return jsonResult({ ok: false, error: mode.error });
         if (mode.mode === "refuse") return jsonResult({ ok: false, error: mode.error, nodes: mode.nodes });
+        // Issue #39 (budget slice): validate the per-dispatch cap overrides, then check the
+        // budget BEFORE any launch, using the ledger as of now. Exhaustion returns a retryable
+        // "budget-exhausted" result shaped like "no-capacity" (same family, same retry
+        // semantics); per-dispatch overrides take precedence over the config defaults. The
+        // overrides also ride the ledger entry so the day's accounting can show them.
+        const { parseOverrides: parseBudgetOverrides, budgetCheck: checkBudget, budgetExhausted, parseBudgetConfig: parseBudgetLimits } = await import("./budget.js");
+        const budgetParsed = parseBudgetLimits(cfg.budget);
+        const budgetLimits = budgetParsed.ok ? budgetParsed.config : undefined;
+        const overrideCheck = parseBudgetOverrides({ perDispatchCostUsd: p.perDispatchCostUsd, perDispatchTokens: p.perDispatchTokens });
+        if (!overrideCheck.ok) return jsonResult({ ok: false, error: overrideCheck.error });
+        const budgetNow = new Date().toISOString();
+        const budgetVerdict = checkBudget(slotRuns, budgetLimits, budgetNow, overrideCheck.override);
+        if (!budgetVerdict.allowed) {
+          return jsonResult(budgetExhausted(budgetVerdict.spent ?? { costUsd: 0, tokens: 0 }, budgetVerdict.reason ?? "budget exhausted", overrideCheck.override));
+        }
         const nodeFilter = mode.mode === "explicit" ? mode.names : mode.mode === "pick" && mode.among !== "fleet" ? mode.among : undefined;
         let targets = nodeFilter?.length
           ? fleet.filter((n) => nodeFilter!.includes(n.displayName ?? n.nodeId) || nodeFilter!.includes(n.nodeId))
@@ -808,6 +847,9 @@ export default definePluginEntry({
             ...(specCheck.spec ? { spec: specCheck.spec } : {}),
             // Issue #117: overrides are part of the run's record.
             ...(design?.acknowledged.length ? { gateAcknowledged: design.acknowledged } : {}),
+            // Issue #39 (budget slice): the per-dispatch caps this run was admitted under,
+            // so the day's accounting can show them; absent when no override was given.
+            ...(overrideCheck.override ? { budgetCap: overrideCheck.override } : {}),
           };
           // Issue #39: per-node concurrency slots. With no limit configured this is the plain
           // upsert it always was; with one, the count and the insert are a single atomic step.
@@ -1326,7 +1368,7 @@ export default definePluginEntry({
       name: "fleet_capacity",
       label: "Fleet Capacity",
       description:
-        "Concurrency slots per node (issue #39): the limit (node `maxConcurrent`, else `capacity.maxConcurrentPerNode`, else unlimited), the runs holding slots with their ages, free slots, and runs suspected stale (still `running` in the ledger past `capacity.staleAfterMs`, so no longer holding a slot; settle them with fleet_run_status or fleet_recover). A fleet_dispatch to a node at its limit returns a retryable `no-capacity` result instead of starting. Read-only. Spend caps and a daily budget are not part of this yet.",
+        "Concurrency slots per node (issue #39): the limit (node `maxConcurrent`, else `capacity.maxConcurrentPerNode`, else unlimited), the runs holding slots with their ages, free slots, and runs suspected stale (still `running` in the ledger past `capacity.staleAfterMs`, so no longer holding a slot; settle them with fleet_run_status or fleet_recover). A fleet_dispatch to a node at its limit returns a retryable `no-capacity` result instead of starting. Also shows today's budget (issue #39): spent, remaining, and the per-dispatch caps a dispatch is admitted under, when a budget block is configured.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -1354,7 +1396,17 @@ export default definePluginEntry({
             suspectedStale: stale.map((r) => ({ runId: r.runId, ageSeconds: age(r) })),
           };
         });
-        return jsonResult({ ok: true, staleAfterMs: staleAfter(cfg.capacity), nodes: out });
+        // Issue #39 (budget slice): today's spend/remaining and the per-dispatch caps,
+        // derived from the ledger, so budget state is visible without a dispatch refusal.
+        const { parseBudgetConfig, daySpent } = await import("./budget.js");
+        const budget = parseBudgetConfig(cfg.budget);
+        const spent = budget.ok && budget.config ? daySpent(runs, new Date(now).toISOString()) : undefined;
+        return jsonResult({
+          ok: true,
+          staleAfterMs: staleAfter(cfg.capacity),
+          nodes: out,
+          ...(budget.ok && budget.config ? { budget: { ...budget.config, spent, ...(spent && budget.config.dailyCostUsd !== undefined ? { remainingCostUsd: Math.max(0, budget.config.dailyCostUsd - spent.costUsd) } : {}), ...(spent && budget.config.dailyTokens !== undefined ? { remainingTokens: Math.max(0, budget.config.dailyTokens - spent.tokens) } : {}) } } : {}),
+        });
       },
     });
 
@@ -1500,6 +1552,14 @@ export default definePluginEntry({
                 : st.exitCode === 0
                   ? "completed"
                   : "failed";
+          // Issue #39 (budget slice): finished runs carry their audit manifest's usage
+          // (tokens, costUsd when the engine reports one) on their ledger entry, so the
+          // day's budget spend can be derived from the ledger. The run is accounted to
+          // the UTC day it started (startedAt rides the entry untouched). A finished run
+          // whose manifest has no usable usage records nothing (no zero laundering).
+          const { usageFromManifest } = await import("./budget.js");
+          const usage = st.manifest !== undefined ? usageFromManifest(st.manifest) : undefined;
+          const alreadyCounted = entry && entry.usage !== undefined;
           await upsertRun(rootDir, {
             ...(entry ?? { runId: p.runId, node: p.node, cwd: "", prompt: "", startedAt: new Date().toISOString() }),
             runId: p.runId,
@@ -1514,6 +1574,9 @@ export default definePluginEntry({
             ...(st.verifyDetails != null ? { verifyDetails: st.verifyDetails } : {}),
             // Issue #104: persist what the node reported so fleet_sync can apply the scope policy.
             ...(entry?.spec?.scope && st.finishedAt ? { scopeViolations: Array.isArray(st.scopeViolations) ? (st.scopeViolations as string[]) : null } : {}),
+            // Issue #39: usage rides the ledger once, from the manifest; the run's own
+            // startedAt attributes it to its day. A recorded entry keeps its usage.
+            ...(usage && !alreadyCounted ? { usage } : {}),
             summary:
               state === "failed" && !st.finishedAt
                 ? "worker process died without completion record (silent death)"
@@ -1816,8 +1879,42 @@ export default definePluginEntry({
         let prevFingerprint = "";
         // Last iteration's parsed outcome, in scope after the loop exits.
         let lastOutcome: { verified?: boolean; verifyDetails?: unknown } | null = null;
+        // Issue #39 (budget slice): each iteration is a run seed counted against the same
+        // day budget. A refused iteration (day spent) sets a "budget" reason the loop's
+        // stop path annotates, so an unattended caller escalates instead of re-launching.
+        const { parseBudgetConfig, budgetCheck: checkBudget, budgetExhausted } = await import("./budget.js");
+        const { loadLedger: loadLedgerForBudget } = await import("./ledger.js");
+        const budgetParsed = parseBudgetConfig(cfg.budget);
+        const budgetLimits = budgetParsed.ok ? budgetParsed.config : undefined;
+        const budgetRoot = api.rootDir ?? process.cwd();
+        let budgetRefusal: ReturnType<typeof budgetExhausted> | undefined;
 
         for (let i = 1; i <= maxIter; i++) {
+          if (budgetLimits) {
+            const budgetVerdict = checkBudget(await loadLedgerForBudget(budgetRoot), budgetLimits, new Date().toISOString());
+            if (!budgetVerdict.allowed) {
+              budgetRefusal = budgetExhausted(budgetVerdict.spent ?? { costUsd: 0, tokens: 0 }, budgetVerdict.reason ?? "budget exhausted");
+              if (i === 1 || escalateOnNoProgress) {
+                return jsonResult(
+                  withVerified(
+                    {
+                      iterations,
+                      done: false,
+                      success: false,
+                      escalated: true,
+                      stoppedBy: "budget" as const,
+                      ...budgetRefusal,
+                      reason: `budget exhausted before iteration ${i}: ${budgetVerdict.reason}`,
+                      recommendation:
+                        "Budget stop: the day's budget is spent (resets 00:00 UTC). Escalate to the operator to raise budget.* in the plugin config, or resume tomorrow — do not keep iterating.",
+                    },
+                    lastOutcome,
+                  ),
+                );
+              }
+              break;
+            }
+          }
           const inv = await api.runtime.nodes.invoke({
             nodeId: node.nodeId,
             command: "opencode.run",
@@ -1894,9 +1991,14 @@ export default definePluginEntry({
                   done: false,
                   success: false,
                   escalated: true,
-                  reason: "no progress across iterations (identical output)",
-                  recommendation:
-                    "Escalate: switch to a heavier model, change the approach, or hand off to a human. Do not keep retrying the same prompt.",
+                  // Issue #39 (budget slice): a stop caused by an exhausted day budget
+                  // is a "budget"-annotated escalation, not a no-progress one.
+                  ...(budgetRefusal ? { stoppedBy: "budget" as const } : {}),
+                  reason: budgetRefusal ? `budget exhausted: ${budgetRefusal.error}` : "no progress across iterations (identical output)",
+                  ...(budgetRefusal ? { spent: budgetRefusal.spent } : {}),
+                  recommendation: budgetRefusal
+                    ? "Budget stop: the day's budget is spent (resets 00:00 UTC). Escalate to the operator to raise budget.* in the plugin config, or resume tomorrow."
+                    : "Escalate: switch to a heavier model, change the approach, or hand off to a human. Do not keep retrying the same prompt.",
                 },
                 lastOutcome,
               ),
