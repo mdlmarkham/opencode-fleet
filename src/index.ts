@@ -2,6 +2,7 @@ import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { buildJsonPluginConfigSchema, jsonResult } from "openclaw/plugin-sdk/core";
 import { join } from "node:path";
 import { shq } from "./shell.js";
+import { AWAIT_MISSING_NOTE } from "./await.js";
 import { DEFAULT_RUN_TIMEOUT_MS, buildOpenCodeCommand, parseOpenCodeOutput, parsePiOutput, validateHarnessTransport, validatePiOptions, type OpenCodeTask } from "./opencode.js";
 import {
   probeAckRecovery,
@@ -966,7 +967,7 @@ export default definePluginEntry({
                     ? { isolationNote: "isolation was requested but the node did not return a run clone" }
                     : {}),
                 ackPending: false,
-                note: "Worker launched detached and survives relay timeouts. Wait with fleet_await({runIds:[runId]}) (not a fleet_run_status loop) or fleet_watch; fleet_resume finds it after interruptions.",
+                note: `Worker launched detached and survives relay timeouts. Wait with fleet_await({runIds:[runId]}) (not a fleet_run_status loop) or fleet_watch; fleet_resume finds it after interruptions. ${AWAIT_MISSING_NOTE}`,
                 ...(autoApproveWarnings[nodeName] ? { warnings: autoApproveWarnings[nodeName] } : {}),
               };
               continue;
@@ -1030,7 +1031,7 @@ export default definePluginEntry({
               note: dead
                 ? `Run died without a completion record (no live process, no completion file). Marked failed in the ledger. Safe to re-dispatch.`
                 : alive
-                  ? `Run is LIVE on the node (pid ${probe.pid}). Wait with fleet_await({runIds:[runId]}) or fleet_watch.`
+                  ? `Run is LIVE on the node (pid ${probe.pid}). Wait with fleet_await({runIds:[runId]}) or fleet_watch. ${AWAIT_MISSING_NOTE}`
                   : `Run state unknown after relay timeout. Check fleet_run_status(runId) before re-dispatching.`,
               error: (inv as { message?: string }).message,
             };
