@@ -18,6 +18,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      # Hygiene guard (#159): no tracked symlinks w/ absolute/escaping targets, node_modules, TASK-*.md.
+      - run: bash scripts/check-hygiene.sh
       - uses: actions/setup-node@v4
         with:
           # OpenClaw refuses Node < 22.22.3 (SQLite WAL bug); see package.json "engines".
