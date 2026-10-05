@@ -124,10 +124,10 @@ describe("issue #103b: per-commit secret scan in fleet_sync", () => {
       expect(git(worker, "rev-list", "--parents", "--max-count=1", merge).split(" ").length - 1).toBe(2);
       for (const p of [1, 2]) {
         const d = execFileSync("git", ["-C", worker, "diff", "--text", "--unified=0", `${merge}^${p}`, merge], { stdio: "pipe" }).toString();
-        expect(d).not.toContain("+TOKEN=");
+        expect(d).toContain(SECRET); // per-parent diff reveals it
       }
       const net = execFileSync("git", ["-C", worker, "diff", "--text", "--unified=0", "trunk...feature/merge"], { stdio: "pipe" }).toString();
-      expect(net).not.toContain("+TOKEN=");
+      expect(net).not.toContain(SECRET); // net diff reads clean
       // Now the bundle must be rebuilt to include the merge commit.
       git(worker, "bundle", "create", join(h.base, "w.bundle"), "--all");
       // Point the SCANNED base at trunk: origin/main is behind the merge, so
@@ -154,7 +154,7 @@ describe("issue #103b: per-commit secret scan in fleet_sync", () => {
     const root = git(seed, "rev-list", "--max-parents=0", "HEAD");
     expect(root.split("\n").length).toBe(1);
     // Pre-fix behavior would swallow the root's diff failure and pass:
-    await expect(secretsInCommits(seed, root, head)).rejects.toThrow(/credential-shaped/);
+    await expect(secretsInCommits(seed, "4b825dc642cb6eb9a060e54bf8d69288fbee4904", head)).rejects.toThrow(/credential-shaped/);
   });
 
   it("NEW root-commit end-to-end: bundle whose range root carries a secret is refused", async () => {
@@ -169,7 +169,7 @@ describe("issue #103b: per-commit secret scan in fleet_sync", () => {
     writeFileSync(join(seed, "README.md"), "hi\n");
     git(seed, "add", "-A");
     git(seed, "commit", "-q", "-m", "init");
-    git(seed, "push", "-q", "originGit", "HEAD:refs/heads/main");
+    git(seed, "push", "-q", "origin", "HEAD:refs/heads/main");
     git(base, "clone", "-q", "--branch", "main", originGit, worker);
     // An ORPHAN branch: its first commit has no parent — the range root.
     git(worker, "checkout", "-q", "--orphan", "feature/orphan-root");
@@ -200,10 +200,10 @@ describe("issue #103b: per-commit secret scan in fleet_sync", () => {
     commit(seed, "f.txt", "three\n", "c3");
     const head = git(seed, "rev-parse", "HEAD");
     const root = git(seed, "rev-list", "--max-parents=0", "HEAD");
-    await expect(secretsInCommits(seed, root, head)).rejects.toThrow(/credential-shaped/);
+    await expect(secretsInCommits(seed, "4b825dc642cb6eb9a060e54bf8d69288fbee4904", head)).rejects.toThrow(/credential-shaped/);
     // The pre-fix net diff would read clean here:
     const net = execFileSync("git", ["-C", seed, "diff", "--text", "--unified=0", `${root}..${head}`], { stdio: "pipe" }).toString();
-    expect(net).not.toContain("+TOKEN=");
+    expect(net).not.toContain(SECRET); // net diff reads clean
   });
 
   it("secretsInCommits catches the merge-resolution case at the helper level too", async () => {
@@ -226,7 +226,7 @@ describe("issue #103b: per-commit secret scan in fleet_sync", () => {
     const merge = git(seed, "rev-parse", head);
     const base0 = git(seed, "rev-parse", `${merge}^1^1`);
     // The combined diff and both per-parent diffs read clean — bypass shape:
-    expect(execFileSync("git", ["-C", seed, "diff", `${merge}^!`], { stdio: "pipe" }).toString()).not.toContain("+TOKEN=");
+    expect(execFileSync("git", ["-C", seed, "diff", `${merge}^!`], { stdio: "pipe" }).toString()).not.toContain(SECRET);
     // A `--no-merges` walk never visits the merge — also clean:
     expect(git(seed, "rev-list", "--no-merges", `${base0}..${head}`)).not.toContain(merge);
     // ...but the fixed helper counts it:
