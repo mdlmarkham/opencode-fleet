@@ -315,7 +315,7 @@ export default definePluginEntry({
           timeoutMs: { type: "number", description: "Per-node timeout, ms." },
           maxIdleMs: { type: "number", description: "Kill the run if no output for this long, ms (stuck-loop guard). Default 120000." },
           maxDurationMs: { type: "number", description: "Kill the run if total runtime exceeds this, ms (stuck-loop guard). Default 600000." },
-          async: { type: "boolean", description: "Run detached: returns a run handle immediately (runId + pid); the worker survives relay timeouts and its completion is recorded. Poll with fleet_watch or fleet_run_status. Default true." },
+          async: { type: "boolean", description: "Run detached: returns a run handle immediately (runId + pid); the worker survives relay timeouts and its completion is recorded. Wait for it with fleet_await (one blocking call; do not poll fleet_run_status in a loop) or watch it live with fleet_watch. Default true." },
           env: { type: "object", additionalProperties: { type: "string" }, description: "Environment variables for the worker process (per-dispatch environment). Names that execute code or redirect configuration (PATH, HOME, BASH_ENV, NODE_OPTIONS, LD_*, GIT_SSH*, OPENCODE_CONFIG*, ...) are REFUSED: the dispatch fails and names them. Operators can narrow this further (config env.allowOnly / env.extraDeny)." },
           isolation: { type: "string", enum: ["none", "clone"], description: "Per-run isolation (issue #41). `clone`: the node makes a private git clone of `cwd` (committed state only) at <parent>/.fleet-runs/<runId>/repo on branch fleet/<runId>, runs the worker there, and returns runCwd and branch; pass runCwd to fleet_sync. Detached runs only. A node that predates isolation is refused rather than run in the shared checkout. Default from config `isolation`, else none. Issue #105: an explicitly requested level is checked against the node's probed isolation capabilities (fleet_capabilities reports isolationLevels) and REFUSED when the node cannot honour it — never downgraded." },
           expect: {
@@ -325,7 +325,7 @@ export default definePluginEntry({
               files: { type: "array", items: { type: "string" }, description: "Artifact paths that must exist after the run (relative to the run cwd and inside it: absolute paths and `..` are refused), e.g. ['dist/index.js', 'docs/api.md']." },
               command: { type: "string", description: "Verification command run via `bash -c` in the run cwd after the worker exits; must exit 0. Bounded to 120s (process group killed). It runs outside the engine's permission system, so it must be a repo-relative script path with plain arguments (e.g. `./scripts/check.sh --fast`) unless the operator set allowSetupCommands; an arbitrary shell command such as `npm test && echo ok` is refused." },
             },
-            description: "Optional post-run verification gate (issue #62). After the worker exits, the node checks that every listed file exists and — when given — that the command exits 0, recording verified/verifyDetails on the run result. verified is separate from ok (which stays the process exit status): use it so a run that exits 0 but produced nothing is not trusted as success. Poll it with fleet_run_status.",
+            description: "Optional post-run verification gate (issue #62). After the worker exits, the node checks that every listed file exists and — when given — that the command exits 0, recording verified/verifyDetails on the run result. verified is separate from ok (which stays the process exit status): use it so a run that exits 0 but produced nothing is not trusted as success. Read it from fleet_await or fleet_run_status.",
           },
           ref: { type: "object", additionalProperties: false, properties: { branch: { type: "string", description: "Branch to check out before running." }, commit: { type: "string", description: "Commit SHA to check out before running." } }, description: "Git ref to check out before running. Refused if the checkout has uncommitted changes." },
           requires: {
@@ -923,7 +923,7 @@ export default definePluginEntry({
                     ? { isolationNote: "isolation was requested but the node did not return a run clone" }
                     : {}),
                 ackPending: false,
-                note: "Worker launched detached and survives relay timeouts. Poll with fleet_run_status(runId) or fleet_watch; fleet_resume finds it after interruptions.",
+                note: "Worker launched detached and survives relay timeouts. Wait with fleet_await({runIds:[runId]}) (not a fleet_run_status loop) or fleet_watch; fleet_resume finds it after interruptions.",
                 ...(autoApproveWarnings[nodeName] ? { warnings: autoApproveWarnings[nodeName] } : {}),
               };
               continue;
@@ -987,7 +987,7 @@ export default definePluginEntry({
               note: dead
                 ? `Run died without a completion record (no live process, no completion file). Marked failed in the ledger. Safe to re-dispatch.`
                 : alive
-                  ? `Run is LIVE on the node (pid ${probe.pid}). Poll with fleet_run_status(runId) or fleet_watch.`
+                  ? `Run is LIVE on the node (pid ${probe.pid}). Wait with fleet_await({runIds:[runId]}) or fleet_watch.`
                   : `Run state unknown after relay timeout. Check fleet_run_status(runId) before re-dispatching.`,
               error: (inv as { message?: string }).message,
             };
@@ -1526,11 +1526,12 @@ export default definePluginEntry({
           node: { type: "string", description: "Node for every run id. Omit to use each run's node from the ledger." },
           timeoutMs: { type: "number", description: "Max wait, ms (default 120000, max 600000)." },
           pollMs: { type: "number", description: "Initial poll interval, ms (default 2000, grows to 15000)." },
+          until: { type: "string", enum: ["all", "any"], description: "all (default): wait for every run. any: return as soon as one run is terminal; the others stay in `pending`." },
         },
         required: ["runIds"],
       },
       execute: async (_toolCallId, params, signal, onUpdate) => {
-        const p = params as { runIds?: unknown; node?: string; timeoutMs?: number; pollMs?: number };
+        const p = params as { runIds?: unknown; node?: string; timeoutMs?: number; pollMs?: number; until?: unknown };
         const { awaitRuns, MAX_AWAIT_RUNS } = await import("./await.js");
         const ids = Array.isArray(p.runIds) ? p.runIds.filter((x): x is string => typeof x === "string" && x !== "") : [];
         if (ids.length === 0) return jsonResult({ ok: false, error: "runIds must be a non-empty array of run ids" });
@@ -1554,7 +1555,7 @@ export default definePluginEntry({
           }
           throw new Error("unreadable status");
         };
-        const r = await awaitRuns(runs, { timeoutMs: p.timeoutMs, pollMs: p.pollMs }, {
+        const r = await awaitRuns(runs, { timeoutMs: p.timeoutMs, pollMs: p.pollMs, until: p.until === "any" ? "any" : "all" }, {
           signal,
           poll: async (run) => decodeStatus(await runStatusExecute("await", { node: run.node, runId: run.runId, includeOutput: false }, signal)),
           onSettled: (o, remaining) => {
@@ -1589,7 +1590,7 @@ export default definePluginEntry({
           waitedMs: r.waitedMs,
           runs: results,
           pending,
-          ...(pending.length ? { hint: "Still running: call fleet_await again with the pending run ids. Do not loop on fleet_run_status." } : {}),
+          ...(pending.length ? { hint: r.timedOut ? "Still running: call fleet_await again with the pending run ids. Do not loop on fleet_run_status." : "Some runs are still pending; call fleet_await again with them if you need them." } : {}),
         });
       },
     });
