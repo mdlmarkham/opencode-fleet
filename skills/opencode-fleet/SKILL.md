@@ -74,7 +74,7 @@ A detached dispatch returns a `runId` immediately. **Wait with one blocking call
 fleet_await(runIds: ["<runId>", ...])             # returns when every run is terminal (default wait 120s)
 fleet_await(runIds: [...], until: "any")          # returns as soon as one finishes
 ```
-On timeout it returns the finished runs plus `pending`: call `fleet_await` again with the pending ids. For a wait longer than the cap (600s), use a scheduled automation instead of an agent sleep loop. Each result carries `verified`: a run that exits 0 but fails its gate is `verified:false`; do not report it as success. `fleet_watch` streams a live run when you want to see it progress.
+On timeout it returns the finished runs plus `pending`: call `fleet_await` again with the pending ids. For a wait longer than the cap (600s), use a scheduled automation instead of an agent sleep loop. Each result carries `verified`: a run that exits 0 but fails its gate is `verified:false`; do not report it as success. `fleet_watch` streams a live run when you want to see it progress, but it is a blocking call whose `timeoutMs` (default 10 minutes) is the run's only limit: **always pass `timeoutMs` sized to the task** (or use `fleet_dispatch` + `fleet_await` for anything long), and read `endedBy` on a failure to see which limit fired.
 
 ```text
 fleet_status        # node health + connectivity

@@ -422,6 +422,9 @@ export type PiExecStatus = ExecStatus;
 /** Wall-clock backstop for a dispatched run (issue #168): real coding tasks outlive the old 5 minutes. The idle watchdog (maxIdleMs) is the primary hung-run guard. */
 export const DEFAULT_RUN_TIMEOUT_MS = 30 * 60_000;
 
+/** `fleet_watch` is a blocking call whose timeoutMs is the run's only limit; 5 minutes killed real tasks (issue #190). */
+export const DEFAULT_WATCH_TIMEOUT_MS = 10 * 60_000;
+
 export const PI_TOOL_NAME = /^[a-z][a-z0-9_-]{0,31}$/;
 
 /** Validate the Pi restriction fields; they are interpolated into a shell command, so be strict. */
