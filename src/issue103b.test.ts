@@ -58,6 +58,11 @@ function harness(commits: Array<{ file: string; content: string; msg: string }>,
 }
 
 describe("issue #103b: per-commit secret scan in fleet_sync", () => {
+  // Every test in this file drives several REAL git invocations and full sync
+  // flows; when the suite runs in parallel the OS-level git spawns slow down,
+  // so the runner's 5s default flakily kills these tests. Give each test a
+  // generous explicit timeout (the assertions themselves are unchanged).
+  const T = 30_000;
   let dir: string;
   beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "fleet103b-")); });
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
@@ -74,7 +79,7 @@ describe("issue #103b: per-commit secret scan in fleet_sync", () => {
       expect(r.commit).toBe("policy-refused");
       expect(h.originRef("feature/leak")).toBe("");
     } finally { h.cleanup(); }
-  });
+  }, T);
 
   it("passes a clean range through unchanged", async () => {
     const h = harness([
@@ -87,7 +92,7 @@ describe("issue #103b: per-commit secret scan in fleet_sync", () => {
       expect(r.synced).toBe(true);
       expect(h.originRef("feature/clean")).not.toBe("");
     } finally { h.cleanup(); }
-  });
+  }, T);
 
   it("still refuses a secret present at the tip (net diff case)", async () => {
     const h = harness([
@@ -100,7 +105,7 @@ describe("issue #103b: per-commit secret scan in fleet_sync", () => {
       expect(r.commit).toBe("policy-refused");
       expect(h.originRef("feature/tip")).toBe("");
     } finally { h.cleanup(); }
-  });
+  }, T);
 
   it("NEW merge-resolution: a secret added only in the merge commit's resolution is refused", async () => {
     const h = harness([{ file: "seed.txt", content: "s\n", msg: "seed" }], { workerBranch: "feature/merge" });
@@ -117,29 +122,35 @@ describe("issue #103b: per-commit secret scan in fleet_sync", () => {
       git(worker, "add", "-A");
       git(worker, "commit", "-q", "-m", "merge with resolution");
       const merge = git(worker, "rev-parse", "HEAD");
-      // Sanity: this really is a two-parent commit, and the merge tip IS
-      // feature/merge's tip — the range main..feature/merge contains the merge.
+      // The merge tip IS feature/merge's tip, and it has 2 parents — the range
+      // main..feature/merge ends at the merge commit.
       expect(git(worker, "rev-list", "--parents", "--max-count=1", merge).split(" ").length - 1).toBe(2);
       expect(git(worker, "rev-parse", "feature/merge").trim()).toBe(merge);
-      // The bypass shape: the merge's per-parent diffs DO reveal the secret
-      // (which is why per-parent scanning closes it), while the NET diff from
-      // the base reads clean, so the old net-diff scan missed it.
-      const perParentReveals = [1, 2].some((p) => {
-        const d = execFileSync("git", ["-C", worker, "diff", "--text", "--unified=0", `${merge}^${p}`, merge], { stdio: "pipe" }).toString();
-        return d.includes(SECRET);
-      });
-      expect(perParentReveals).toBe(true);
-      const net = execFileSync("git", ["-C", worker, "diff", "--text", "--unified=0", "main...feature/merge"], { stdio: "pipe" }).toString();
-      expect(net).not.toContain(SECRET);
-      // Now the bundle must be rebuilt to include the merge commit.
+      // The bypass shape: the secret is introduced ONLY by the merge commit's
+      // resolution — no linear commit carries it, so a scan that walks only
+      // non-merge commits (`--no-merges`) never visits the sole offender.
+      expect(git(worker, "rev-list", "--no-merges", `main..${merge}`)).not.toContain(merge);
+      // And the merge's per-parent diffs DO reveal the added secret (the
+      // resolution adds it against each parent), which is why per-parent
+      // scanning closes the hole.
+      for (const p of [1, 2]) {
+        const perParent = execFileSync("git", ["-C", worker, "diff", "--text", "--no-textconv", "--no-ext-diff", "--unified=0", `${merge}^${p}`, merge], { stdio: "pipe" }).toString();
+        expect(perParent).toContain(`+TOKEN=${SECRET}`);
+      }
+      // Reroute syncFromNode through the merge branch: the harness's run()
+      // seeds the bundle from its opts.workerBranch, and syncFromNode scans
+      // origin/<clone-base>...refs/remotes/bundler/<workerBranch> — so the
+      // range must END at the merge commit for the scan to visit it.
       git(worker, "bundle", "create", join(h.base, "w.bundle"), "--all");
-      const r = await h.run("main");
+      const b64 = readFileSync(join(h.base, "w.bundle")).toString("base64");
+      const r = await syncFromNode("local", worker, h.origin, "main", { mode: "from-base64", base64: b64, branch: "main", workerBranch: "feature/merge", destBranch: undefined }, undefined);
       expect(r.ok).toBe(false);
       expect(r.commit).toBe("policy-refused");
+      expect(r.synced).toBe(false);
       expect(h.originRef("feature/merge")).toBe("");
       expect(JSON.stringify(r)).not.toContain(SECRET);
     } finally { h.cleanup(); }
-  });
+  }, T);
 
   it("NEW root-commit: a secret in the range's parentless root commit is refused", async () => {
     const seed = join(dir, "r");
@@ -154,11 +165,17 @@ describe("issue #103b: per-commit secret scan in fleet_sync", () => {
     expect(root.split("\n").length).toBe(1);
     // Pre-fix behavior would swallow the root's diff failure and pass:
     await expect(secretsInCommits(seed, "4b825dc642cb6eb9a060e54bf8d69288fbee4904", head)).rejects.toThrow(/credential-shaped/);
-  });
+  }, T);
 
   it("NEW root-commit end-to-end: bundle whose range root carries a secret is refused", async () => {
-    // Worker history STARTS at a parentless commit (orphan branch), i.e. the
-    // scanned range has a root with no parent at all.
+    // syncFromNode's 4th argument is the CLONE base (a branch that must exist
+    // on origin), so an EMPTY TREE cannot be handed to it directly. To keep a
+    // genuine e2e refusal WHILE making the range's parentless root real, give
+    // the orphan history a main-descended ANCHOR commit and merge the orphan
+    // chain into the synced branch: the range origin/main..feature/orphan-root
+    // then contains a commit with no parents at all (the old `commit^!` scan
+    // diffs nothing for it), while the TIP tree stays clean (the secret is
+    // added at the orphan root and removed before the tip).
     const base = mkdtempSync(join(tmpdir(), "fleet103b-"));
     const originGit = join(base, "origin.git");
     const seed = join(base, "seed");
@@ -170,27 +187,44 @@ describe("issue #103b: per-commit secret scan in fleet_sync", () => {
     git(seed, "commit", "-q", "-m", "init");
     git(seed, "push", "-q", "origin", "HEAD:refs/heads/main");
     git(base, "clone", "-q", "--branch", "main", originGit, worker);
-    // An ORPHAN branch: its first commit has no parent — the range root.
-    git(worker, "checkout", "-q", "--orphan", "feature/orphan-root");
+    // Anchor on an ordinary main-descended branch, then graft a PARENTLESS
+    // history onto it. The orphan chain's FIRST commit has no parent — the
+    // range root.
+    git(worker, "checkout", "-q", "-b", "feature/orphan-root");
+    commit(worker, "a.txt", "a\n", "anchor");
+    git(worker, "checkout", "-q", "--orphan", "chain");
     git(worker, "rm", "-q", "-rf", "--", ".");
     commit(worker, "cfg.env", `TOKEN=${SECRET}\n`, "orphan root carries a secret");
-    commit(worker, "n.txt", "n\n", "more work");
+    commit(worker, "cfg.env", "TOKEN=ok\n", "clean it up");
+    git(worker, "checkout", "-q", "feature/orphan-root");
+    git(worker, "merge", "-q", "--no-edit", "--allow-unrelated-histories", "chain");
+    const head = git(worker, "rev-parse", "HEAD");
     const bundle = join(base, "w.bundle");
     git(worker, "bundle", "create", bundle, "--all");
     const b64 = readFileSync(bundle).toString("base64");
     const originRef = (b: string) => { try { return git(originGit, "rev-parse", "--verify", "--quiet", `refs/heads/${b}`); } catch { return ""; } };
     try {
-      // Scan against the EMPTY TREE so the parentless root of the orphan
-      // branch is INSIDE the scanned range (main..orphan excludes nothing
-      // useful, and the root has no parent to diff against otherwise).
-      const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
-      const r = await syncFromNode("local", worker, originGit, EMPTY_TREE, { mode: "from-base64", base64: b64, branch: EMPTY_TREE, workerBranch: "feature/orphan-root", destBranch: undefined }, undefined);
+      // Premise: the scanned range origin/main..head contains a PARENTLESS
+      // commit (a real range root — `commit^!` diffs nothing against it),
+      // and the tip's tree reads clean, so ONLY the per-commit scan can
+      // catch the root's secret here.
+      const rows = git(worker, "rev-list", "--parents", `origin/main..${head}`).split("\n").filter((l) => l.trim());
+      expect(rows.filter((r) => r.split(" ").length === 1).length).toBe(1);
+      const tipClean = execFileSync("git", ["-C", worker, "diff", "--text", "--no-textconv", "--no-ext-diff", "--unified=0", "origin/main...HEAD"], { stdio: "pipe" }).toString();
+      expect(tipClean).not.toContain(SECRET);
+      const r = await syncFromNode("local", worker, originGit, "main", { mode: "from-base64", base64: b64, branch: "main", workerBranch: "feature/orphan-root", destBranch: undefined }, undefined);
       expect(r.ok).toBe(false);
       expect(r.commit).toBe("policy-refused");
+      expect(r.synced).toBe(false);
       expect(originRef("feature/orphan-root")).toBe("");
       expect(JSON.stringify(r)).not.toContain(SECRET);
+      // The 4th-argument route for a parentless range (an ORPHAN worker branch:
+      // syncFromNode would fail at `git clone --branch <branch>` before any
+      // scan) is covered by the helper directly: with the EMPTY TREE as the
+      // scanned base the parentless root IS inside base..tip and rejects.
+      await expect(secretsInCommits(worker, "4b825dc642cb6eb9a060e54bf8d69288fbee4904", head)).rejects.toThrow(/credential-shaped/);
     } finally { rmSync(base, { recursive: true, force: true }); }
-  });
+  }, T);
 
   it("secretsInCommits scans each commit and reports the offender", async () => {
     const seed = join(dir, "r");
@@ -207,7 +241,7 @@ describe("issue #103b: per-commit secret scan in fleet_sync", () => {
     // The pre-fix net diff would read clean here:
     const net = execFileSync("git", ["-C", seed, "diff", "--text", "--unified=0", `${root}..${head}`], { stdio: "pipe" }).toString();
     expect(net).not.toContain(SECRET); // net diff reads clean
-  });
+  }, T);
 
   it("secretsInCommits catches the merge-resolution case at the helper level too", async () => {
     const seed = join(dir, "m");
@@ -236,7 +270,7 @@ describe("issue #103b: per-commit secret scan in fleet_sync", () => {
     expect(perParent).toContain(SECRET);
     // ...but the fixed helper counts it:
     await expect(secretsInCommits(seed, base0, head)).rejects.toThrow(/credential-shaped/);
-  });
+  }, T);
 
   it("secretsInCommits passes a clean range silently", async () => {
     const seed = join(dir, "c");
@@ -249,7 +283,7 @@ describe("issue #103b: per-commit secret scan in fleet_sync", () => {
     const head = git(seed, "rev-parse", "HEAD");
     const root = git(seed, "rev-list", "--max-parents=0", "HEAD");
     await expect(secretsInCommits(seed, root, head)).resolves.toBeUndefined();
-  });
+  }, T);
 
   it("secretsInCommits passes a clean history WITH merges through unchanged", async () => {
     const seed = join(dir, "cm");
@@ -266,7 +300,7 @@ describe("issue #103b: per-commit secret scan in fleet_sync", () => {
     const head = git(seed, "rev-parse", "HEAD");
     const root = git(seed, "rev-list", "--max-parents=0", "HEAD");
     await expect(secretsInCommits(seed, root, head)).resolves.toBeUndefined();
-  });
+  }, T);
 
   it("git failures are fatal (fail closed), not swallowed", async () => {
     const seed = join(dir, "x");
@@ -277,5 +311,5 @@ describe("issue #103b: per-commit secret scan in fleet_sync", () => {
     commit(seed, "f.txt", "one\n", "c1");
     // A bogus range must THROW (the old code returned "" on rev-list failure).
     await expect(secretsInCommits(seed, "does-not-exist", "HEAD")).rejects.toThrow();
-  });
+  }, T);
 });
