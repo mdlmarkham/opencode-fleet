@@ -24,6 +24,7 @@ import { B64_MARKER, MAX_TRANSFER_B64, parseBundleOutput, parseStatusOutput, sta
 import { acceptChunk, assembleChunks, isCanonicalBase64 } from "../xfer.js";
 import { guardCwd, taskUsesCwd, validateTaskIds } from "../guard.js";
 import { ensureStateDir, runPaths, xferPaths, writePrivate } from "../paths.js";
+import { UNSET_ORIGIN_PLACEHOLDER, stableOriginCommand } from "../provision.js";
 import { resolveOp, stampProtocol, type Op } from "../protocol.js";
 import { parseScope, scopeViolations } from "../scope.js";
 import { buildManifest, capLogFile, extractEvents, parseChanges } from "../audit.js";
@@ -60,6 +61,8 @@ export type FleetOpenCodeTask = OpenCodeTask & {
   maxIdleMs?: number;
   /** Kill the run if total runtime exceeds this, ms. */
   maxDurationMs?: number;
+  /** Issue #152: stable repo URL the manager sends with __UNPACK__ (xfer.unpack op). */
+  stableOrigin?: string;
 };
 
 export interface NodeIo {
@@ -205,10 +208,21 @@ OPS["xfer.unpack"] = async ({ task, io, context }: OpCtx) => {
         // is; on SSH-free nodes the manager never ssh'd a chown, so hand the
         // checkout to the node's service user (when present) so the worker
         // principal can actually write it. Mirror of the SSH-path unpackCmd.
+        // Issue #152: the bundle clone leaves `origin` at the TRANSIENT
+        // staging bundle path this op deletes in its finally block — so every
+        // later `git fetch`/`pull` on the node failed. When the manager sends
+        // a stable repo URL, repoint `origin` at it right after the clone
+        // (the bundle is a one-shot fetch source, never the upstream); with
+        // none, install the clearly-marked placeholder so the doomed path is
+        // never left in place.
+        const stableOrigin = typeof task.stableOrigin === "string" && task.stableOrigin.trim()
+          ? task.stableOrigin.trim()
+          : UNSET_ORIGIN_PLACEHOLDER;
         const unpackCmd = [
           `rm -rf ${shq(task.cwd)}`,
           `mkdir -p ${shq(task.cwd)}`,
           `git clone -q ${shq(bundlePath)} ${shq(task.cwd)}`,
+          stableOriginCommand(task.cwd, stableOrigin),
           task.commit ? `cd ${shq(task.cwd)} && git checkout -q ${shq(task.commit)}` : "",
           `if id -u svcuser >/dev/null 2>&1; then chown -R svcuser:svcuser ${shq(task.cwd)}; fi`,
           `cd ${shq(task.cwd)} && git rev-parse HEAD`,
@@ -217,7 +231,7 @@ OPS["xfer.unpack"] = async ({ task, io, context }: OpCtx) => {
         if (!/^[0-9a-f]{7,40}/m.test(out.trim())) {
           return JSON.stringify({ ok: false, error: `unpack failed: ${out.trim().slice(0, 300)}` });
         }
-        return JSON.stringify({ ok: true, commit: out.trim().split("\n").pop(), bytes: b64.length });
+        return JSON.stringify({ ok: true, commit: out.trim().split("\n").pop(), bytes: b64.length, stableOrigin });
       } finally {
         await (await import("node:fs/promises")).rm(accDir, { recursive: true, force: true }).catch(() => {});
       }
