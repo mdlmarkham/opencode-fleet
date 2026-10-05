@@ -41,6 +41,16 @@ import type { S1RouteDecision, S1RouteHarnessResult } from "./s1-wire.js";
  * workspace path.
  */
 
+
+/**
+ * Issue #165: the ONE dynamic import of the shadow module. Both the dispatch hook and
+ * the fleet_iterate progress judge go through here, so index.ts keeps exactly one
+ * dynamic import of the shadow module (the #79b wiring invariant) and s1 config/mode/egress/
+ * redaction are enforced in one place. Returns undefined when s1 is off/absent/invalid.
+ */
+
+
+
 interface FleetConfig {
   defaultTransport?: "http" | "acp";
   nodePrefixes?: string[];
@@ -451,10 +461,10 @@ export default definePluginEntry({
         // the ledger or any added field.
         if (cfg.s1 != null) {
           const shadowRoot = api.rootDir ?? process.cwd();
-          void import("./s1-shadow.js")
-            .then((shadow) => shadow.recordDispatchShadow(cfg.s1, { task: p.prompt, cwd: p.cwd }, shadowRoot))
+          void recordDispatchShadowVia(cfg.s1, { task: p.prompt, cwd: p.cwd }, shadowRoot)
             .catch(() => { /* the shadow path can never break dispatch */ });
         }
+
         // Issue #87, slice 3: OPT-IN S1 engine routing. Default OFF: with no
         // `route` param nothing runs here — no S1 call, no field added, and
         // the dispatch is byte-identical to routing being absent. When set,
@@ -1633,10 +1643,28 @@ export default definePluginEntry({
         //   -> probabilityTrue
         // decide() never throws and injectable transports make it unit-testable.
         const judgeOn = p.judgeProgress === true;
+        // Issue #165 review: the progress judge needs an objective signal. With no
+        // `expect` there is nothing verifiable to judge against — warn (do not silently
+        // compare worker prose).
+        const judgeWarning =
+          judgeOn && expectSpec.expect === undefined
+            ? "judgeProgress is on but the dispatch has no `expect` gate: there is no objective success signal to judge progress against; the estimate is advisory only."
+            : undefined;
+        // Issue #165 review: validate progressThreshold (NaN / out of [0,1] is an error,
+        // not a silent default that could mask a typo).
+        if (p.progressThreshold !== undefined) {
+          const t = p.progressThreshold;
+          if (typeof t !== "number" || Number.isNaN(t) || t < 0 || t > 1) {
+            return jsonResult({ ok: false, error: `progressThreshold must be a number in [0,1]; got ${JSON.stringify(p.progressThreshold)}` });
+          }
+        }
         const judgeThreshold = p.progressThreshold ?? 0.5;
         // Per-transition S1 samples, in order (a failed/absent decision records
         // judgeError; the loop's identical-output check stays the baseline).
         const judgeSamples: Array<{ probabilityTrue?: number; judgeError?: string }> = [];
+        // True when the S1 layer is in shadow (or unavailable): record, never act.
+        let judgeShadowMode = true;
+        const shadowProgressNotes: Array<{ iter: number; reason?: string; estimates?: unknown }> = [];
 
         for (let i = 1; i <= maxIter; i++) {
           const inv = await api.runtime.nodes.invoke({
@@ -1673,21 +1701,45 @@ export default definePluginEntry({
           // never permission; the deterministic baseline below always wins).
           if (judgeOn && i > 1) {
             const { buildProgressQuestion } = await import("./progressJudge.js");
-            const { decide } = await import("./decision.js");
-            const question = buildProgressQuestion({
-              acceptanceCriteria: p.prompt,
-              prevFailureOutput: prevFingerprint,
-              thisResult: (parsed.summary ?? "") + "|" + (parsed.error ?? ""),
-              verifyOutput: parsed.verifyDetails !== undefined ? JSON.stringify(parsed.verifyDetails).slice(0, 1000) : "no verification gate ran",
-            });
-            const r = await decide(
-              { state: { tool: "fleet_iterate", node: p.node, iteration: i }, questions: { progress: question } },
-              { timeoutMs: 30_000 },
-            );
-            if (r.ok && r.answers.progress.type === "boolean" && Number.isFinite(r.answers.progress.probabilityTrue)) {
-              judgeSamples.push({ probabilityTrue: r.answers.progress.probabilityTrue });
+            const { quoteUntrusted } = await import("./untrusted.js");
+            // Issue #165 review: go through the GUARDED decider (same path the
+            // dispatch hook uses), NOT the raw decide(). The guard enforces
+            // s1.mode (off => no call), backend egress opt-in, and REDACTION of
+            // the state/questions on egress; it also downgrades enforce->shadow
+            // when the model differs from the calibrated one.
+            const judgeDecider = await loadShadowDecider(cfg.s1, api.rootDir);
+            if (!judgeDecider) {
+              // No s1 config block, mode off, or invalid config: record nothing and
+              // leave the deterministic string-diff baseline in force.
+              judgeSamples.push({ judgeError: "S1 progress judge disabled (no s1 config / mode off / invalid)" });
+              judgeShadowMode = true;
             } else {
-              judgeSamples.push({ judgeError: r.ok ? "S1 answer not boolean/finite" : r.error });
+              // Worker output is UNTRUSTED: quote it as data and CAP it, so a worker
+              // that prints "answer true" cannot steer the judge.
+              const cap = (t: string) => (t.length > 1000 ? t.slice(0, 1000) + "…[truncated]" : t);
+              const question = buildProgressQuestion({
+                acceptanceCriteria: p.prompt,
+                prevFailureOutput: quoteUntrusted("previous-output", cap(prevFingerprint)),
+                thisResult: quoteUntrusted("this-output", cap((parsed.summary ?? "") + "|" + (parsed.error ?? ""))),
+                verifyOutput: quoteUntrusted("verify-output", cap(parsed.verifyDetails !== undefined ? JSON.stringify(parsed.verifyDetails) : "no verification gate ran")),
+              });
+              try {
+                const r = (await judgeDecider(
+                  { state: { tool: "fleet_iterate", node: p.node, iteration: i }, questions: { progress: question } },
+                  { timeoutMs: 30_000 },
+                )) as { ok?: boolean; answers?: Record<string, { type?: string; probabilityTrue?: number }>; error?: string; meta?: { effectiveMode?: string } };
+                const mode = r?.meta?.effectiveMode ?? "shadow";
+                judgeShadowMode = mode !== "enforce";
+                const ans = r?.answers?.progress;
+                if (r?.ok && ans?.type === "boolean" && Number.isFinite(ans.probabilityTrue)) {
+                  judgeSamples.push({ probabilityTrue: ans.probabilityTrue as number });
+                } else {
+                  judgeSamples.push({ judgeError: r?.ok ? "S1 answer not boolean/finite" : (r?.error ?? "S1 unavailable") });
+                }
+              } catch {
+                judgeSamples.push({ judgeError: "S1 call threw" });
+                judgeShadowMode = true;
+              }
             }
           }
           prevFingerprint = fingerprint;
@@ -1764,7 +1816,10 @@ export default definePluginEntry({
               identicalConsecutive: !progress,
               threshold: judgeThreshold ?? DEFAULT_PROGRESS_THRESHOLD,
             });
-            if (verdict.escalate) {
+            // Issue #165 review: SHADOW-FIRST. In shadow (or when S1 is off/unavailable)
+            // we RECORD the estimate and change nothing; only an effective mode of
+            // `enforce` lets the S1 estimate actually stop the loop.
+            if (verdict.escalate && !judgeShadowMode) {
               return jsonResult(
                 withVerified(
                   {
@@ -1779,6 +1834,10 @@ export default definePluginEntry({
                   lastOutcome,
                 ),
               );
+            }
+            // Shadow: surface the S1 estimate as evidence, act on nothing.
+            if (verdict.escalate && judgeShadowMode) {
+              shadowProgressNotes.push({ iter: i, reason: verdict.reason, estimates: verdict.s1Estimates });
             }
           }
 
@@ -2825,3 +2884,18 @@ function payloadOf(inv: unknown): Record<string, unknown> {
   return ((payload as Record<string, unknown> | undefined) ?? {});
 }
 
+async function loadShadowModule(): Promise<{ buildShadowDecider: (cfg: unknown, deps?: unknown) => unknown; recordDispatchShadow: (cfg: unknown, ctx: { task: string; cwd: string }, rootDir: string) => Promise<void> }> {
+  return import("./s1-shadow.js") as Promise<never>;
+}
+
+async function loadShadowDecider(cfgS1: unknown, rootDir?: string): Promise<((input: unknown, opts?: unknown) => Promise<unknown>) | undefined> {
+  const mod = await loadShadowModule();
+  return mod.buildShadowDecider(cfgS1 ?? {}, { ...(rootDir ? { rootDir } : {}) }) as
+    | ((input: unknown, opts?: unknown) => Promise<unknown>)
+    | undefined;
+}
+
+async function recordDispatchShadowVia(cfgS1: unknown, ctx: { task: string; cwd: string }, rootDir: string): Promise<void> {
+  const mod = await loadShadowModule();
+  return mod.recordDispatchShadow(cfgS1, ctx, rootDir);
+}
