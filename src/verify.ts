@@ -4,15 +4,19 @@
  * A worker that exits 0 but produced nothing must not be reported as a
  * success. `fleet_dispatch` accepts an optional `expect` spec:
  *
- *     { files?: string[]; command?: string }
+ *     { files?: string[]; command?: string; commands?: string[]; timeoutMs?: number }
  *
  * After the worker process finishes, the NODE evaluates the spec in the run's
  * cwd and records the outcome alongside the run result:
  *
  *   - every path in `expect.files` must exist (relative to cwd, and inside it:
  *     absolute paths and `..` are refused, symlinks that leave cwd do not count);
- *   - if `expect.command` is given, it is run via `bash -c` in cwd and must
- *     exit 0.
+ *   - if `expect.command`/`expect.commands` is given, each command is run via
+ *     `bash -c` in cwd and must exit 0; with `commands[]` EVERY command must
+ *     exit 0 for the gate to pass (issue #104), each bounded by `timeoutMs`
+ *     (shared, overrides the default) or DEFAULT_EXPECT_COMMAND_TIMEOUT_MS. The
+ *     singular `command` is normalized onto the plural so there is ONE
+ *     evaluation path.
  *
  * The outcome is recorded as `verified: boolean` + `verifyDetails` on the
  * run result. `verified` is deliberately DISTINCT from `ok` (`ok` remains the
@@ -32,8 +36,34 @@ import { isAbsolute, relative, resolve, sep } from "node:path";
 export interface ExpectCheck {
   /** Paths relative to the run cwd that must exist after the run (absolute paths and `..` are refused). */
   files?: string[];
-  /** Command run via `bash -c` in the run cwd; must exit 0. */
+  /**
+   * Single-command alias (issue #104): normalized onto `commands` so there is
+   * ONE evaluation path. Kept working unchanged for backward compatibility.
+   */
   command?: string;
+  /** Commands run via `bash -c` in the run cwd; EVERY one must exit 0 (issue #104). */
+  commands?: string[];
+  /** Shared wall-clock bound for every command; overrides DEFAULT_EXPECT_COMMAND_TIMEOUT_MS when given (issue #104). */
+  timeoutMs?: number;
+}
+
+/**
+ * The normalized gate: `command` (singular) is folded onto `commands` here so
+ * every consumer (evaluateExpect, the launcher gate script) sees ONE shape.
+ */
+export interface NormalizedExpectCheck {
+  files?: string[];
+  commands: string[];
+  timeoutMs?: number;
+}
+
+/** Normalize a parsed spec onto the single plural evaluation path (issue #104). */
+export function normalizeExpect(expect: ExpectCheck): NormalizedExpectCheck {
+  const commands = expect.commands ?? (expect.command !== undefined ? [expect.command] : []);
+  const out: NormalizedExpectCheck = { commands };
+  if (expect.files !== undefined) out.files = expect.files;
+  if (expect.timeoutMs !== undefined) out.timeoutMs = expect.timeoutMs;
+  return out;
 }
 
 /** Per-path outcome of the file-existence check. */
@@ -42,7 +72,7 @@ export interface ExpectFileCheck {
   ok: boolean;
 }
 
-/** Outcome of the verification command (absent when no command was given). */
+/** Outcome of one verification command. */
 export interface ExpectCommandCheck {
   cmd: string;
   exitCode: number | null;
@@ -52,7 +82,10 @@ export interface ExpectCommandCheck {
 /** Full result of evaluating an `expect` spec. */
 export interface VerifyDetails {
   files: ExpectFileCheck[];
+  /** The FIRST command's outcome (singular compatibility, issue #104). */
   command?: ExpectCommandCheck;
+  /** Every command's outcome, in order (issue #104). */
+  commands?: ExpectCommandCheck[];
 }
 
 /** Outcome recorded on the run result (issue #62). */
@@ -80,9 +113,9 @@ export type ExpectSpecResult = { ok: true; expect?: ExpectCheck } | { ok: false;
 export function parseExpectSpec(value: unknown): ExpectSpecResult {
   if (value === undefined || value === null) return { ok: true, expect: undefined };
   if (typeof value !== "object" || Array.isArray(value)) {
-    return { ok: false, error: "expect must be an object {files?, command?}" };
+    return { ok: false, error: "expect must be an object {files?, command?, commands?, timeoutMs?}" };
   }
-  const e = value as { files?: unknown; command?: unknown };
+  const e = value as { files?: unknown; command?: unknown; commands?: unknown; timeoutMs?: unknown };
   const bad = (msg: string): ExpectSpecResult => ({ ok: false, error: msg });
 
   let files: string[] | undefined;
@@ -112,11 +145,44 @@ export function parseExpectSpec(value: unknown): ExpectSpecResult {
     command = e.command;
   }
 
+  // Issue #104: the plural gate. Each entry is validated like the single
+  // `command` (non-empty, no NUL) so the plural cannot smuggle what the
+  // singular would refuse.
+  let commands: string[] | undefined;
+  if (e.commands !== undefined) {
+    if (!Array.isArray(e.commands) || e.commands.some((c) => typeof c !== "string" || c.trim().length === 0)) {
+      return bad("expect.commands must be an array of non-empty strings");
+    }
+    for (const c of e.commands as string[]) {
+      if (c.includes("\0")) return bad("expect.commands entries must not contain NUL");
+    }
+    commands = e.commands as string[];
+  }
+
+  // Issue #104: the shared bound. A malformed number would otherwise silently
+  // fall back to the default or wedge the gate; refuse instead.
+  let timeoutMs: number | undefined;
+  if (e.timeoutMs !== undefined) {
+    if (typeof e.timeoutMs !== "number" || !Number.isFinite(e.timeoutMs) || e.timeoutMs <= 0) {
+      return bad("expect.timeoutMs must be a positive number of milliseconds");
+    }
+    timeoutMs = e.timeoutMs;
+  }
+
   if (files !== undefined && files.length === 0) files = undefined; // an empty file list checks nothing
-  if (files === undefined && command === undefined) {
+  if (commands !== undefined && commands.length === 0) commands = undefined; // an empty command list checks nothing
+  if (files === undefined && command === undefined && commands === undefined) {
+    // Exact historical text (issue #65 pins it): the plural does not change the
+    // "checks nothing" refusal.
     return { ok: false, error: "expect requires at least one of files or command" };
   }
-  return { ok: true, expect: { files, command } };
+  const expect: ExpectCheck = {
+    ...(files !== undefined ? { files } : {}),
+    ...(command !== undefined ? { command } : {}),
+    ...(commands !== undefined ? { commands } : {}),
+    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+  };
+  return { ok: true, expect };
 }
 
 /**
@@ -147,31 +213,49 @@ export async function expectFileOk(cwd: string, p: string): Promise<boolean> {
 }
 
 /**
- * The pure evaluator for the expect gate (issue #62).
+ * The pure evaluator for the expect gate (issue #62; plural for issue #104).
  *
- * Checks every path in `files` (relative to `cwd`), runs `command` via
- * `bash -c` in `cwd` when given, and derives `verified` as: all files exist
- * AND (no command OR command exited 0). Never throws for expected failure
- * modes — a missing file, a failing command, or a killed command all produce
- * an honest `verified: false` outcome.
+ * Checks every path in `files` (relative to `cwd`), runs every command in
+ * `commands` (the singular `command` is normalized onto it) via `bash -c` in
+ * `cwd`, honoring the shared `timeoutMs` bound, and derives `verified` as: all
+ * files exist AND every command exited 0 (issue #104: EVERY command must pass
+ * for the gate to pass). Never throws for expected failure modes — a missing
+ * file, a failing command, or a killed command all produce an honest
+ * `verified: false` outcome.
  */
 export async function evaluateExpect(
   expect: ExpectCheck,
   cwd: string,
   opts: EvaluateExpectOptions = {},
 ): Promise<ExpectOutcome> {
+  const norm = normalizeExpect(expect);
   const files: ExpectFileCheck[] = await Promise.all(
-    (expect.files ?? []).map(async (p) => ({ path: p, ok: await expectFileOk(cwd, p) })),
+    (norm.files ?? []).map(async (p) => ({ path: p, ok: await expectFileOk(cwd, p) })),
   );
 
-  let command: ExpectCommandCheck | undefined;
-  if (typeof expect.command === "string" && expect.command.trim().length > 0) {
-    command = await runExpectCommand(expect.command, cwd, opts.commandTimeoutMs ?? DEFAULT_EXPECT_COMMAND_TIMEOUT_MS);
+  const commands: ExpectCommandCheck[] = [];
+  for (const cmd of norm.commands) {
+    if (typeof cmd !== "string" || cmd.trim().length === 0) continue;
+    commands.push(
+      await runExpectCommand(cmd, cwd, expect.timeoutMs ?? opts.commandTimeoutMs ?? DEFAULT_EXPECT_COMMAND_TIMEOUT_MS),
+    );
   }
 
   const verified =
-    files.every((f) => f.ok) && (command ? command.ok : true);
-  return { verified, verifyDetails: command ? { files, command } : { files } };
+    files.every((f) => f.ok) && commands.every((c) => c.ok);
+  if (commands.length === 0) return { verified, verifyDetails: { files } };
+  // Issue #104: the ledger shape follows the WIRE shape — a singular `command`
+  // records the exact legacy `{files, command}` details (byte-identical, so
+  // old consumers keep reading the same shape), only a plural `commands[]`
+  // adds the `commands` array (the legacy `command` key stays on the FIRST
+  // entry there for the same reason).
+  if (expect.commands === undefined) {
+    return { verified, verifyDetails: { files, command: commands[0] } };
+  }
+  return {
+    verified,
+    verifyDetails: { files, commands, command: commands[0] },
+  };
 }
 
 /** Hard bound on how long we wait for the whole process group to disappear after SIGKILL. */
@@ -278,8 +362,12 @@ export const GATE_RELAY_GRACE_MS = 15_000;
 /**
  * The relay timeout for a run that carries a gate: the worker's own budget PLUS
  * the gate's bound and a grace period, so a worker that uses its whole budget
- * still returns `verified` instead of the relay timing out mid-gate.
+ * still returns `verified` instead of the relay timing out mid-gate. Issue
+ * #104: a spec-declared shared `timeoutMs` overrides the default bound in the
+ * budget too (bounded below by the default so the relay never budgets LESS
+ * than the historical grace).
  */
-export function relayTimeoutWithGate(timeoutMs: number, hasGate: boolean): number {
-  return hasGate ? timeoutMs + DEFAULT_EXPECT_COMMAND_TIMEOUT_MS + GATE_RELAY_GRACE_MS : timeoutMs;
+export function relayTimeoutWithGate(timeoutMs: number, hasGate: boolean, gate?: ExpectCheck): number {
+  if (!hasGate) return timeoutMs;
+  return timeoutMs + Math.max(gate?.timeoutMs ?? DEFAULT_EXPECT_COMMAND_TIMEOUT_MS, DEFAULT_EXPECT_COMMAND_TIMEOUT_MS) + GATE_RELAY_GRACE_MS;
 }

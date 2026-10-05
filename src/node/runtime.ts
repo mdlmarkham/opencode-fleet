@@ -442,6 +442,11 @@ export interface VerifyGateOptions {
  * defensively and fail closed (verification cannot be satisfied) if that
  * somehow fails.
  *
+ * Issue #104: the gate may carry a plural `commands[]` (every entry must exit
+ * 0) with a shared `timeoutMs`; a singular `command` is normalized onto the
+ * same plural loop so bash has one evaluation path too. The recorded details
+ * keep the legacy singular `command` key on the FIRST entry for old consumers.
+ *
  * All values are pre-escaped in TypeScript (shq for bash, JSON.stringify for
  * the recorded strings), so bash only moves literals around — no expansion of
  * untrusted content happens on the node.
@@ -452,8 +457,14 @@ export function verifyGateScript(
   opts: VerifyGateOptions,
 ): { verifyLines: string[]; doneLine: string } {
   const files = (expect.files ?? []).filter((p) => typeof p === "string" && p.length > 0);
-  const command = typeof expect.command === "string" && expect.command.trim().length > 0 ? expect.command : undefined;
-  const timeoutSec = Math.max(1, Math.round((opts.commandTimeoutMs ?? DEFAULT_EXPECT_COMMAND_TIMEOUT_MS) / 1000));
+  const commands = (expect.commands ?? (expect.command !== undefined ? [expect.command] : []))
+    .filter((c): c is string => typeof c === "string" && c.trim().length > 0);
+  // Legacy shape: a singular `command` spec generates the exact historical
+  // lines (issue #62 tests pin them); a plural `commands` spec takes the
+  // normalized loop. One evaluation semantics (every command must exit 0,
+  // bounded); only the emitted bytes differ for wire-shape compatibility.
+  const plural = expect.commands !== undefined;
+  const sharedTimeout = expect.timeoutMs ?? opts.commandTimeoutMs ?? DEFAULT_EXPECT_COMMAND_TIMEOUT_MS;
 
   const lines: string[] = [
     "# Issue #62: post-run verification gate, evaluated in the run's cwd after the worker exits.",
@@ -481,25 +492,55 @@ export function verifyGateScript(
     lines.push("__V_SEP=','");
     lines.push("done");
   }
-  if (command) {
-    lines.push("__V_JCMD=" + shq(JSON.stringify(command)));
+  if (commands.length) {
+    // Issue #104: the plural path is a normalized loop over the commands —
+    // each runs via `bash -c`, must exit 0, and is bounded (record order
+    // preserved). A singular `command` (plural === false) keeps the EXACT
+    // legacy fragment bytes (issue #62 tests pin them) — but it is the SAME
+    // evaluation semantics: run 1 command, require exit 0. One normalized
+    // representation in TypeScript (the `commands` array above) drives both;
+    // only the emitted bytes differ for wire-shape compatibility.
+    const timeoutSec = String(Math.max(1, Math.round(sharedTimeout / 1000)));
+    if (!plural) {
+      const command = commands[0];
+      lines.push("__V_JCMD=" + shq(JSON.stringify(command)));
+      lines.push('if [ "$__V_CDW" = true ]; then');
+      lines.push(
+        `  if timeout -k 5 ${timeoutSec} bash -c ${shq(command)} >/dev/null 2>&1; then __V_CMD_OK=true; __V_CMD_EXIT=0; else __V_CMD_EXIT=$?; __V_CMD_OK=false; __V_ALL_OK=false; fi`,
+      );
+      lines.push('  __V_CMD_JSON="{\\\"cmd\\\":$__V_JCMD,\\\"exitCode\\\":$__V_CMD_EXIT,\\\"ok\\\":$__V_CMD_OK}"');
+      lines.push("else");
+      lines.push("  __V_CMD_OK=false; __V_ALL_OK=false");
+      lines.push('  __V_CMD_JSON="{\\\"cmd\\\":$__V_JCMD,\\\"exitCode\\\":null,\\\"ok\\\":false}"');
+      lines.push("fi");
+      lines.push('__V_DETAILS="{\\\"files\\\":[$__V_FILES_JSON],\\\"command\\":$__V_CMD_JSON}"');
+    } else {
+    lines.push(`__V_CMDS=( ${commands.map(shq).join(" ")} )`);
+    lines.push(`__V_JCMDS=( ${commands.map((c) => shq(JSON.stringify(c))).join(" ")} )`);
+    lines.push(`__V_TOOLS=( ${commands.map(() => String(Math.max(1, Math.round(sharedTimeout / 1000)))).join(" ")} )`);
+    lines.push("__V_CMDS_JSON=''");
+    lines.push("__V_SEP=''");
+    lines.push('for __i in "${!__V_CMDS[@]}"; do');
     lines.push('if [ "$__V_CDW" = true ]; then');
     lines.push(
-      `  if timeout -k 5 ${timeoutSec} bash -c ${shq(command)} >/dev/null 2>&1; then __V_CMD_OK=true; __V_CMD_EXIT=0; else __V_CMD_EXIT=$?; __V_CMD_OK=false; __V_ALL_OK=false; fi`,
+      `  if timeout -k 5 "\${__V_TOOLS[$__i]}" bash -c "\${__V_CMDS[$__i]}" >/dev/null 2>&1; then __V_CMD_OK=true; __V_CMD_EXIT=0; else __V_CMD_EXIT=$?; __V_CMD_OK=false; __V_ALL_OK=false; fi`,
     );
-    lines.push('  __V_CMD_JSON="{\\\"cmd\\\":$__V_JCMD,\\\"exitCode\\\":$__V_CMD_EXIT,\\\"ok\\\":$__V_CMD_OK}"');
+    lines.push('  __V_CMD_JSON="{\\\"cmd\\\":${__V_JCMDS[$__i]},\\\"exitCode\\\":$__V_CMD_EXIT,\\\"ok\\\":$__V_CMD_OK}"');
     lines.push("else");
     lines.push("  __V_CMD_OK=false; __V_ALL_OK=false");
-    lines.push('  __V_CMD_JSON="{\\\"cmd\\\":$__V_JCMD,\\\"exitCode\\\":null,\\\"ok\\\":false}"');
+    lines.push('  __V_CMD_JSON="{\\\"cmd\\\":${__V_JCMDS[$__i]},\\\"exitCode\\\":null,\\\"ok\\\":false}"');
     lines.push("fi");
+    lines.push('  __V_CMDS_JSON="${__V_CMDS_JSON}${__V_SEP}$__V_CMD_JSON"');
+    lines.push('  if [ "$__i" -eq 0 ]; then __V_FIRST_JSON="$__V_CMD_JSON"; fi');
+    lines.push("__V_SEP=','");
+    lines.push("done");
+    lines.push(
+      '__V_DETAILS="{\\\"files\\\":[$__V_FILES_JSON],\\\"command\\":$__V_FIRST_JSON,\\\"commands\\":[$__V_CMDS_JSON]}"',
+    );
+    }
+  } else {
+    lines.push('__V_DETAILS="{\\\"files\\\":[$__V_FILES_JSON]}"');
   }
-  // verifyDetails is fully assembled by the generator: the accumulated JSON
-  // file array, plus the command object only when one was given.
-  lines.push(
-    command
-      ? '__V_DETAILS="{\\\"files\\\":[$__V_FILES_JSON],\\\"command\\\":$__V_CMD_JSON}"'
-      : '__V_DETAILS="{\\\"files\\\":[$__V_FILES_JSON]}"',
-  );
   const doneLine =
     `printf '{"done":1,"exitCode":%s,"finishedAt":"%s","verified":%s,"verifyDetails":%s}\\n' "$EC" "$(date -u +%FT%TZ)" "$__V_ALL_OK" "$__V_DETAILS" > ${shq(donePath)}`;
   return { verifyLines: lines, doneLine };

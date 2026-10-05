@@ -4,7 +4,7 @@
  *
  * `fleet_dispatch` accepts it as an optional `spec` param:
  *
- *     { goal: string; acceptance?: string[]; verify?: { files?: string[]; command?: string } }
+ *     { goal: string; acceptance?: string[]; verify?: { files?: string[]; command?: string; commands?: string[]; timeoutMs?: number } }
  *
  * When a spec is given the engine prompt is RENDERED from `goal` +
  * `acceptance` (the flat `prompt` param is then ignored), and `verify` is
@@ -31,8 +31,22 @@ export interface TaskSpec {
   goal: string;
   /** Acceptance criteria, rendered as a bullet list under "Acceptance criteria:". */
   acceptance?: string[];
-  /** Post-run verification gate (same shape + semantics as the flat `expect` param, issue #62). */
-  verify?: { files?: string[]; command?: string };
+  /**
+   * Post-run verification gate (same shape + semantics as the flat `expect`
+   * param, issue #62). Issue #104: `commands[]` runs EVERY command (each must
+   * exit 0) with a shared `timeoutMs` bound; `command` stays as a working
+   * single-command alias for one-element `commands`.
+   */
+  verify?: {
+    /** Paths relative to the run cwd that must exist after the run. */
+    files?: string[];
+    /** Single-command alias for `commands: [command]` (kept for one release). */
+    command?: string;
+    /** Post-run verification commands run in the run cwd; EVERY one must exit 0 for the gate to pass (issue #104). */
+    commands?: string[];
+    /** Shared wall-clock bound applied to every command; overrides DEFAULT_EXPECT_COMMAND_TIMEOUT_MS when given (issue #104). */
+    timeoutMs?: number;
+  };
   /** Advisory file scope (issue #65 slice 2): repo-relative paths/globs the task should stay within. */
   scope?: { files: string[] };
 }

@@ -290,7 +290,9 @@ export default definePluginEntry({
                 additionalProperties: false,
                 properties: {
         //  paths are treated as relative to the run cwd.
-                  command: { type: "string", description: "Verification command run in the run cwd after the worker exits; must exit 0 — same semantics as expect.command. Bounded to 120s." },
+                  command: { type: "string", description: "Verification command run in the run cwd after the worker exits; must exit 0 — same semantics as expect.command. Bounded to 120s unless timeoutMs is given." },
+                  commands: { type: "array", items: { type: "string" }, description: "Issue #104: plural verification gate — EVERY command is run in the run cwd after the worker exits and must exit 0 for the gate to pass. `command` below stays as a working single-command alias; do not pass both. Same setup-command rule as expect.command." },
+                  timeoutMs: { type: "number", description: "Issue #104: shared wall-clock bound applied to every verification command, ms; overrides the default 120000." },
                 },
                 description: "Post-run verification gate — mapped onto the existing `expect` gate (issue #62/#40). Absent => no gate, nothing extra is emitted.",
               },
@@ -333,7 +335,9 @@ export default definePluginEntry({
             additionalProperties: false,
             properties: {
               files: { type: "array", items: { type: "string" }, description: "Artifact paths that must exist after the run (relative to the run cwd and inside it: absolute paths and `..` are refused), e.g. ['dist/index.js', 'docs/api.md']." },
-              command: { type: "string", description: "Verification command run via `bash -c` in the run cwd after the worker exits; must exit 0. Bounded to 120s (process group killed). It runs outside the engine's permission system, so it must be a repo-relative script path with plain arguments (e.g. `./scripts/check.sh --fast`) unless the operator set allowSetupCommands; an arbitrary shell command such as `npm test && echo ok` is refused." },
+              command: { type: "string", description: "Verification command run via `bash -c` in the run cwd after the worker exits; must exit 0. Bounded to 120s unless timeoutMs is given (process group killed). It runs outside the engine's permission system, so it must be a repo-relative script path with plain arguments (e.g. `./scripts/check.sh --fast`) unless the operator set allowSetupCommands; an arbitrary shell command such as `npm test && echo ok` is refused." },
+              commands: { type: "array", items: { type: "string" }, description: "Issue #104: plural gate — EVERY command runs via `bash -c` in the run cwd after the worker exits and must exit 0 for the gate to pass, each bounded by the shared timeoutMs. Same setup-command rule as expect.command (repo-relative script paths unless allowSetupCommands). Do not pass both command and commands." },
+              timeoutMs: { type: "number", description: "Issue #104: shared wall-clock bound applied to every verification command, ms; overrides the default 120000." },
             },
             description: "Optional post-run verification gate (issue #62). After the worker exits, the node checks that every listed file exists and — when given — that the command exits 0, recording verified/verifyDetails on the run result. verified is separate from ok (which stays the process exit status): use it so a run that exits 0 but produced nothing is not trusted as success. Read it from fleet_await or fleet_run_status.",
           },
@@ -378,8 +382,8 @@ export default definePluginEntry({
           async?: boolean;
           isolation?: "none" | "clone";
           env?: Record<string, string>;
-          expect?: { files?: string[]; command?: string };
-          spec?: { goal: string; acceptance?: string[]; verify?: { files?: string[]; command?: string }; scope?: { files: string[] } };
+          expect?: { files?: string[]; command?: string; commands?: string[]; timeoutMs?: number };
+          spec?: { goal: string; acceptance?: string[]; verify?: { files?: string[]; command?: string; commands?: string[]; timeoutMs?: number }; scope?: { files: string[] } };
           ref?: { branch?: string; commit?: string };
           requires?: {
             gpu?: boolean;
@@ -581,9 +585,16 @@ export default definePluginEntry({
         // `expect.command` runs on the node OUTSIDE the engine's permission system,
         // so it gets the same rule as provision `setup`: a repo-relative script
         // path unless the operator allows arbitrary commands (issue #34).
+        // Issue #104: every plural `commands[]` entry gets the SAME rule.
         if (expectSpec.expect?.command) {
           const cmdCheck = checkSetup(expectSpec.expect.command, cfg.allowSetupCommands === true);
           if (!cmdCheck.ok) return jsonResult({ ok: false, error: `invalid expect.command: ${cmdCheck.error}` });
+        }
+        if (expectSpec.expect?.commands) {
+          for (const cmd of expectSpec.expect.commands) {
+            const cmdCheck = checkSetup(cmd, cfg.allowSetupCommands === true);
+            if (!cmdCheck.ok) return jsonResult({ ok: false, error: `invalid expect.commands entry: ${cmdCheck.error}` });
+          }
         }
         const { upsertRun, newRunId, probeRun, loadLedger, outcomeEntry } = await import("./ledger.js");
         const rootDir = api.rootDir ?? process.cwd();
@@ -840,7 +851,7 @@ export default definePluginEntry({
                 nodeId: node.nodeId,
                 command: "opencode.run",
                 params: task,
-                timeoutMs: task.timeoutMs === undefined ? undefined : relayTimeoutWithGate(task.timeoutMs, expectSpec.expect !== undefined),
+                timeoutMs: task.timeoutMs === undefined ? undefined : relayTimeoutWithGate(task.timeoutMs, expectSpec.expect !== undefined, expectSpec.expect),
                 signal,
               })
               .catch((err: Error) => ({
@@ -1731,7 +1742,9 @@ export default definePluginEntry({
             additionalProperties: false,
             properties: {
               files: { type: "array", items: { type: "string" }, description: "Artifact paths that must exist after each iteration (relative to the run cwd and inside it: absolute paths and `..` are refused)." },
-              command: { type: "string", description: "Verification command run via `bash -c` in the run cwd after the worker exits; must exit 0. Bounded to 120s (process group killed). It runs outside the engine's permission system, so it must be a repo-relative script path with plain arguments (e.g. `./scripts/check.sh --fast`) unless the operator set allowSetupCommands; an arbitrary shell command such as `npm test && echo ok` is refused." },
+              command: { type: "string", description: "Verification command run via `bash -c` in the run cwd after the worker exits; must exit 0. Bounded to 120s unless timeoutMs is given (process group killed). It runs outside the engine's permission system, so it must be a repo-relative script path with plain arguments (e.g. `./scripts/check.sh --fast`) unless the operator set allowSetupCommands; an arbitrary shell command such as `npm test && echo ok` is refused." },
+              commands: { type: "array", items: { type: "string" }, description: "Issue #104: plural gate — EVERY command runs via `bash -c` in the run cwd after the worker exits and must exit 0 for the gate to pass, each bounded by the shared timeoutMs. Same setup-command rule as expect.command (repo-relative script paths unless allowSetupCommands). Do not pass both command and commands." },
+              timeoutMs: { type: "number", description: "Issue #104: shared wall-clock bound applied to every verification command, ms; overrides the default 120000." },
             },
             description: "Optional post-run verification gate (issue #62), identical to fleet_dispatch.expect: after each iteration the node records verified/verifyDetails on the result. An iteration with verified:false is NOT success — the loop keeps iterating (or escalates) instead of stopping there.",
           },
@@ -1749,7 +1762,7 @@ export default definePluginEntry({
           timeoutMs?: number;
           successMarker?: string;
           noProgressEscalate?: boolean;
-          expect?: { files?: string[]; command?: string };
+          expect?: { files?: string[]; command?: string; commands?: string[]; timeoutMs?: number };
         };
         const list = await api.runtime.nodes.list();
         const node = (list.nodes ?? []).find((n) => n.displayName === p.node || n.nodeId === p.node);
@@ -1769,6 +1782,12 @@ export default definePluginEntry({
         if (expectSpec.expect?.command) {
           const cmdCheck = checkSetup(expectSpec.expect.command, cfg.allowSetupCommands === true);
           if (!cmdCheck.ok) return jsonResult({ ok: false, error: `invalid expect.command: ${cmdCheck.error}` });
+        }
+        if (expectSpec.expect?.commands) {
+          for (const cmd of expectSpec.expect.commands) {
+            const cmdCheck = checkSetup(cmd, cfg.allowSetupCommands === true);
+            if (!cmdCheck.ok) return jsonResult({ ok: false, error: `invalid expect.commands entry: ${cmdCheck.error}` });
+          }
         }
 
         const maxIter = p.maxIterations ?? 5;
@@ -1791,7 +1810,7 @@ export default definePluginEntry({
               timeoutMs: p.timeoutMs ?? 300_000,
               expect: expectSpec.expect,
             },
-            timeoutMs: relayTimeoutWithGate(p.timeoutMs ?? 300_000, expectSpec.expect !== undefined),
+            timeoutMs: relayTimeoutWithGate(p.timeoutMs ?? 300_000, expectSpec.expect !== undefined, expectSpec.expect),
             signal,
           });
           const payload = (inv as { payload?: unknown }).payload;
@@ -1907,7 +1926,9 @@ export default definePluginEntry({
             additionalProperties: false,
             properties: {
               files: { type: "array", items: { type: "string" }, description: "Artifact paths that must exist after the run (relative to the run cwd and inside it: absolute paths and `..` are refused)." },
-              command: { type: "string", description: "Verification command run via `bash -c` in the run cwd after the worker exits; must exit 0. Bounded to 120s (process group killed). It runs outside the engine's permission system, so it must be a repo-relative script path with plain arguments (e.g. `./scripts/check.sh --fast`) unless the operator set allowSetupCommands; an arbitrary shell command such as `npm test && echo ok` is refused." },
+              command: { type: "string", description: "Verification command run via `bash -c` in the run cwd after the worker exits; must exit 0. Bounded to 120s unless timeoutMs is given (process group killed). It runs outside the engine's permission system, so it must be a repo-relative script path with plain arguments (e.g. `./scripts/check.sh --fast`) unless the operator set allowSetupCommands; an arbitrary shell command such as `npm test && echo ok` is refused." },
+              commands: { type: "array", items: { type: "string" }, description: "Issue #104: plural gate — EVERY command runs via `bash -c` in the run cwd after the worker exits and must exit 0 for the gate to pass, each bounded by the shared timeoutMs. Same setup-command rule as expect.command (repo-relative script paths unless allowSetupCommands). Do not pass both command and commands." },
+              timeoutMs: { type: "number", description: "Issue #104: shared wall-clock bound applied to every verification command, ms; overrides the default 120000." },
             },
             description: "Optional post-run verification gate (issue #62), identical to fleet_dispatch.expect: after the worker exits the node records verified/verifyDetails on the result. A FAILED gate means the watched run must not be reported as successful work.",
           },
@@ -1923,7 +1944,7 @@ export default definePluginEntry({
           transport?: "http" | "acp";
           timeoutMs?: number;
           pollMs?: number;
-          expect?: { files?: string[]; command?: string };
+          expect?: { files?: string[]; command?: string; commands?: string[]; timeoutMs?: number };
         };
         const list = await api.runtime.nodes.list();
         const node = (list.nodes ?? []).find((n) => n.displayName === p.node || n.nodeId === p.node);
@@ -1944,6 +1965,12 @@ export default definePluginEntry({
           const cmdCheck = checkSetup(expectSpec.expect.command, cfg.allowSetupCommands === true);
           if (!cmdCheck.ok) return jsonResult({ ok: false, error: `invalid expect.command: ${cmdCheck.error}` });
         }
+        if (expectSpec.expect?.commands) {
+          for (const cmd of expectSpec.expect.commands) {
+            const cmdCheck = checkSetup(cmd, cfg.allowSetupCommands === true);
+            if (!cmdCheck.ok) return jsonResult({ ok: false, error: `invalid expect.commands entry: ${cmdCheck.error}` });
+          }
+        }
 
         const timeoutMs = p.timeoutMs ?? 300_000;
         const pollMs = p.pollMs ?? 15_000;
@@ -1962,7 +1989,7 @@ export default definePluginEntry({
             timeoutMs,
             expect: expectSpec.expect,
           },
-          timeoutMs: relayTimeoutWithGate(timeoutMs, expectSpec.expect !== undefined),
+          timeoutMs: relayTimeoutWithGate(timeoutMs, expectSpec.expect !== undefined, expectSpec.expect),
           signal,
         });
 
