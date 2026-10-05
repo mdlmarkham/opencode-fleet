@@ -69,6 +69,15 @@
           }
         }
       },
+      "workerGitIdentity": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Opt-in (issue #189): fleet_provision sets this git identity in each provisioned checkout's LOCAL config (only when the checkout has none), so worker-authored commits are distinguishable from a person's in review. Defaults name `fleet-worker`, email `fleet-worker@<node>.invalid`. SSH-provisioned nodes only.",
+        "properties": {
+          "name": { "type": "string" },
+          "email": { "type": "string" }
+        }
+      },
       "dispatch": {
         "type": "object",
         "additionalProperties": false,
