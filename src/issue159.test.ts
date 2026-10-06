@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -90,6 +90,41 @@ describe.skipIf(!gitAvailable)("#159: check-hygiene", () => {
       expect(r.status).not.toBe(0);
       expect(r.output).toContain("node_modules/pkg/index.js");
     } finally { rmSync(repo, { recursive: true, force: true }); }
+  });
+
+  it("the dot-prefixed fleet_sync brief convention is refused too (issue #205), at any depth", () => {
+    for (const name of [".fleet-TASK-39.md", ".TASK-1.md", "docs/.fleet-TASK-9.md"]) {
+      const bad = repoWith({ [name]: "brief\n" });
+      try {
+        const r = runGuard(bad);
+        expect(r.status, name).not.toBe(0);
+        expect(r.output).toContain(name);
+      } finally { rmSync(bad, { recursive: true, force: true }); }
+    }
+  });
+
+  it("the tracked .fleet/ project record and other lookalikes are NOT caught (issue #205)", () => {
+    const ok = repoWith({
+      ".fleet/charter.md": "charter\n",
+      ".fleet/rules.yml": "rules: []\n",
+      ".fleet/decisions/0001-use-tasks.md": "decision\n",
+      ".fleet/decisions/0004-no-TASK-files.md": "decision\n",
+      "NOTES-TASK.md": "notes\n",
+      ".hidden-notes.md": "notes\n",
+      ".TASK.md": "no dash\n",
+      "docs/TASKS.md": "plural\n",
+    });
+    try {
+      const r = runGuard(ok);
+      expect(r.status, r.output).toBe(0);
+    } finally { rmSync(ok, { recursive: true, force: true }); }
+  });
+
+  it(".gitignore ignores the same briefs and not the .fleet/ record", () => {
+    const repoRoot = dirname(dirname(scriptPath));
+    const ignored = (p: string): boolean => spawnSync("git", ["-C", repoRoot, "check-ignore", "-q", "--no-index", p]).status === 0;
+    for (const p of ["TASK-39.md", ".fleet-TASK-39.md", "docs/.fleet-TASK-9.md"]) expect(ignored(p), p).toBe(true);
+    for (const p of [".fleet/charter.md", ".fleet/rules.yml", ".fleet/decisions/0001-use-tasks.md", "NOTES-TASK.md", ".hidden-notes.md"]) expect(ignored(p), p).toBe(false);
   });
 
   it("a tracked TASK-*.md brief fails; a non-matching lookalike passes", () => {

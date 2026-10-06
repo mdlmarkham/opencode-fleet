@@ -94,7 +94,7 @@ function checks(spec: TaskSpec, ctx: GateContext): Objection[] {
     out.push(objection({ id: "spec.no-acceptance", severity: "nudge", message: "The spec has no acceptance criteria, so neither the worker nor a reviewer can tell when it is done.", evidence: "spec.acceptance is absent or empty", suggestion: "Add 2-5 checkable acceptance criteria." }));
   }
   if (!spec.verify || (!spec.verify.command && !(spec.verify.commands && spec.verify.commands.length) && !(spec.verify.files && spec.verify.files.length))) {
-    out.push(objection({ id: "spec.no-verify", severity: "nudge", message: "The spec has no verify gate, so success rests on the worker's own claim.", evidence: "spec.verify is absent or empty", suggestion: "Add verify.command (a repo script that exits 0) or verify.files." }));
+    out.push(objection({ id: "spec.no-verify", severity: "nudge", message: "The spec has no verify gate, so success rests on the worker's own claim.", evidence: "spec.verify is absent or empty", suggestion: "Add verify.command (a repo script that exits 0) or verify.files (paths that must exist)." }));
   }
   if (!spec.scope || spec.scope.files.length === 0) {
     out.push(objection({ id: "spec.no-scope", severity: "nudge", message: "The spec declares no file scope, so out-of-scope edits cannot be detected and overlap with other runs cannot be checked.", evidence: "spec.scope is absent or empty", suggestion: "Add scope.files listing the paths or globs the task should touch." }));

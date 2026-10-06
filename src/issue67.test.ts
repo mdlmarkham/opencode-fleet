@@ -268,7 +268,9 @@ describe("#70 review: the command rule holds at the policy chokepoint", () => {
     const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.ts"), "utf8");
     expect(src).not.toContain("absolute allowed");
     expect(src).not.toContain("bash -lc");
-    expect((src.match(/absolute paths and `\.\.` are refused/g) ?? []).length).toBe(3);
-    expect((src.match(/repo-relative script path with plain arguments/g) ?? []).length).toBeGreaterThanOrEqual(3);
+    // Issue #171: the three tools share ONE expect schema (expectParam), which states the enforced rules.
+    expect((src.match(/expect: expectParam\(/g) ?? []).length).toBe(3);
+    expect((src.match(/absolute paths and `\.\.` are refused/g) ?? []).length).toBe(1);
+    expect((src.match(/repo-relative script path/g) ?? []).length).toBeGreaterThanOrEqual(1);
   });
 });
