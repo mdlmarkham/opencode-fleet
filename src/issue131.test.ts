@@ -10,7 +10,7 @@ const ok = (id: string, p: number) => async () => ({ ok: true, answers: { [id]: 
 
 describe("#131: the built-in points", () => {
   it("are declared, valid, shadow-only and have safe defaults", () => {
-    expect(BUILTIN_POINTS.map((p) => p.id)).toEqual(["handraise.triage", "failure.real-bug", "review.depth"]);
+    expect(BUILTIN_POINTS.map((p) => p.id)).toEqual(["handraise.triage", "failure.real-bug", "review.depth", "progress.rubric"]);
     for (const p of BUILTIN_POINTS) { expect(p.mode).toBe("shadow"); expect(effectiveMode(p)).toBe("shadow"); expect(p.safeDefault).not.toBe(""); }
     expect(pointById("failure.real-bug")!.safeDefault).toBe("treat-as-real-bug");
     expect(pointById("handraise.triage")!.safeDefault).toBe("escalate-to-caller");

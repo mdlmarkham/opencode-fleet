@@ -17,6 +17,7 @@
 
 import { appendJournal, loadMission, readJournal, setPhase, updateMission, type MissionRecord } from "./mission-store.js";
 import { missionStatus, plan, reduce, type Action, type MissionEvent, type OutcomeSignals } from "./mission-supervisor.js";
+import { rubricBaseline } from "./builtin-points.js";
 
 export interface Reconciled { state: "unknown" | "running" | "finished"; runId?: string; signals?: OutcomeSignals }
 export type LaunchResult = { ok: true; runId: string } | { ok: false; error: string; /** The launch may have happened (timeout): keep the intent and reconcile later. */ ambiguous?: boolean };
@@ -46,6 +47,8 @@ export interface TickResult {
   /** Specs escalated because an unconfirmed launch reconciled to nothing (issue #244 review fix). */
   escalated?: string[];
   status?: "complete" | "running" | "escalated";
+  /** Issue #250: the per-tick convergence verdict vs the charter's success criteria. */
+  verdict?: "on-track" | "drifting" | "blocked" | "converged";
   error?: string;
 }
 
@@ -140,6 +143,20 @@ export async function tick(root: string, id: string, deps: TickDeps): Promise<Ti
   // 3. Mission-level status moves the phase.
   m = await loadMission(root, id);
   if (!m.ok) return { ...out, ok: false, error: m.error };
+  // Issue #250: per-tick convergence verdict against the charter's success criteria.
+  // The deterministic rubric baseline is the fallback; the S1 `progress.rubric` point is
+  // shadow-only for now, so the loop's behaviour is unchanged until it is promoted.
+  const specStates = Object.values(m.record.supervisor.specs);
+  const rubricSignals = {
+    specsTotal: specStates.length,
+    specsDone: specStates.filter((s) => s.status === "verified").length,
+    escalated: specStates.filter((s) => s.status === "escalated").length,
+    criteriaTotal: 0,
+    criteriaPassed: 0,
+  };
+  const verdict = rubricBaseline(rubricSignals);
+  out.verdict = verdict;
+  await appendJournal(root, id, { type: "progress-rubric", why: verdict, evidence: `specs ${rubricSignals.specsDone}/${rubricSignals.specsTotal}, escalated ${rubricSignals.escalated}` });
   const st = missionStatus(m.record.supervisor, { ...ctx, freeSlots: await deps.freeSlots() });
   out.status = st.status;
   if (st.status === "complete") {
