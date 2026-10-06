@@ -21,6 +21,7 @@ import { dirname, join } from "node:path";
 import { parseTaskSpec, renderSpec, type TaskSpec } from "./spec.js";
 import { evaluateExpect, parseExpectSpec, type ExpectCheck } from "./verify.js";
 import { loadLedger, upsertRun, type LedgerEntry } from "./ledger.js";
+import { gatewaySrc } from "./testkit/src.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -215,7 +216,7 @@ describe("issue #65: ledger — the run's spec is recorded", () => {
 });
 
 describe("issue #65: gateway wiring (fleet_dispatch)", () => {
-  const src = readFileSync(join(here, "index.ts"), "utf8");
+  const src = gatewaySrc();
 
   it("fleet_dispatch accepts an optional spec and renders the prompt from goal + acceptance", () => {
     expect(src).toContain("parseTaskSpec(raw.spec)");

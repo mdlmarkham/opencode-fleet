@@ -16,6 +16,7 @@ import { promisify } from "node:util";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { existsSync } from "node:fs";
 import { SSH_ARGS, scpPrefix, scpRemote, sshPrefix } from "./ssh.js";
 import {
   inspectRemoteInstallRecord,
@@ -82,9 +83,36 @@ async function builtIndexHash(pluginDir: string): Promise<string> {
 /**
  * Run the full deploy cycle except the gateway restart.
  */
+/**
+ * Issue #238: the build/pack steps run npm with cwd = pluginDir. For an INSTALLED plugin the
+ * derived default is the gateway's extensions root, which has no package.json — npm dies with a
+ * bare ENOENT ("build failed") and no operator guidance. Validate BEFORE any npm call and name
+ * the remedy: point the tool's `pluginDir` param (or the `deploy.pluginDir` config) at the repo
+ * checkout that actually has package.json.
+ */
+export function validatePluginDir(dir: string): { ok: true } | { ok: false; error: string } {
+  if (!existsSync(join(dir, "package.json"))) {
+    return {
+      ok: false,
+      error: `no package.json at pluginDir '${dir}': this is not a plugin repo checkout — pass pluginDir (the repo where package.json lives) or set deploy.pluginDir in the plugin config`,
+    };
+  }
+  return { ok: true };
+}
+
 export async function deployPlugin(req: DeployRequest): Promise<DeployResult> {
   const steps: Array<{ step: string; ok: boolean; detail?: string }> = [];
   const add = (step: string, ok: boolean, detail?: string) => steps.push({ step, ok, detail });
+
+  // Issue #238: refuse BEFORE npm ever runs when pluginDir is not a package dir — the old
+  // behavior surfaced as a bare "build failed" (ENOENT reading package.json) when the derived
+  // default (the installed plugin's parent dir) was not the repo.
+  const dirCheck = validatePluginDir(req.pluginDir);
+  if (!dirCheck.ok) {
+    add("resolve-plugin-dir", false, dirCheck.error);
+    return { ok: false, steps, gatewayRestartRequired: false, error: `no package.json at pluginDir '${req.pluginDir}': pass pluginDir (the plugin repo checkout) or set deploy.pluginDir in the plugin config` };
+  }
+
 
   try {
     // 1. Build.

@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { gatewaySrc } from "./testkit/src.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -11,7 +12,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const OPERATOR_ONLY = ["fleet_deploy", "fleet_provision"];
 
 describe("SKILL.md tool-coverage drift guard (#215)", () => {
-  const src = readFileSync(resolve(here, "index.ts"), "utf8");
+  const src = gatewaySrc();
   const skill = readFileSync(resolve(here, "../skills/opencode-fleet/SKILL.md"), "utf8");
 
   const registered = [...src.matchAll(/name: "(fleet_[a-z0-9_]+)"/g)].map((m) => m[1]);

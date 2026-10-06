@@ -3,10 +3,11 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { buildOpenCodeCommand, type OpenCodeTask } from "./opencode.js";
+import { gatewaySrc } from "./testkit/src.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 // The node handler and its helpers moved out of index.ts (issue #43); the wiring checks span them all.
-const indexSrc = ["index.ts", "node/handler.ts", "node/runtime.ts"].map((f) => readFileSync(join(here, f), "utf8")).join("\n");
+const indexSrc = [gatewaySrc(), ...["node/handler.ts", "node/runtime.ts"].map((f) => readFileSync(join(here, f), "utf8"))].join("\n");
 
 /**
  * Issue #22 regression guards.

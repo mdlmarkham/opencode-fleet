@@ -20,6 +20,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { loadLedger, outcomeEntry, upsertRun, type LedgerEntry } from "./ledger.js";
 import { withVerified } from "./verify.js";
+import { gatewaySrc } from "./testkit/src.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -151,7 +152,7 @@ describe("issue #40 review: withVerified pins one verified shape everywhere", ()
 });
 
 describe("issue #40 review: gateway wiring (fleet_watch / fleet_iterate / reconcile)", () => {
-  const src = readFileSync(join(here, "index.ts"), "utf8");
+  const src = gatewaySrc();
 
   it("fleet_watch and fleet_iterate accept and thread `expect` like fleet_dispatch", () => {
     // The gate spec is parsed up front and threaded to the node in all three
