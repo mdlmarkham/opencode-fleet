@@ -70,6 +70,8 @@ interface FleetConfig {
   isolation?: "none" | "clone";
   /** Deterministic design gate for spec dispatches (issue #117): off | advise (default) | enforce, plus size bounds. */
   /** Concurrency slots (issue #39). */
+  /** GitHub projection of missions (issue #132): the repo and the NAME of the env var that holds the token (the token itself stays in OpenClaw's secrets, never in config). */
+  projection?: { repo?: string; tokenEnv?: string };
   capacity?: { maxConcurrentPerNode?: number; staleAfterMs?: number; minFreeDiskGb?: number };
   /** Spend caps (issue #39): per-UTC-day totals from ledger usage + per-dispatch caps. Validated by parseBudgetConfig. */
   budget?: { dailyCostUsd?: number; dailyTokens?: number; perDispatchCostUsd?: number; perDispatchTokens?: number };
@@ -172,6 +174,15 @@ export default definePluginEntry({
           maxConcurrentPerNode: { type: "integer", minimum: 1, maximum: 64, description: "Default max concurrent runs per node. Unset means unlimited." },
           minFreeDiskGb: { type: "integer", minimum: 1, maximum: 10000, description: "Isolated (clone) runs copy the object store: a node with less free disk than this refuses another, with a retryable no-disk result. Unset means no check." },
           staleAfterMs: { type: "integer", minimum: 60000, default: 21600000, description: "A run still `running` in the ledger after this long without an update stops holding a slot and is reported as suspected stale." },
+        },
+      },
+      projection: {
+        type: "object",
+        additionalProperties: false,
+        description: "One-way GitHub projection of missions (issue #132): the repo, and the NAME of the environment variable holding the token. The token stays in OpenClaw's secrets; it is never stored in config.",
+        properties: {
+          repo: { type: "string", description: "owner/name of the repository whose issues receive mission progress." },
+          tokenEnv: { type: "string", description: "Name of the environment variable that holds the GitHub token on the manager (default GITHUB_TOKEN)." },
         },
       },
       budget: {
@@ -1324,6 +1335,34 @@ export default definePluginEntry({
           discarded: p.discard === true,
           runs: findings,
         });
+      },
+    });
+
+    api.registerTool({
+      name: "fleet_mission_project",
+      label: "Fleet Mission Project",
+      description:
+        "Project a mission's progress onto a GitHub issue: ONE comment (found by a marker, edited in place) and fleet:* labels. One-way and idempotent; never edits the issue's title, body or others' comments. GitHub being down returns pending, never blocks the mission. Needs projection.repo and the token in the env var named by projection.tokenEnv.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: { missionId: { type: "string", description: "Mission id." }, issue: { type: "number", description: "Issue number to project onto." } },
+        required: ["missionId", "issue"],
+      },
+      execute: async (_toolCallId, params) => {
+        const p = params as { missionId: string; issue: number };
+        const cfg = (api.pluginConfig ?? {}) as FleetConfig;
+        const root = api.rootDir ?? process.cwd();
+        const proj = await import("./projection.js");
+        const repo = cfg.projection?.repo;
+        if (!repo) return jsonResult({ ok: false, error: "projection.repo is not configured" });
+        const token = proj.tokenFromEnv(cfg.projection?.tokenEnv);
+        if (!token) return jsonResult({ ok: false, error: `no token: set the environment variable ${cfg.projection?.tokenEnv ?? "GITHUB_TOKEN"} from OpenClaw's secrets on the manager` });
+        const m = await (await import("./mission-store.js")).loadMission(root, p.missionId);
+        if (!m.ok) return jsonResult({ ok: false, error: m.error });
+        let transport;
+        try { transport = proj.restTransport(repo, token, (globalThis as unknown as { fetch: never }).fetch); } catch (e) { return jsonResult({ ok: false, error: (e as Error).message }); }
+        return jsonResult(await proj.flushProjection(root, m.record, p.issue, transport, [token]));
       },
     });
 
