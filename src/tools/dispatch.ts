@@ -373,15 +373,34 @@ export function registerDispatchTools(api: OpenClawPluginApi, cfg: FleetConfig):
       const rootDir = api.rootDir ?? process.cwd();
 
       // Issue #8: unfiltered dispatch must not fail on non-OpenCode nodes.
+      // Issue #282: do not blame the node when the real fault is the GATEWAY.
+      // The capability list is a cached snapshot; a node whose (re-)registration
+      // the gateway is refusing (ws admission 503 / handshake timeout) cannot
+      // refresh it, so its absence of opencode.run is stale, not a node property.
       const skippedNodes: string[] = [];
+      const staleNodes: string[] = [];
       const opencodeTargets = targets.filter((n) => {
         const invocable = (n as { invocableCommands?: string[] }).invocableCommands ?? [];
         if (!invocable.includes("opencode.run")) {
-          skippedNodes.push(`${n.displayName ?? n.nodeId} (not an opencode node)`);
+          const connected = (n as { connected?: boolean }).connected !== false;
+          if (!connected) {
+            staleNodes.push(n.displayName ?? n.nodeId);
+          } else {
+            skippedNodes.push(`${n.displayName ?? n.nodeId} (not an opencode node)`);
+          }
           return false;
         }
         return true;
       });
+      if (opencodeTargets.length === 0 && staleNodes.length > 0) {
+        return jsonResult({
+          ok: false,
+          retryable: true,
+          reason: "gateway-not-connected",
+          error: `no dispatchable node: ${staleNodes.join(", ")} ${staleNodes.length === 1 ? "is" : "are"} not connected to the gateway, so ${staleNodes.length === 1 ? "its" : "their"} command list cannot be refreshed. This is a GATEWAY admission fault (the node may have advertised opencode.run and still be unable to re-register), not "not an opencode node". Restore gateway connectivity and retry.`,
+          staleNodes,
+        });
+      }
       // Issue #117: deterministic design gate. Only a structured spec is gated; a prompt-only
       // dispatch (no spec) and gate=off leave the dispatch byte-identical.
       const gateMode = cfg.project?.gate ?? "advise";
