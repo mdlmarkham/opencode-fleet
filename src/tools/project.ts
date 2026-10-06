@@ -236,7 +236,13 @@ export function registerProjectTools(api: OpenClawPluginApi, cfg: FleetConfig): 
         bounds: { ...(cfg.project?.maxScopePatterns ? { maxScopePatterns: cfg.project.maxScopePatterns } : {}), ...(cfg.project?.maxAcceptanceItems ? { maxAcceptanceItems: cfg.project.maxAcceptanceItems } : {}) },
       }, ackCheck.acks);
       if (!gate.ok) return jsonResult({ ok: false, error: gate.error });
-      return jsonResult({ ok: true, gate: cfg.project?.gate ?? "advise", overlapChecked: Boolean(p.node && p.cwd), ...gate.result });
+      // Issue #296: objections carry their suggestion too — the caller gets the remedy, not just
+      // the complaint. Existing fields keep their shape; an empty suggestion is omitted, never "".
+      const objections = gate.result.objections.map((o) => {
+        const { suggestion, ...rest } = o;
+        return { ...rest, ...(suggestion.trim() !== "" ? { suggestion } : {}) };
+      });
+      return jsonResult({ ok: true, gate: cfg.project?.gate ?? "advise", overlapChecked: Boolean(p.node && p.cwd), ...gate.result, objections });
     },
   });
 
