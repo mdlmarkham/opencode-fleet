@@ -534,6 +534,12 @@ export function registerDispatchTools(api: OpenClawPluginApi, cfg: FleetConfig):
           const room = diskHeadroom(nodeName, parseFreeKb(await sshProbe(sshHost, diskFreeCommand(shq(p.cwd)))), cfg.capacity!.minFreeDiskGb!);
           if (!room.ok) { results[nodeKey] = room; continue; }
         }
+        // Issue #137: a configured minimum Pi version is enforced at dispatch, failing closed when unreadable.
+        if (routed.harness === "pi" && cfg.dispatch?.piMinVersion) {
+          const { checkPiVersion, PI_VERSION_COMMAND } = await import("../pi-version.js");
+          const v = checkPiVersion(await sshProbe(sshHost, PI_VERSION_COMMAND), cfg.dispatch.piMinVersion);
+          if (!v.ok) { results[nodeKey] = { ok: false, error: `refusing to dispatch: node ${nodeName}: ${v.error}` }; continue; }
+        }
         if (routed.harness !== "pi" && (p.piTools !== undefined || p.piOffline !== undefined || p.piJson !== undefined)) {
           results[nodeKey] = { ok: false, error: "piTools/piOffline/piJson apply to harness=pi only; refusing so the restriction is not silently ignored" };
           continue;

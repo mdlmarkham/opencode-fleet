@@ -101,6 +101,7 @@ export default definePluginEntry({
         additionalProperties: false,
         description: "Dispatch target policy.",
         properties: {
+          piMinVersion: { type: "string", pattern: "^\\d+\\.\\d+\\.\\d+$", description: "Refuse a harness=pi dispatch to a node whose `pi --version` is older than this (fail closed when it cannot be read)." },
           defaultTarget: { type: "string", enum: ["all"], description: "Restore the old behaviour: a fleet_dispatch that names no node runs on EVERY fleet node. Off by default: an unnamed target is refused with the node list; fan-out is explicit (nodes: \"all\") and pick:\"any\" chooses one node with a free slot." },
         },
       },
