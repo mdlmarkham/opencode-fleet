@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { checkPiVersion, compareVersions } from "./pi-version.js";
-import { fakeSsh, loadEntry, loadPlugin, nodeReply, type Loaded } from "./testkit/plugin.js";
+import { fakeSshMultiline, loadEntry, loadPlugin, nodeReply, type Loaded } from "./testkit/plugin.js";
 
 describe("#137: Pi minimum version", () => {
   it("compares numerically, not lexically", () => {
@@ -29,7 +29,7 @@ describe("#137: fleet_dispatch enforces dispatch.piMinVersion", () => {
   let restore: (() => void) | undefined;
   afterEach(() => { p?.dispose(); p = undefined; restore?.(); });
   const setup = async (sshOut: string, min: string | undefined) => {
-    restore = fakeSsh(`FLEET_CWD=ok ${sshOut}`);
+    restore = fakeSshMultiline(["FLEET_CWD=ok", sshOut]);
     p = loadPlugin((await loadEntry())!, { nodes: NODES, config: { piDefaultModel: "m", nodes: { dev2: { roles: ["worker"], ssh: false } }, ...(min ? { dispatch: { piMinVersion: min } } : {}) }, invoke: () => nodeReply({ ok: true, detached: true, runId: "r", pid: 1 }) });
   };
   const run = (h = "pi") => p!.call("fleet_dispatch", { cwd: "/w/proj", node: "dev2", prompt: "do", harness: h }) as Promise<Record<string, any>>;
