@@ -351,6 +351,7 @@
       "fleet_await",
       "fleet_design_check",
       "fleet_project_show",
+      "fleet_mission_show",
       "fleet_board"
     ]
   }
