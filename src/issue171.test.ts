@@ -4,8 +4,8 @@ import { loadEntry, loadPlugin } from "./testkit/plugin.js";
 // Issue #171: the tool schemas are paid for by the calling agent on every session. This measures them and
 // fails above a budget, so growth is a visible decision. RATCHET the budget DOWN when you trim; raise it
 // only deliberately, in the PR that adds the tool or parameter, and say why.
-// Raised 37_500 -> 38_400 across #123/#124: fleet_mission_show (read-only) and fleet_mission_abort (kill switch).
-export const SCHEMA_BUDGET_CHARS = 38_400;
+// Raised 37_500 -> 39_900 across #116/#123/#124: project_start (intake), mission_show (read-only), mission_abort (kill switch).
+export const SCHEMA_BUDGET_CHARS = 39_900;
 // Per tool: no single tool may balloon unnoticed.
 export const PER_TOOL_BUDGET_CHARS = 10_000;
 
