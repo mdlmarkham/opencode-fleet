@@ -643,14 +643,34 @@ export async function pruneStateDir(
  * output, before the done marker is written. Only emitted when the start commit
  * is known (the cwd is a git repo); a missing capture later reads as "unknown",
  * never as "no changes". No JSON is assembled in bash.
+ *
+ * Issue #271: when the run changed files but did NOT commit (endHead ==
+ * startHead with a non-empty capture), a `dirtyWorktree=1` line is appended so
+ * the manifest can flag the silent data-loss shape (branch tip at base,
+ * unpublished work) instead of reporting a plain success. A run that committed
+ * its work, or changed nothing, emits no extra line (byte-identical capture).
  */
 export function changesCaptureLines(cwd: string, startHead: string | undefined, changesPath: string): string[] {
   if (!startHead || !/^[0-9a-f]{40,64}$/.test(startHead)) return [];
   const g = `git -C ${shq(cwd)} -c core.quotePath=false`;
   return [
     "# Issue #42: record what changed, for the audit manifest.",
-    `{ echo "endHead=$(${g} rev-parse HEAD 2>/dev/null)"; echo "---status"; ${g} diff --name-status ${startHead} -- 2>/dev/null; ${g} ls-files --others --exclude-standard 2>/dev/null | awk '{print "?\t" $0}'; echo "---stat"; ${g} diff --stat ${startHead} -- 2>/dev/null; } > ${shq(changesPath)} 2>/dev/null`,
+    `{ echo "endHead=$(${g} rev-parse HEAD 2>/dev/null)"; echo "---status"; ${g} diff --name-status ${startHead} -- 2>/dev/null; ${g} ls-files --others --exclude-standard 2>/dev/null | awk '{print "?\\t" $0}'; echo "---stat"; ${g} diff --stat ${startHead} -- 2>/dev/null; } > ${shq(changesPath)} 2>/dev/null`,
+    "# Issue #271: changed files with an unmoved branch tip = dirty worktree (uncommitted work, nothing to push).",
+    `if grep -q "^endHead=${startHead}$" ${shq(changesPath)} 2>/dev/null && sed -n '2,/^---stat/p' ${shq(changesPath)} 2>/dev/null | grep -qE '^[A-Z?]'; then echo dirtyWorktree=1 >> ${shq(changesPath)}; fi`,
   ];
+}
+
+/**
+ * Issue #271: whether a raw change capture carries the dirty-worktree tail the
+ * run script appends when it recorded file changes with an unmoved branch tip
+ * (work left uncommitted; nothing for fleet_sync to push). Absence is
+ * meaningful only together with a capture actually being present; a missing
+ * capture file reads as "not dirty", never as "clean" (the manifest's null
+ * filesChanged already says "unknown" for that case).
+ */
+export function dirtyWorktreeSignal(rawChanges: string): boolean {
+  return /^dirtyWorktree=1$/m.test(rawChanges);
 }
 
 // ---------------------------------------------------------------------------

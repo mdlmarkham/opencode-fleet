@@ -21,6 +21,8 @@ export interface Changes {
   endHead?: string;
   files: FileChange[];
   diffStat: string;
+  /** Issue #271: endHead == startHead while file changes exist (uncommitted work, nothing to publish). */
+  dirtyWorktree?: boolean;
 }
 
 /**
@@ -32,6 +34,7 @@ export interface Changes {
  *   ?\tpath            (untracked)
  *   ---stat
  *   <git diff --stat>
+ *   dirtyWorktree=1    (issue #271: changed files but the branch tip did not move)
  */
 export function parseChanges(text: string): Changes {
   const out: Changes = { files: [], diffStat: "" };
@@ -52,6 +55,10 @@ export function parseChanges(text: string): Changes {
     }
   }
   out.diffStat = stat.join("\n").trim();
+  // Issue #271: the run script appends this marker when it captured file
+  // changes with an unmoved branch tip (work left uncommitted on the run
+  // branch). Nothing appends it in the committed or no-change cases.
+  if (/^dirtyWorktree=1$/m.test(text)) out.dirtyWorktree = true;
   return out;
 }
 
@@ -186,6 +193,11 @@ export function buildManifest(i: ManifestInput) {
     ...(i.verifyDetails != null ? { verifyDetails: i.verifyDetails } : {}),
     startHead: i.startHead ?? null,
     endHead: i.changes?.endHead ?? null,
+    // Issue #271: true only when the run left changes uncommitted with the
+    // branch tip at base (a silent data-loss shape for fleet_sync);
+    // undefined (field omitted) otherwise — byte-identical manifests for
+    // runs that committed their work or changed nothing.
+    ...(i.changes?.dirtyWorktree ? { dirtyWorktree: true } : {}),
     // null = the capture is missing (not a git repo, or the run died before the tail), never "no changes".
     filesChanged: i.changes ? i.changes.files : null,
     diffStat: i.changes ? i.changes.diffStat : null,
