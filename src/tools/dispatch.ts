@@ -424,8 +424,11 @@ export function registerDispatchTools(api: OpenClawPluginApi, cfg: FleetConfig):
           now: Date.now(),
           staleAfterMs: capacityStaleAfter(cfg.capacity),
         });
+        // Issue #260: the claim check looks at this checkout on every node, not only the targets.
+        const anywhere = capacityInputFromLedger(await loadLedger(rootDir) as never, { cwd: p.cwd, now: Date.now(), staleAfterMs: capacityStaleAfter(cfg.capacity) });
         const gate = evaluateDesignGate(specCheck.spec, {
           inFlight: gateInput.inFlight,
+          liveAnywhere: anywhere.inFlight,
           isolated: (p.isolation ?? cfg.isolation ?? "none") === "clone",
           bounds: { ...(cfg.project?.maxScopePatterns ? { maxScopePatterns: cfg.project.maxScopePatterns } : {}), ...(cfg.project?.maxAcceptanceItems ? { maxAcceptanceItems: cfg.project.maxAcceptanceItems } : {}) },
         }, ackCheck.acks);

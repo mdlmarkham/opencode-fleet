@@ -53,7 +53,7 @@ export function liveRuns(runs: LedgerEntry[], nodeNames: string[], now: number, 
 }
 
 /** What the design gate needs from the ledger: live conflict evidence + informational recent history (issue #196). */
-export interface InFlightRun { runId: string; node: string; cwd: string; scope?: { files: string[] }; isolated?: boolean }
+export interface InFlightRun { runId: string; node: string; cwd: string; scope?: { files: string[] }; isolated?: boolean; goal?: string }
 export type LedgerLike = {
   runId: string; node: string; cwd: string; state: string;
   startedAt?: string; updatedAt?: string; finishedAt?: string;
@@ -71,6 +71,7 @@ export function ledgerToInFlight(r: LedgerLike): InFlightRun {
     cwd: r.cwd,
     ...(spec?.scope && Array.isArray(spec.scope.files) && spec.scope.files.length ? { scope: { files: spec.scope.files } } : {}),
     ...(r.runCwd ? { isolated: true } : {}),
+    ...(typeof (spec as { goal?: unknown } | undefined)?.goal === "string" ? { goal: (spec as { goal: string }).goal } : typeof r.prompt === "string" ? { goal: r.prompt } : {}),
   };
 }
 

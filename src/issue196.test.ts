@@ -77,7 +77,7 @@ describe("#196: ledgerToInFlight keeps scope + isolation", () => {
       startedAt: "2026-10-05T20:30:00Z", updatedAt: "2026-10-05T20:39:00Z",
       runCwd: "/w/p-clones/r2",
     } as unknown as LedgerLike;
-    expect(ledgerToInFlight(scoped)).toEqual({ runId: "r1", node: "dev2", cwd: "/w/p", scope: { files: ["src/x/"] } });
+    expect(ledgerToInFlight(scoped)).toEqual({ runId: "r1", node: "dev2", cwd: "/w/p", scope: { files: ["src/x/"] }, goal: "g" });
     expect(ledgerToInFlight(isolated)).toEqual({ runId: "r2", node: "dev2", cwd: "/w/p", isolated: true });
     expect(ledgerToInFlight({ runId: "r3", node: "dev2", cwd: "/w/p", state: "running", startedAt: "2026-10-05T20:30:00Z", updatedAt: "2026-10-05T20:39:00Z" } as unknown as LedgerLike)).toEqual({ runId: "r3", node: "dev2", cwd: "/w/p" });
   });
