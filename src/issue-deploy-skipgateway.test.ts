@@ -58,12 +58,41 @@ function makeShimDir(): { dir: string; calls: () => string[] } {
       "#!/bin/sh",
       'argv="$*"',
       'case "$argv" in',
+      // Issue #281: the deploy now verifies a whole-dist CODE-TREE digest, not a
+      // single index.js hash. Emulate it EXACTLY as build-provenance.treeDigest:
+      // sort the .js paths, emit `path\\0sha\\0` per file, strip the trailing NUL
+      // (`head -c -1`) so the payload has no final separator, then sha256 it.
+      //
+      // ORDER MATTERS: this arm MUST come before the `*"sha256sum --"*` arm. The
+      // emitted verify script contains `sha256sum -- "$f"` INSIDE its text, so the
+      // tarball-checksum glob would otherwise match it first and answer with a
+      // tarball hash/MISSING, never reaching here (that ordering bug made #281's
+      // first shim update fail for the wrong reason).
+      "  *'*.js'*)",
+      "    ROOT=\"$FLEET255_REPO/dist\"",
+      "    if [ -d \"$ROOT\" ]; then",
+      "      find \"$ROOT\" -type f -name '*.js' | LC_ALL=C sort | while IFS= read -r f; do h=$(/usr/bin/sha256sum -- \"$f\"); h=${h%% *}; printf '%s\\0%s\\0' \"${f#$ROOT/}\" \"$h\"; done | head -c -1 | /usr/bin/sha256sum | cut -d' ' -f1",
+      "    else printf '%s\\n' MISSING; fi",
+      "    ;;",
       '  *"sha256sum --"*)',
       "    p=$(printf '%s' \"$argv\" | awk -F\"'\" '{print $4}')",
       '    if [ -f "$p" ]; then exec sha256sum_real "$p"; fi',
       "    printf '%s\\n' MISSING",
       "    ;;",
       "  *installedIndex*) printf '%s\\n' '{\"present\": false}' ;;",
+      // Issue #281: the deploy now verifies a whole-dist CODE-TREE digest, not a
+      // single index.js hash. Emulate it EXACTLY as build-provenance.treeDigest:
+      // sort the .js paths, emit `path\\0sha\\0` per file, strip the trailing NUL
+      // (`head -c -1`) so the payload has no final separator, then sha256 it.
+      // Match on the shq-escaped wire form: the emitted script reaches here as
+      // `-name '\\''*.js'\\''` (shq inside a single-quoted bash -c), so match on the
+      // stable `*.js` token rather than the surrounding quote style.
+      "  *'*.js'*)",
+      "    ROOT=\"$FLEET255_REPO/dist\"",
+      "    if [ -d \"$ROOT\" ]; then",
+      "      find \"$ROOT\" -type f -name '*.js' | LC_ALL=C sort | while IFS= read -r f; do h=$(/usr/bin/sha256sum -- \"$f\"); h=${h%% *}; printf '%s\\0%s\\0' \"${f#$ROOT/}\" \"$h\"; done | head -c -1 | /usr/bin/sha256sum | cut -d' ' -f1",
+      "    else printf '%s\\n' MISSING; fi",
+      "    ;;",
       "  *\"echo MISSING\"*) printf '%s\\n' 2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881 ;;",
       "  *printf\\ %s*) printf '%s\\n' /home/fleet255-svc ;;",
       '  *"mktemp -d"*)',
