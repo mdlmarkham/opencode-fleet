@@ -196,13 +196,28 @@ export function registerNodesTools(api: OpenClawPluginApi, cfg: FleetConfig): vo
           `No fleet nodes found. Paired nodes: ${nodes.map((n) => n.displayName ?? n.nodeId).join(", ") || "none"}`,
         );
       }
-      const results: Record<string, NodeActivityEntry[] | { error: string } | { skipped: string }> = {};
+      const results: Record<string, NodeActivityEntry[] | { error: string } | { skipped: string; stale?: boolean; reason?: string }> = {};
       for (const node of targets) {
         // Issue #8: skip nodes that don't support opencode.run (e.g. the
         // Windows desktop node) instead of failing the whole call.
+        // Issue #282: distinguish "the node genuinely lacks the command" from
+        // "we hold a stale snapshot because the gateway is refusing the node's
+        // (re-)registration". The manager serves a cached capability list; if the
+        // node cannot re-register (ws admission 503 / handshake timeout) that list
+        // never refreshes, and blaming the NODE for a GATEWAY fault is a false
+        // diagnostic. `connected` is false in that window; report it as stale.
         const invocable = (node as { invocableCommands?: string[] }).invocableCommands ?? [];
         if (!invocable.includes("opencode.run")) {
-          results[node.displayName ?? node.nodeId] = { skipped: "not an opencode node (no opencode.run command)" };
+          const connected = (node as { connected?: boolean }).connected !== false;
+          if (!connected) {
+            results[node.displayName ?? node.nodeId] = {
+              skipped: "capabilities are STALE: the node is not connected to the gateway, so its command list cannot be refreshed (a gateway admission fault, not a node fault). Restore gateway connectivity and retry.",
+              stale: true,
+              reason: "gateway-not-connected",
+            };
+          } else {
+            results[node.displayName ?? node.nodeId] = { skipped: "not an opencode node (no opencode.run command)" };
+          }
           continue;
         }
         const host = node.remoteIp ?? node.displayName ?? node.nodeId;
