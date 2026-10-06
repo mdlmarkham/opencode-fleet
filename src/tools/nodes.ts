@@ -33,7 +33,8 @@ export function registerNodesTools(api: OpenClawPluginApi, cfg: FleetConfig): vo
         const { live, stale } = liveRuns(runs, [n.displayName, n.nodeId].filter((x): x is string => !!x), now, staleAfter(cfg.capacity));
         return {
           node: name,
-          ...(limit.ok ? { limit: limit.limit ?? null, free: limit.limit === undefined ? null : Math.max(0, limit.limit - live.length) } : { configError: limit.error }),
+          // Issue #292: no configured limit reads as "unlimited", not "unknown" (display only).
+          ...(limit.ok ? { limit: limit.limit ?? "unlimited", free: limit.limit === undefined ? "unlimited" : Math.max(0, limit.limit - live.length) } : { configError: limit.error }),
           running: live.map((r) => ({ runId: r.runId, ageSeconds: age(r) })),
           suspectedStale: stale.map((r) => ({ runId: r.runId, ageSeconds: age(r) })),
         };
