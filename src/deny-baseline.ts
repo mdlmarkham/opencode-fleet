@@ -333,6 +333,43 @@ export function mergeDenyBaseline(existing?: unknown): OpenCodeNodeConfig {
 }
 
 // ---------------------------------------------------------------------------
+// mergePermissionBlock — the same order-safe merge for NON-opencode.json layers
+// ---------------------------------------------------------------------------
+
+/**
+ * Issue #258 (defence in depth): apply the deny-baseline merge to ANY
+ * permission block the node writes — not just the node-global opencode.json.
+ * The agent-markdown permission blocks config-provision ships flatten LATER in
+ * opencode's flattening than the node-global config, so an allow rule written
+ * there shadowed a baseline deny under last-match-wins evaluation (issue #51c's
+ * live-verified findLast semantics). This helper gives every such layer the
+ * SAME order-safe treatment as the #254 merge: user rules first, every
+ * baseline pattern re-added LAST, `__proto__` skipped, idempotent (merging a
+ * merged block again is a no-op), deny-only additions (it can never turn a
+ * baseline deny into allow/ask, and an allowing/asking user rule on an exact
+ * baseline pattern is absorbed into the trailing deny).
+ *
+ * Layer scope (issue #258): a permission block whose categories are
+ * PermissionEntry-shaped — the `permission:` frontmatter map of agent markdown
+ * files and any project-local opencode config layer — as well as the
+ * node-global opencode.json (mergeDenyBaseline delegates here per category).
+ * Pure: new object, input never mutated.
+ */
+export function mergePermissionBlock(block?: unknown): Record<string, PermissionEntry> {
+  const src = isRecord(block) ? block : {};
+  const permission: Record<string, PermissionEntry> = {};
+  for (const [cat, val] of Object.entries(src)) {
+    if (cat === PROTO_KEY) continue;
+    if (isRecord(val)) permission[cat] = { ...val } as PermissionEntry;
+    else permission[cat] = val as PermissionEntry;
+  }
+  for (const [cat, denies] of Object.entries(BASELINE_DENY)) {
+    permission[cat] = mergeCategory(src[cat], denies);
+  }
+  return permission;
+}
+
+// ---------------------------------------------------------------------------
 // baselinePresent — structural detection of the baseline (for fleet_capabilities)
 // ---------------------------------------------------------------------------
 
