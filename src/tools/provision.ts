@@ -397,7 +397,7 @@ export function registerProvisionTools(api: OpenClawPluginApi, cfg: FleetConfig)
           description:
             "After install+restart, run a trivial dispatch on each node and require the token back; fail the deploy if it does not (default true). Hash-equality proves the file matches, not that the plugin works.",
         },
-        skipGateway: { type: "boolean", description: "Node-only sync: skip the gateway install and its restart requirement. Default false." },
+        skipGateway: { type: "boolean", description: "Node-only sync: skip the gateway install." },
       },
     },
     execute: async (toolCallId, params, signal) => {
