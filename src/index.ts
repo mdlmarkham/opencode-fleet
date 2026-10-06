@@ -68,7 +68,7 @@ interface FleetConfig {
   capacity?: { maxConcurrentPerNode?: number; staleAfterMs?: number };
   /** Spend caps (issue #39): per-UTC-day totals from ledger usage + per-dispatch caps. Validated by parseBudgetConfig. */
   budget?: { dailyCostUsd?: number; dailyTokens?: number; perDispatchCostUsd?: number; perDispatchTokens?: number };
-  project?: { gate?: "off" | "advise" | "enforce"; maxScopePatterns?: number; maxAcceptanceItems?: number; roots?: string[]; rules?: unknown[]; requireCharterFields?: string[]; allowRepoBlocking?: boolean };
+  project?: { gate?: "off" | "advise" | "enforce"; maxScopePatterns?: number; maxAcceptanceItems?: number; roots?: string[]; rules?: unknown[]; requireCharterFields?: string[]; allowRepoBlocking?: boolean; screenOutput?: "off" | "shadow" | "fence" | "withhold" };
   /** S1 decision layer (issue #79): backend, mode (default shadow), thresholds, egress opt-in. Validated by parseS1Config. */
   s1?: unknown;
   /** fleet_sync publish policy (issue #33). */
@@ -176,6 +176,7 @@ export default definePluginEntry({
         description: "Design gate for spec dispatches. A deterministic check (no model call) of the spec before dispatch: missing acceptance/verify/scope, a spec too large for one task, overlap with in-flight runs on the same checkout. `advise` (default) attaches the verdict as `design` when it is not a plain accept; `enforce` also refuses dispatch while an unacknowledged blocking objection remains; `off` skips it. A prompt-only dispatch is never gated.",
         properties: {
           gate: { type: "string", enum: ["off", "advise", "enforce"], default: "advise" },
+          screenOutput: { type: "string", enum: ["off", "shadow", "fence", "withhold"], default: "shadow", description: "Instruction-pattern screening of worker output before the agent reads it: shadow logs flagged output, fence quotes it as data, withhold replaces it." },
           maxScopePatterns: { type: "integer", minimum: 1, maximum: 100, default: 20, description: "A spec with more scope patterns is `decompose`." },
           maxAcceptanceItems: { type: "integer", minimum: 1, maximum: 50, default: 15, description: "A spec with more acceptance items is `decompose`." },
           roots: { type: "array", items: { type: "string" }, description: "Directories on the gateway host under which fleet_project_show may read a checkout's .fleet/ record. Default: the gateway's working directory and root dir." },
@@ -1799,6 +1800,18 @@ export default definePluginEntry({
         if (st.finishedAt && p.includeOutput !== false) {
           const res = payloadOf(await invoke({ prompt: "__RUN_RESULT__", cwd: "/", transport: "http", runId: p.runId }, 30_000));
           output = res.result;
+          // Issue #83: instruction-pattern screen before the agent reads it. shadow only logs; fence/withhold change the text.
+          if (typeof output === "string") {
+            const sc = await import("./output-screen.js");
+            const mode = sc.parseScreenMode((cfg.project as { screenOutput?: unknown } | undefined)?.screenOutput);
+            if (mode !== "off") {
+              const r = sc.applyScreen(output, mode);
+              if (r.screen.flagged) {
+                void sc.logScreen(api.rootDir ?? process.cwd(), p.runId, mode, r.screen);
+              }
+              output = r.text;
+            }
+          }
         }
 
         return jsonResult({
