@@ -171,7 +171,7 @@ describe("#114: loader", () => {
     if (!r.present) return;
     expect(r.record.errors).toEqual([]);
     expect(r.record.warnings).toEqual([]);
-    expect(r.record.rules.map((x) => x.id).sort()).toEqual(["protocol-older-node-test", "redaction-false-positive-test", "security-independent-review"]);
+    expect(r.record.rules.map((x) => x.id).sort()).toEqual(["loop-survives-restart", "protocol-older-node-test", "redaction-false-positive-test", "security-independent-review", "serialize-manager-gates"]);
     expect(r.record.decisions.map((x) => x.id)).toEqual(["0001", "0002", "0003"]);
     expect(r.record.charter?.nonGoals?.length).toBeGreaterThan(0);
     expect(r.record.rules.every((x) => x.enforced === "advise")).toBe(true); // repo blocking is off by default

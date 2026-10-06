@@ -25,7 +25,8 @@ rules:
     evidence: "Decision 0002 and the review policy open in #45."
   - id: serialize-manager-gates
     severity: advise
-    keywords: [verify.sh, vitest, gate, reviewer, review-spawn, subagent]
+    match:
+      keywords: [verify.sh, vitest, gate, reviewer, review-spawn, subagent]
     message: Run at most one verification gate on the manager host at a time, and spawn reviewers as isolated remote runs rather than local child sessions.
     evidence: "2026-10-05: two concurrent gates drove host load to 39, vitest RPC timed out, and 8 FALSE failures appeared; all were green when re-run quiet. 2026-10-06: three local reviewers were killed by gateway restarts ('agent.wait unavailable') — the local-subagent review pattern is wrong."
     requires:
