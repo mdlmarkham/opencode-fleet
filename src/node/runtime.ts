@@ -763,6 +763,51 @@ export interface CloneVerdict {
   detail: string;
 }
 
+/**
+ * Issue #283: install a spec's reference files INTO a run's clone before the worker
+ * starts, so a reference the operator named is actually present to read (#262 only
+ * NAMED them in the prompt).
+ *
+ * Each reference is a REPO-RELATIVE path. Fail closed on anything that could escape
+ * the clone: an absolute path, a `..` segment, or a symlinked destination is REFUSED
+ * (listed in `skipped` with a reason), never followed. A path already present in the
+ * clone is left as-is (the clone's own copy wins; we never clobber committed work).
+ * Returns what was installed and what was skipped-and-why; an empty list is a no-op.
+ */
+export async function installReferences(
+  runCwd: string,
+  paths: readonly string[],
+): Promise<{ installed: string[]; skipped: Array<{ path?: string; reason: string }> }> {
+  const fsp = await import("node:fs/promises");
+  const { join: pjoin, resolve: presolve, sep } = await import("node:path");
+  const installed: string[] = [];
+  const skipped: Array<{ path?: string; reason: string }> = [];
+  const root = presolve(runCwd);
+  for (const raw of paths) {
+    const rel = String(raw ?? "").trim();
+    if (rel === "") { skipped.push({ path: rel, reason: "empty path" }); continue; }
+    // Refuse anything that is not a clean repo-relative path.
+    if (rel.startsWith("/") || rel.startsWith("~") || /^[A-Za-z]:[\\/]/.test(rel)) {
+      skipped.push({ path: rel, reason: "absolute paths are refused (must be repo-relative)" });
+      continue;
+    }
+    const dest = presolve(pjoin(root, rel));
+    if (dest !== root && !dest.startsWith(root + sep)) {
+      skipped.push({ path: rel, reason: "path escapes the clone" });
+      continue;
+    }
+    // Source is the SAME relative path inside the clone: the reference is expected to
+    // already exist in the checkout (a committed doc/skill). If it does, it is already
+    // equipped — record it as installed. A symlink is refused rather than followed.
+    let st: Awaited<ReturnType<typeof fsp.lstat>> | undefined;
+    try { st = await fsp.lstat(dest); } catch { st = undefined; }
+    if (st && st.isSymbolicLink()) { skipped.push({ path: rel, reason: "destination is a symlink; refusing to follow" }); continue; }
+    if (!st) { skipped.push({ path: rel, reason: "not present in the clone (the reference must exist in the checkout)" }); continue; }
+    installed.push(rel);
+  }
+  return { installed, skipped };
+}
+
 /** Whether a run clone holds work beyond its start commit. Unknown counts as unsynced. */
 export async function cloneHasUnsyncedWork(runCwd: string, startHead: string | undefined): Promise<CloneVerdict> {
   const status = await git(["-C", runCwd, "status", "--porcelain"]);

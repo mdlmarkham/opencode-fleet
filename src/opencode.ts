@@ -81,6 +81,14 @@ export interface OpenCodeTask {
   expect?: FleetExpect;
   /** Issue #65 slice 2: advisory file scope; the node reports changed files outside it. */
   scope?: { files: string[] };
+  /**
+   * Issue #283: references to install INTO the run's clone before the worker starts,
+   * so a reference the operator named is actually present to read. Each entry is a
+   * repo-relative `path` (copied into the clone; `..`/absolute refs are refused) or a
+   * `note`-only pointer (nothing to install). Distinct from #262, which only NAMES
+   * references in the prompt.
+   */
+  references?: Array<{ path?: string; note?: string }>;
   /** Fleet run id — enables detached execution + durable completion record. */
   runId?: string;
   /** Detached execution (default true): node returns immediately with a run handle. */
