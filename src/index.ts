@@ -339,7 +339,7 @@ export default definePluginEntry({
                 type: "object",
                 additionalProperties: false,
                 properties: {
-        //  paths are treated as relative to the run cwd.
+                  files: { type: "array", items: { type: "string" }, description: "Artifact paths that must exist after the run (relative to the run cwd, inside it). Same rules as expect.files." },
                   command: { type: "string", description: "Verification command run in the run cwd after the worker exits; must exit 0 — same semantics as expect.command. Bounded to 120s unless timeoutMs is given." },
                   commands: { type: "array", items: { type: "string" }, description: "plural verification gate — EVERY command is run in the run cwd after the worker exits and must exit 0 for the gate to pass. `command` below stays as a working single-command alias; do not pass both. Same setup-command rule as expect.command." },
                   timeoutMs: { type: "number", description: "shared wall-clock bound applied to every verification command, ms; overrides the default 120000." },
@@ -635,6 +635,14 @@ export default definePluginEntry({
         // shape. No verify (and no expect) => expect stays undefined and
         // nothing extra is emitted anywhere. When spec is given it is the
         // dispatch unit, so its verify supersedes a flat `expect`.
+        // Issue #204: a flat `expect` alongside a spec used to be dropped silently (gate "none"). It now
+        // stands in when the spec has no verify of its own; giving both is refused, never guessed.
+        if (specCheck.spec && specCheck.spec.verify !== undefined && specCheck.spec.verify !== null && p.expect !== undefined && p.expect !== null) {
+          return jsonResult({ ok: false, error: "pass the verification gate once: either spec.verify or the flat `expect`, not both" });
+        }
+        if (specCheck.spec && (specCheck.spec.verify === undefined || specCheck.spec.verify === null) && p.expect !== undefined && p.expect !== null) {
+          specCheck.spec = { ...specCheck.spec, verify: p.expect as never }; // a copy: never mutate the caller's spec
+        }
         const expectSpec = specCheck.spec
           ? parseExpectSpec(specCheck.spec.verify)
           : parseExpectSpec(p.expect);
