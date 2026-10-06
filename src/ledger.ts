@@ -358,14 +358,22 @@ export function newRunId(): string {
 export async function probeRun(
   nodeHost: string,
   cwd: string,
-  opts: { harness?: string; pid?: number } = {},
+  opts: { harness?: string; pid?: number; hint?: string } = {},
 ): Promise<{ procRunning: boolean; procs?: string[]; uncommitted?: number; error?: string }> {
   const { execFile } = await import("node:child_process");
   const { promisify } = await import("node:util");
   const execFileP = promisify(execFile);
   try {
+    // Issue #30 finding I + TASK #103d: the pid probe also reads
+    // /proc/<pid>/cmdline in the SAME ssh call so a live-looking pid can be
+    // checked against an identity hint. Every step is guarded: a vanished pid
+    // (or an unreadable /proc entry) collapses to an EMPTY marker — kill -0
+    // alone cannot fail the whole ssh call, and neither can the cmdline read.
     const pidCheck = opts.pid
-      ? `kill -0 ${opts.pid} 2>/dev/null && echo "PIDALIVE ${opts.pid}" || true`
+      ? [
+          `kill -0 ${opts.pid} 2>/dev/null && echo "PIDALIVE ${opts.pid}" || true`,
+          `[ -r /proc/${opts.pid}/cmdline ] && printf 'CMDLINE %s\\n' "$(tr '\\0' ' ' < /proc/${opts.pid}/cmdline 2>/dev/null)" || echo "CMDLINE "`,
+        ].join("; ")
       : "true";
     const cmd = [
       pidCheck,
@@ -378,7 +386,11 @@ export async function probeRun(
     const procPart = procPartRaw ?? "";
     // Issue #30 finding I: engine-independent liveness (recorded pid OR any
     // matching opencode/pi process line), extracted as a pure helper.
-    const { alive, procs } = interpretLiveness(procPart, opts.pid);
+    // Task #103d: when a pid AND an identity hint exist the verdict is
+    // pid+identity ONLY (dead/mismatched pid => DEAD, name lines ignored);
+    // a recorded pid without a hint, or no pid at all, keeps the issue #30
+    // rule exactly (hint-less callers behave as today).
+    const { alive, procs } = interpretLiveness(procPart, opts.pid, opts.pid !== undefined ? opts.hint : undefined);
     const uncommitted = parseInt((uncommittedPart ?? "").trim(), 10);
     return {
       procRunning: alive,

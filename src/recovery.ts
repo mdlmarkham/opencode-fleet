@@ -153,20 +153,71 @@ export function abortStateWrite(
   return { ...existing, state: "aborted", finishedAt };
 }
 
+/** Marker emitted by the probe when the recorded pid answers `kill -0`. */
+const PID_ALIVE = "PIDALIVE";
+/** Marker emitted by the probe for `/proc/<pid>/cmdline`; empty when the pid has vanished or is unreadable. */
+export const CMDLINE = "CMDLINE";
+
 /**
- * Issue #30 finding I: interpret the engine-independent liveness probe output.
- * The recorded pid (when given) is confirmed by its PIDALIVE marker; otherwise
- * ANY matching opencode/pi process line means the run is alive.
+ * The probe transcript emits `CMDLINE <sanitized cmdline>` (one line, the
+ * cmdline's NUL separators flattened to spaces) for the recorded pid. Extract
+ * it; a missing or EMPTY marker (vanished pid, unreadable /proc) yields
+ * undefined — no identity evidence either way, never a false match.
+ */
+export function cmdlineOf(procPart: string): string | undefined {
+  for (const line of procPart.split("\n")) {
+    const l = line.trim();
+    if (l.startsWith(`${CMDLINE} `)) {
+      const cmdline = l.slice(CMDLINE.length).trim();
+      return cmdline.length ? cmdline : undefined;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * TASK #103d (issue #103): the pid+identity test. A RECORDED pid counts as the
+ * run's process only if the identity hint (its runId) appears in the cmdline.
+ * pid reuse — the old run dead, the pid recycled by an unrelated process —
+ * leaves the hint absent, so the recycled process never counts. The hint is
+ * the launch script path's embedded `runId` (`runScriptPath(runId)`), which is
+ * unguessable (issue #32), and the cmdline is sanitized before it is carried
+ * back over ssh (NULs → spaces), so a plain substring test is the right,
+ * injection-free comparison.
+ */
+export function pidMatchesHint(cmdline: string | undefined, hint: string | undefined): boolean {
+  if (cmdline === undefined) return false;
+  if (hint === undefined) return false;
+  return cmdline.includes(hint);
+}
+
+/**
+ * Issue #30 finding I + TASK #103d: interpret the engine-independent liveness
+ * probe output. Decision rule:
+ *  - recorded pid + NO hint: exactly today's (issue #30) behavior — the
+ *    PIDALIVE marker or ANY opencode/pi name line means alive (regression
+ *    guard for hint-less callers),
+ *  - recorded pid + hint (the run's runId): pid+identity ONLY — the pid must
+ *    answer `kill -0` AND its /proc cmdline must carry the hint; name-grep
+ *    lines are ignored (a reused pid or a dead run cannot borrow an unrelated
+ *    opencode/pi process to fake liveness),
+ *  - no recorded pid: name matching only (issue #30, preserved exactly).
  */
 export function interpretLiveness(
   procPart: string,
   pid?: number,
+  hint?: string,
 ): { alive: boolean; procs: string[] } {
   const pidAlive =
-    pid !== undefined && new RegExp(`PIDALIVE\\s+${pid}\\b`).test(procPart);
+    pid !== undefined && new RegExp(`${PID_ALIVE}\\s+${pid}\\b`).test(procPart);
   const procs = procPart
     .split("\n")
     .map((l) => l.trim())
-    .filter((l) => l && !l.startsWith("PIDALIVE"));
-  return { alive: pidAlive || procs.length > 0, procs };
+    .filter((l) => l && !l.startsWith(PID_ALIVE) && !l.startsWith(`${CMDLINE} `));
+  if (pid !== undefined) {
+    if (hint === undefined) return { alive: pidAlive || procs.length > 0, procs };
+    if (!pidAlive) return { alive: false, procs };
+    return { alive: pidMatchesHint(cmdlineOf(procPart), hint), procs };
+  }
+  return { alive: procs.length > 0, procs };
 }
