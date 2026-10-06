@@ -2082,6 +2082,8 @@ export default definePluginEntry({
         const iterations: Array<{ iter: number; summary?: string; handRaised?: boolean; question?: string; error?: string; verified?: boolean | null; progress?: boolean }> = [];
         let currentPrompt = p.prompt;
         let prevFingerprint = "";
+        // Issue #131: the failure.real-bug decision made after the previous round; this round's result is its outcome.
+        let pendingFailure: Promise<string | undefined> | undefined;
         const labelRun = (success: boolean, verified: boolean | null, iterations: number): void => {
           if (p.judgeProgress !== true || cfg.s1 == null) return;
           void import("./progress-judge.js").then((m) => m.recordProgressLabel(judgeKey, { verified, success, iterations }, api.rootDir ?? process.cwd())).catch(() => { /* best effort */ });
@@ -2175,6 +2177,11 @@ export default definePluginEntry({
 
           // Hand-raise: stop and let the caller answer.
           if (parsed.handRaised) {
+            // Issue #131 (shadow): would S1 have answered this from the record? Logged, never acted on.
+            if (cfg.s1 != null && parsed.question) {
+              const q = parsed.question;
+              void import("./builtin-points.js").then((m) => m.shadowPoint(cfg.s1, "handraise.triage", m.handraiseState(q, p.prompt), m.handraiseBaseline(q, p.prompt), api.rootDir ?? process.cwd())).catch(() => { /* never breaks the loop */ });
+            }
             return jsonResult(withVerified({ iterations, handRaised: true, question: parsed.question, done: false }, parsed));
           }
 
@@ -2196,6 +2203,11 @@ export default definePluginEntry({
           // run must not be able to fake success.
           const markerSeen = p.successMarker ? (parsed.summary ?? "").includes(p.successMarker) : false;
           const success = (p.successMarker ? markerSeen && !looksFailed : !looksFailed) && verified !== false;
+          if (pendingFailure) {
+            const pf = pendingFailure;
+            pendingFailure = undefined;
+            void Promise.all([pf, import("./builtin-points.js")]).then(([id, m]) => { if (id) return m.linkOutcome(m.shadowSinkFor(api.rootDir ?? process.cwd()), id, !success); }).catch(() => { /* best effort */ });
+          }
           if (success) {
             labelRun(true, verified, i);
             return jsonResult(withVerified({ iterations, done: true, success: true, finalSummary: parsed.summary }, parsed));
@@ -2226,6 +2238,14 @@ export default definePluginEntry({
                 lastOutcome,
               ),
             );
+          }
+
+          // Issue #131 (shadow): classify the failing round; the NEXT round's result is its outcome.
+          if (cfg.s1 != null) {
+            const fail = { error: parsed.error, summary: parsed.summary, verified, ...(typeof (parsed as { exitCode?: unknown }).exitCode === "number" ? { exitCode: (parsed as { exitCode: number }).exitCode } : {}) };
+            pendingFailure = import("./builtin-points.js")
+              .then(async (m) => (await m.shadowPoint(cfg.s1, "failure.real-bug", m.failureState(fail), m.failureBaseline(fail), api.rootDir ?? process.cwd()))?.decisionId)
+              .catch(() => undefined);
           }
 
           // Re-dispatch with the failure context appended.
