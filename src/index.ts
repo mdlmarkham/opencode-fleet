@@ -1564,7 +1564,7 @@ export default definePluginEntry({
       name: "fleet_spec_quality",
       label: "Fleet Spec Quality",
       description:
-        "Which spec shapes fail: outcomes of finished spec runs (no-op, failed gate, failed, complete) by acceptance/verify/scope, gate verdict and objection id. Read-only, from the ledger; rates need minN runs.",
+        "Which spec shapes fail: outcomes of finished spec runs by acceptance/verify/scope, gate verdict and objection id, plus per-objection regret-vs-noise proposals. Read-only, from the ledger; rates need minN runs.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -1578,7 +1578,10 @@ export default definePluginEntry({
         const { loadLedger } = await import("./ledger.js");
         const { qualityReport } = await import("./spec-quality.js");
         const sinceMs = typeof p.days === "number" && p.days > 0 ? Date.now() - p.days * 86_400_000 : undefined;
-        return jsonResult({ ok: true, ...qualityReport(await loadLedger(api.rootDir ?? process.cwd()), { ...(sinceMs !== undefined ? { sinceMs } : {}), ...(p.minN !== undefined ? { minN: p.minN } : {}) }) });
+        const ledger = await loadLedger(api.rootDir ?? process.cwd());
+        const opts = { ...(sinceMs !== undefined ? { sinceMs } : {}), ...(p.minN !== undefined ? { minN: p.minN } : {}) };
+        const { regretReport } = await import("./override-regret.js");
+        return jsonResult({ ok: true, ...qualityReport(ledger, opts), regret: regretReport(ledger, opts) });
       },
     });
 
