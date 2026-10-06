@@ -23,3 +23,20 @@ rules:
       paths: [src/guard.ts, src/deny-baseline.ts, src/decision-backends.ts, src/provision.ts, src/ssh.ts]
     message: Security-boundary changes get an independent review, from a different session than the author.
     evidence: "Decision 0002 and the review policy open in #45."
+  - id: serialize-manager-gates
+    severity: advise
+    keywords: [verify.sh, vitest, gate, reviewer, review-spawn, subagent]
+    message: Run at most one verification gate on the manager host at a time, and spawn reviewers as isolated remote runs rather than local child sessions.
+    evidence: "2026-10-05: two concurrent gates drove host load to 39, vitest RPC timed out, and 8 FALSE failures appeared; all were green when re-run quiet. 2026-10-06: three local reviewers were killed by gateway restarts ('agent.wait unavailable') — the local-subagent review pattern is wrong."
+    requires:
+      - Do not overlap a reviewer gate with the manager's own gate; let the manager's gate finish first (the #263 incident).
+      - Spawn review runs as isolated remote fleet runs (fleet_review prepare/collect on a node distinct from the author's), never as local child sessions that die with a gateway restart.
+  - id: loop-survives-restart
+    severity: advise
+    match:
+      paths: [src/mission-runner.ts, src/mission-node.ts, src/mission-supervisor.ts, src/ledger.ts, src/recovery.ts]
+    message: Long-running loop state must survive a node or gateway restart; a false negative (verified work reported unverified) is a defect, not a nuisance.
+    evidence: "#256 (first dispatch after a node restart false-fails), #257 (ledger loses the run→checkout link across a restart, so fleet_sync calls verified runs unverified)."
+    requires:
+      - Persist or reconcile the run→checkout link across restarts rather than letting it go null.
+      - Add a test that simulates the restart and shows the loop resumes rather than false-failing.
