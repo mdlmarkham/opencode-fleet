@@ -54,7 +54,7 @@ interface FleetConfig {
   /** Node-side private state dir (issue #103 group c); env FLEET_STATE_DIR still overrides. */
   stateDir?: string;
   /** Dispatch target policy (issue #168). */
-  dispatch?: { defaultTarget?: "all" };
+  dispatch?: { defaultTarget?: "all"; piMinVersion?: string };
   /** Opt-in (issue #189): commits made in a provisioned checkout carry this identity (set in the checkout's local git config, only when it has none). */
   workerGitIdentity?: { name?: string; email?: string };
   apertureUrl?: string;
@@ -152,6 +152,7 @@ export default definePluginEntry({
         additionalProperties: false,
         description: "Dispatch target policy.",
         properties: {
+          piMinVersion: { type: "string", pattern: "^\\d+\\.\\d+\\.\\d+$", description: "Refuse a harness=pi dispatch to a node whose `pi --version` is older than this (fail closed when it cannot be read)." },
           defaultTarget: { type: "string", enum: ["all"], description: "Restore the old behaviour: a fleet_dispatch that names no node runs on EVERY fleet node. Off by default: an unnamed target is refused with the node list; fan-out is explicit (nodes: \"all\") and pick:\"any\" chooses one node with a free slot." },
         },
       },
@@ -860,6 +861,12 @@ export default definePluginEntry({
             const { diskFreeCommand, parseFreeKb, diskHeadroom } = await import("./capacity.js");
             const room = diskHeadroom(nodeName, parseFreeKb(await sshProbe(sshHost, diskFreeCommand(shq(p.cwd)))), cfg.capacity!.minFreeDiskGb!);
             if (!room.ok) { results[nodeKey] = room; continue; }
+          }
+          // Issue #137: a configured minimum Pi version is enforced at dispatch, failing closed when unreadable.
+          if (routed.harness === "pi" && cfg.dispatch?.piMinVersion) {
+            const { checkPiVersion, PI_VERSION_COMMAND } = await import("./pi-version.js");
+            const v = checkPiVersion(await sshProbe(sshHost, PI_VERSION_COMMAND), cfg.dispatch.piMinVersion);
+            if (!v.ok) { results[nodeKey] = { ok: false, error: `refusing to dispatch: node ${nodeName}: ${v.error}` }; continue; }
           }
           if (routed.harness !== "pi" && (p.piTools !== undefined || p.piOffline !== undefined || p.piJson !== undefined)) {
             results[nodeKey] = { ok: false, error: "piTools/piOffline/piJson apply to harness=pi only; refusing so the restriction is not silently ignored" };
