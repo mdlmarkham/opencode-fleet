@@ -859,6 +859,8 @@ export default definePluginEntry({
             ...(specCheck.spec ? { spec: specCheck.spec } : {}),
             // Issue #117: overrides are part of the run's record.
             ...(design?.acknowledged.length ? { gateAcknowledged: design.acknowledged } : {}),
+            // Issue #166: what the gate said at dispatch, as ids (no text), for the spec-quality view.
+            ...(design ? { design: { verdict: design.verdict, objectionIds: design.objections.map((o) => o.id) } } : {}),
             // Issue #39 (budget slice): the per-dispatch caps this run was admitted under,
             // so the day's accounting can show them; absent when no override was given.
             ...(overrideCheck.override ? { budgetCap: overrideCheck.override } : {}),
@@ -1519,6 +1521,28 @@ export default definePluginEntry({
     });
 
     api.registerTool({
+      name: "fleet_spec_quality",
+      label: "Fleet Spec Quality",
+      description:
+        "Issue #166: which spec shapes fail. Over finished spec-dispatched runs, compares outcomes (no-op, failed gate, failed, complete) by whether the spec had acceptance / verify / scope, by design-gate verdict and by objection id. Read-only, derived from the ledger; rates are withheld below minN runs.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          days: { type: "number", description: "Only runs started in the last N days (default: all)." },
+          minN: { type: "number", description: "Smallest group a rate is shown for (default 10)." },
+        },
+      },
+      execute: async (_toolCallId, params) => {
+        const p = params as { days?: number; minN?: number };
+        const { loadLedger } = await import("./ledger.js");
+        const { qualityReport } = await import("./spec-quality.js");
+        const sinceMs = typeof p.days === "number" && p.days > 0 ? Date.now() - p.days * 86_400_000 : undefined;
+        return jsonResult({ ok: true, ...qualityReport(await loadLedger(api.rootDir ?? process.cwd()), { ...(sinceMs !== undefined ? { sinceMs } : {}), ...(p.minN !== undefined ? { minN: p.minN } : {}) }) });
+      },
+    });
+
+    api.registerTool({
       name: "fleet_run_report",
       label: "Fleet Run Report",
       description:
@@ -1647,6 +1671,8 @@ export default definePluginEntry({
             // Issue #39: usage rides the ledger once, from the manifest; the run's own
             // startedAt attributes it to its day. A recorded entry keeps its usage.
             ...(usage && !alreadyCounted ? { usage } : {}),
+            // Issue #166: a captured change list (null = capture missing, never "no changes").
+            ...(Array.isArray((st.manifest as { filesChanged?: unknown } | undefined)?.filesChanged) ? { filesChanged: ((st.manifest as { filesChanged: unknown[] }).filesChanged).length } : {}),
             summary:
               state === "failed" && !st.finishedAt
                 ? "worker process died without completion record (silent death)"
