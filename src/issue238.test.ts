@@ -87,3 +87,12 @@ describe("#238: deployPlugin refuses a non-repo pluginDir before build", () => {
     expect(deploy?.properties?.pluginDir?.type).toBe("string");
   });
 });
+
+describe("#238: the install steps never prompt in a non-TTY deploy", () => {
+  const src = readFileSync(join(here, "deploy.ts"), "utf8");
+  it("both openclaw install call sites acknowledge the install-policy warning", () => {
+    // Issue found live: deployPlugin's install-gateway step failed in non-TTY because the CLI
+    // prompts on security.installPolicy warnings for local archives; --force alone does not answer it.
+    expect(src.match(/--acknowledge-install-policy-warning/g)?.length).toBe(2);
+  });
+});
