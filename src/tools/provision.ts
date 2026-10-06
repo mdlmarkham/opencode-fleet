@@ -431,7 +431,12 @@ export function registerProvisionTools(api: OpenClawPluginApi, cfg: FleetConfig)
         selfCheck: p.selfCheck,
         skipGateway: p.skipGateway,
       });
-      return jsonResult(r);
+      // Issue #289: surface allow-array drift at the moment it matters (read-only; never fails the deploy).
+      const { toolAllowForDeploy } = await import("../tool-allow.js");
+      const { readFile } = await import("node:fs/promises");
+      const { homedir } = await import("node:os");
+      const toolAllow = await toolAllowForDeploy(process.env.OPENCLAW_CONFIG_PATH || join(homedir(), ".openclaw", "openclaw.json"), join(pluginDir, "openclaw.plugin.json"), (f) => readFile(f, "utf8"));
+      return jsonResult({ ...(r as object), toolAllow });
     },
   });
 }
