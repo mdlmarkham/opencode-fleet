@@ -16,6 +16,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { quoteUntrusted, sanitizeQuestion } from "./untrusted.js";
 import { checkSetup, partitionEnv } from "./policy.js";
 import { handleOpencodeRun, type FleetOpenCodeTask } from "./node/handler.js";
+import { setNodeEnvConfig, type NodeEnvConfig } from "./guard.js";
 import { handleOpencodeRunPolicy, newProtocolCache, type PolicyCtx } from "./gateway-policy.js";
 import { isSentinelPrompt } from "./protocol.js";
 import { OPCODE_PS_COMMAND, abortRunById, parseActivity, runStatePath, type NodeActivityEntry } from "./node/runtime.js";
@@ -48,6 +49,10 @@ interface FleetConfig {
   defaultTransport?: "http" | "acp";
   nodePrefixes?: string[];
   defaultTimeoutMs?: number;
+  /** Node-side workspace roots (issue #103 group c); env FLEET_ALLOWED_ROOTS still overrides. */
+  allowedRoots?: string[];
+  /** Node-side private state dir (issue #103 group c); env FLEET_STATE_DIR still overrides. */
+  stateDir?: string;
   /** Dispatch target policy (issue #168). */
   dispatch?: { defaultTarget?: "all" };
   /** Opt-in (issue #189): commits made in a provisioned checkout carry this identity (set in the checkout's local git config, only when it has none). */
@@ -121,6 +126,15 @@ export default definePluginEntry({
         type: "number",
         default: 1800000,
         description: "Default wall-clock timeout for a fleet_dispatch run, ms (30 minutes). The idle watchdog (maxIdleMs, default 120000) is the primary hung-run guard; this is the backstop. A run ended by either limit reports which one in `endedBy`.",
+      },
+      allowedRoots: {
+        type: "array",
+        items: { type: "string" },
+        description: "Workspace roots the node will operate in (issue #103 group c): absolute paths, e.g. [\"/srv/work\", \"/home/u\"]. Config twin of the node's FLEET_ALLOWED_ROOTS env var; an explicit FLEET_ALLOWED_ROOTS env value still overrides this. Default: the shared fleet root plus the service user's home.",
+      },
+      stateDir: {
+        type: "string",
+        description: "Node-side private state directory (issue #103 group c), absolute path. Config twin of the node's FLEET_STATE_DIR env var; an explicit FLEET_STATE_DIR env value still overrides this. Default: ~/.openclaw/fleet/state under the service user's home.",
       },
       workerGitIdentity: {
         type: "object",
@@ -288,6 +302,11 @@ export default definePluginEntry({
   register(api) {
     const cfg = (api.pluginConfig ?? {}) as FleetConfig;
     setSshOptions(cfg.ssh);
+    // Issue #103 group c: capture the node-relevant knobs (allowedRoots/stateDir)
+    // so the node-side defaults (guardCwd roots, the private state dir) honor the
+    // plugin config; an explicit FLEET_ALLOWED_ROOTS/FLEET_STATE_DIR env value on
+    // the node still overrides it.
+    setNodeEnvConfig({ ...(cfg.allowedRoots?.length ? { allowedRoots: cfg.allowedRoots } : {}), ...(cfg.stateDir ? { stateDir: cfg.stateDir } : {}) });
 
     // Issue #39 (budget slice): validate the optional budget block once at load so a
     // malformed config is a precise, immediate error, never a silently ignored limit.

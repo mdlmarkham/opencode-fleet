@@ -13,18 +13,28 @@ import { chmodSync, lstatSync, mkdirSync } from "node:fs";
 import { rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { ID_RE } from "./guard.js";
+import { ID_RE, getDefaultNodeEnvConfig, type NodeEnvConfig } from "./guard.js";
 
-/** Override with FLEET_STATE_DIR on the node; default is under the service user's home. */
-export function fleetStateDir(env: Record<string, string | undefined> = process.env): string {
-  return env.FLEET_STATE_DIR?.trim() || join(homedir(), ".openclaw", "fleet", "state");
+/**
+ * Node private state directory. Precedence (issue #103 group c): an explicit
+ * `FLEET_STATE_DIR` env value first, then the plugin config's `stateDir`
+ * (captured via setNodeEnvConfig when not passed here), then the default under
+ * the service user's home. Behavior is unchanged when neither is set.
+ */
+export function fleetStateDir(
+  env: Record<string, string | undefined> = process.env,
+  config?: NodeEnvConfig,
+): string {
+  const fromEnv = env.FLEET_STATE_DIR?.trim();
+  const fromConfig = (config ?? getDefaultNodeEnvConfig())?.stateDir?.trim();
+  return fromEnv || fromConfig || join(homedir(), ".openclaw", "fleet", "state");
 }
 
 /**
  * Create (if needed) and verify the state directory: a real directory (not a
  * symlink), owned by the current user, with no group/other access.
  */
-export function ensureStateDir(dir: string = fleetStateDir()): string {
+export function ensureStateDir(dir: string = fleetStateDir(process.env, getDefaultNodeEnvConfig())): string {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const st = lstatSync(dir);
   if (st.isSymbolicLink() || !st.isDirectory()) {
@@ -83,7 +93,7 @@ export function xferPaths(transferId: string, dir: string = ensureStateDir()): {
  * files. provision.ts mirrors this layout in the node-side shell command
  * (remoteStageDirCmd); ids are validated like transferIds.
  */
-export function stagePaths(id: string, dir: string = fleetStateDir()): { dir: string; bundle: string } {
+export function stagePaths(id: string, dir: string = fleetStateDir(process.env, getDefaultNodeEnvConfig())): { dir: string; bundle: string } {
   const safe = seg("transferId", id);
   const staging = join(dir, `xfer-${safe}`);
   return { dir: staging, bundle: join(staging, "bundle") };
