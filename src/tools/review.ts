@@ -70,7 +70,15 @@ export function registerReviewTools(api: OpenClawPluginApi, cfg: FleetConfig): v
         if (!st.finishedAt) return jsonResult({ ok: false, error: "the reviewer run has not finished", status: st.alive ? "running" : "no-completion-record" });
         const manifest = (st.manifest as { commands?: Array<{ tool?: string; input?: string }> } | undefined)?.commands ?? [];
         const res = await call({ prompt: "__RUN_RESULT__", cwd: "/", transport: "http", runId: entry.runId });
-        const parsed = parseReviewerOutput(String(res.result ?? ""));
+        // Issue #270: `res.result` is the engine's PARSED result object
+        // ({ ok, summary, ... }) — the reviewer's fenced verdict lives in the
+        // `summary` field. String(res.result) yielded "[object Object]" and
+        // never found the block. Prefer the summary text; fall back to a raw
+        // string for older nodes that returned one directly.
+        const resultText = (res.result && typeof res.result === "object" && typeof (res.result as { summary?: unknown }).summary === "string")
+          ? String((res.result as { summary: string }).summary)
+          : String(res.result ?? "");
+        const parsed = parseReviewerOutput(resultText);
         if (!parsed.ok) return jsonResult({ ok: false, error: parsed.error });
         const report = parsed.report;
         const claimed = (report.commands ?? []).map((c) => String(c.command ?? ""));
