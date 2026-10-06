@@ -960,7 +960,7 @@ export function registerDispatchTools(api: OpenClawPluginApi, cfg: FleetConfig):
       const findings: Array<Record<string, unknown>> = [];
       for (const run of incomplete) {
         const host = hostFor(run.node);
-        const probe = await probeRun(host, run.cwd, { harness: run.harness, pid: run.pid });
+        const probe = await probeRun(host, run.cwd, { harness: run.harness, pid: run.pid, hint: run.runId });
         let status: string;
         if (probe.procRunning) status = "live";
         else if ((probe.uncommitted ?? -1) > 0) status = "finished-uncommitted";
