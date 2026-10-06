@@ -7,9 +7,9 @@ describe("#115: detectCommands", () => {
   it("reads npm scripts and the right install command, with the source file as evidence", () => {
     const c = detectCommands({ "package.json": JSON.stringify({ scripts: { build: "tsc", test: "vitest", lint: "eslint .", deploy: "x" } }), "package-lock.json": "{}" });
     expect(c).toEqual(expect.arrayContaining([
-      { kind: "build", command: "npm run build", source: "package.json" },
-      { kind: "test", command: "npm test", source: "package.json" },
-      { kind: "lint", command: "npm run lint", source: "package.json" },
+      { kind: "build", command: "npm run build", source: "package.json", body: "tsc" },
+      { kind: "test", command: "npm test", source: "package.json", body: "vitest" },
+      { kind: "lint", command: "npm run lint", source: "package.json", body: "eslint ." },
       { kind: "install", command: "npm ci", source: "package.json" },
     ]));
     expect(c.some((x) => x.command.includes("deploy"))).toBe(false);

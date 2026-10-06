@@ -20,6 +20,8 @@ export interface CommandCandidate {
   command: string;
   /** The file the command was read from (evidence). */
   source: string;
+  /** What the runner would actually execute (a package.json script, a Makefile recipe), when known. */
+  body?: string;
 }
 
 const RUNNERS: Record<string, CommandKind> = { install: "install", ci: "install", build: "build", compile: "build", test: "test", lint: "lint" };
@@ -35,7 +37,7 @@ export function detectCommands(files: Record<string, string | undefined>): Comma
       if (pkg.scripts && typeof pkg.scripts === "object") {
         for (const name of Object.keys(pkg.scripts)) {
           const kind = RUNNERS[name];
-          if (kind && kind !== "install" && typeof pkg.scripts[name] === "string") out.push({ kind, command: name === "test" ? `${pm} test` : `${pm} run ${name}`, source: "package.json" });
+          if (kind && kind !== "install" && typeof pkg.scripts[name] === "string") out.push({ kind, command: name === "test" ? `${pm} test` : `${pm} run ${name}`, source: "package.json", body: pkg.scripts[name] as string });
         }
       }
       out.push({ kind: "install", command: pm === "npm" ? (files["package-lock.json"] !== undefined ? "npm ci" : "npm install") : `${pm} install`, source: "package.json" });
@@ -43,9 +45,9 @@ export function detectCommands(files: Record<string, string | undefined>): Comma
   }
   const make = files["Makefile"];
   if (make !== undefined) {
-    for (const m of make.matchAll(/^([A-Za-z][\w-]*):(?!=)/gm)) {
+    for (const m of make.matchAll(/^([A-Za-z][\w-]*):(?!=)[^\n]*((?:\n\t[^\n]*)*)/gm)) {
       const kind = RUNNERS[m[1]!];
-      if (kind && kind !== "install") out.push({ kind, command: `make ${m[1]}`, source: "Makefile" });
+      if (kind && kind !== "install") out.push({ kind, command: `make ${m[1]}`, source: "Makefile", body: m[2]!.trim() });
     }
   }
   if (files["Cargo.toml"] !== undefined) out.push({ kind: "build", command: "cargo build", source: "Cargo.toml" }, { kind: "test", command: "cargo test", source: "Cargo.toml" });
@@ -61,8 +63,11 @@ export type Screen = { runnable: true } | { runnable: false; reason: string };
 const SAFE_RUN = /^(?:(?:npm|pnpm|yarn) (?:ci|install|test|run [A-Za-z0-9:_-]+)|make [A-Za-z0-9_-]+|cargo (?:build|test|clippy)|go (?:build|test|vet) \.\/\.\.\.|pytest(?: -[A-Za-z]+)*(?: [A-Za-z0-9_./-]+)*|tox)$/;
 const DANGEROUS = /\|\s*(?:sh|bash|zsh)\b|\b(?:curl|wget)\b|[;&|`<>]|\$\(|\brm\s+-|\bsudo\b|\beval\b/;
 
-/** May this command be executed in the survey clone? Anything else is reported as a finding instead. */
-export function screenCommand(command: string): Screen {
+const BODY_DANGEROUS = /\|\s*(?:sh|bash|zsh)\b|\b(?:curl|wget)\b|\bsudo\b|\beval\b|\brm\s+-[A-Za-z]*r/;
+
+/** May this command be executed in the survey clone? The script body it would run is screened too. Anything else is reported as a finding instead. */
+export function screenCommand(command: string, body?: string): Screen {
+  if (body !== undefined && BODY_DANGEROUS.test(body)) return { runnable: false, reason: "its script downloads, pipes to a shell, escalates or deletes recursively; reported, not executed" };
   const c = command.trim();
   if (c === "" || c.length > 200) return { runnable: false, reason: "empty or too long" };
   if (DANGEROUS.test(c)) return { runnable: false, reason: "contains a download, pipe, chain, redirection or privileged call; reported, not executed" };

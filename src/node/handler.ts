@@ -140,6 +140,51 @@ OPS["project.read"] = async ({ task }: OpCtx) => {
   return JSON.stringify({ ok: true, ...r });
 };
 
+OPS["project.survey"] = async ({ task, context }: OpCtx) => {
+  // Issue #115: a read-only survey of a checkout. It reads known manifests (capped, symlinks refused),
+  // lists tracked files, and detects the install/build/test/lint commands. It RUNS only commands that pass
+  // screenCommand, only when the caller says the checkout is disposable, each with a hard timeout. Anything
+  // else is reported with the reason it was not run. The gateway re-validates the report.
+  const { detectCommands, detectConventions, screenCommand, validateReport } = await import("../adopt.js");
+  const t = task as { run?: unknown; disposableClone?: unknown; commandTimeoutMs?: unknown };
+  const fsp = await import("node:fs/promises");
+  const KNOWN = ["package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "Makefile", "Cargo.toml", "go.mod", "pyproject.toml", "pytest.ini", "tox.ini"];
+  const LOCKFILES = new Set(["package-lock.json", "pnpm-lock.yaml", "yarn.lock"]);
+  const files: Record<string, string | undefined> = {};
+  for (const name of KNOWN) {
+    try {
+      const path = join(task.cwd, name);
+      const st = await fsp.lstat(path);
+      if (st.isSymbolicLink() || !st.isFile() || st.size > 256 * 1024) continue;
+      // Lockfiles only matter by presence; never read their (large) contents.
+      files[name] = LOCKFILES.has(name) ? "" : await fsp.readFile(path, "utf8");
+    } catch { /* absent */ }
+  }
+  const head = (await runShell(`cd ${shq(task.cwd)} && git rev-parse HEAD 2>/dev/null`, 10_000, context?.signal)).trim();
+  if (!/^[0-9a-f]{40}$/.test(head)) return JSON.stringify({ ok: false, error: "cwd is not a git checkout with a HEAD commit" });
+  const listing = await runShellDetailed(`cd ${shq(task.cwd)} && git ls-files`, 15_000, context?.signal);
+  const paths = listing.exitCode === 0 ? listing.output.split("\n").filter(Boolean).slice(0, 20_000) : null;
+  const runMode = t.run === "all" || t.run === "checks" ? t.run : "none";
+  const disposable = t.disposableClone === true;
+  const limit = typeof t.commandTimeoutMs === "number" && t.commandTimeoutMs >= 1000 && t.commandTimeoutMs <= 600_000 ? t.commandTimeoutMs : 120_000;
+  const commands = [] as Array<Record<string, unknown>>;
+  for (const c of detectCommands(files)) {
+    const base = { kind: c.kind, command: c.command, source: c.source };
+    const screen = screenCommand(c.command, c.body);
+    if (!screen.runnable) { commands.push({ ...base, exitCode: null, durationMs: null, skipped: screen.reason }); continue; }
+    if (runMode === "none") { commands.push({ ...base, exitCode: null, durationMs: null, skipped: "run not requested" }); continue; }
+    if (!disposable) { commands.push({ ...base, exitCode: null, durationMs: null, skipped: "running needs disposableClone: true (installs and tests write to the checkout)" }); continue; }
+    if (runMode === "checks" && c.kind === "install") { commands.push({ ...base, exitCode: null, durationMs: null, skipped: "install not requested (run: checks)" }); continue; }
+    const t0 = Date.now();
+    const r = await runShellDetailed(`cd ${shq(task.cwd)} && ${c.command}`, limit, context?.signal);
+    commands.push({ ...base, exitCode: r.timedOut ? 124 : r.exitCode, durationMs: Date.now() - t0, outputTail: r.output.slice(-1500) });
+  }
+  const report = { schemaVersion: 1, commit: head, commands, conventions: detectConventions(paths) };
+  const v = validateReport(report);
+  if (!v.ok) return JSON.stringify({ ok: false, error: `survey produced an invalid report: ${v.error}` });
+  return JSON.stringify({ ok: true, report: v.report });
+};
+
 OPS["diff"] = async ({ task, io, context }: OpCtx) => {
   void io; void context;
       // Show the working-tree diff in the checkout (real diff).

@@ -20,12 +20,13 @@
  *               and the network, silently dropping the restriction the caller asked for
  *   protocol 6  adds the `project.read` op (raw `.fleet/` text for the gateway to re-validate); an older
  *               node would take its sentinel for an ordinary task prompt
+ *   protocol 7  adds the `project.survey` op (read-only adoption survey, runs screened commands)
  */
 
-export const PROTOCOL_VERSION = 6;
+export const PROTOCOL_VERSION = 7;
 
 /** Ops that only a node of at least this protocol understands (absent = any node). */
-export const OP_MIN_PROTOCOL: Readonly<Record<string, number>> = { "state.prune": 3, "project.read": 6 };
+export const OP_MIN_PROTOCOL: Readonly<Record<string, number>> = { "state.prune": 3, "project.read": 6, "project.survey": 7 };
 
 /** Minimum node protocol an op itself needs, with a label for refusal messages. */
 export function requiredProtocolForOp(op: string): { version: number; feature?: string } {
@@ -79,6 +80,7 @@ export const SENTINEL_OPS = {
   __RUN_RESULT__: "run.result",
   __PRUNE__: "state.prune",
   __PROJECT_READ__: "project.read",
+  __PROJECT_SURVEY__: "project.survey",
 } as const;
 
 export type SentinelPrompt = keyof typeof SENTINEL_OPS;
