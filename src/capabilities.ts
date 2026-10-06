@@ -61,6 +61,12 @@ export interface NodeCapabilities {
    * when bwrap is usable. Derived from the booleans above by deriveIsolationLevels.
    */
   isolationLevels?: string[];
+  /**
+   * Build provenance: which CODE this node is actually running. A digest of the
+   * node's installed dist .js modules (not the entry stub, which never changes) —
+   * the manager can compare it to its own build to answer "merged but deployed?".
+   */
+  build?: { digest: string; short: string; modules: number };
   error?: string;
 }
 
