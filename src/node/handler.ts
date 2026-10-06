@@ -331,11 +331,25 @@ OPS["run.start"] = async ({ task, io, context }: OpCtx) => {
       }
       let eff = task;
       let isolation: { mode: "clone"; source: string; cwd: string; branch: string; sourceDirty: boolean } | undefined;
+      let installedReferences: string[] | undefined;
+      let referencesSkipped: Array<{ path?: string; reason: string }> | undefined;
       if (isoMode === "clone") {
         const clone = await createRunClone(runId, task.cwd);
         if (!clone.ok) return JSON.stringify({ ok: false, error: `refused: cannot isolate the run: ${clone.error}` });
         isolation = { mode: "clone", source: task.cwd, cwd: clone.cwd, branch: clone.branch, sourceDirty: clone.sourceDirty };
         eff = { ...task, cwd: clone.cwd };
+        // Issue #283: install the spec's references INTO the clone before the worker
+        // starts, so a reference the operator named is actually present to read (#262
+        // only NAMES them). Fail-safe: an uninstallable reference is reported with a
+        // reason, never silently dropped; a path escaping the clone is refused.
+        const refs = Array.isArray((task as { references?: unknown }).references) ? ((task as { references: Array<{ path?: unknown; note?: unknown }> }).references) : [];
+        const withPath = refs.filter((r) => typeof r?.path === "string" && (r.path as string).trim() !== "");
+        if (withPath.length) {
+          const { installReferences } = await import("./runtime.js");
+          const res = await installReferences(clone.cwd, withPath.map((r) => String(r.path)));
+          installedReferences = res.installed;
+          if (res.skipped.length) referencesSkipped = res.skipped;
+        }
       } else {
         // Issue #275: a run into a SHARED, non-isolated checkout must not start
         // on top of another run's uncommitted work. A dirty source mixes
