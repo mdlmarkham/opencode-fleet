@@ -168,6 +168,7 @@ The plugin bundles a **skill** (`skills/opencode-fleet/SKILL.md`) that teaches a
 | `sync` | see below | `fleet_sync` publish policy: `protectedBranches` (default `["main","master"]`), `allowDirectPush` (default `[]`), `allowSensitivePaths` (default `false`), `sensitivePaths` (extra path globs, e.g. `ci/**`, added to the built-in list). |
 | `nodes[].user` | _(unset)_ | SSH login user for a node (defaults to SSH config default, usually `root`) |
 | `nodes[].serviceUser` | _(unset)_ | Principal the node's OpenClaw service runs as, when it differs from the login user. Install/verify target this principal's plugin root. |
+| `allowedRoots` / `stateDir` | _(unset)_ | Node-side knobs (issue #103 group c) settable in the plugin config instead of env: `allowedRoots` (string array) is the workspace roots the node operates in (config twin of `FLEET_ALLOWED_ROOTS`), `stateDir` (string) the node's private state dir (config twin of `FLEET_STATE_DIR`). An explicit env value on the node still overrides the config. |
 
 ## Trust boundaries for agent-supplied input
 

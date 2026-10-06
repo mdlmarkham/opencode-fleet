@@ -28,6 +28,15 @@
         "type": "number",
         "default": 1800000
       },
+      "allowedRoots": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Workspace roots the node will operate in (issue #103 group c): absolute paths, e.g. [\"/srv/work\", \"/home/u\"]. Config twin of the node's FLEET_ALLOWED_ROOTS env var; an explicit FLEET_ALLOWED_ROOTS env value still overrides this. Default: the shared fleet root plus the service user's home."
+      },
+      "stateDir": {
+        "type": "string",
+        "description": "Node-side private state directory (issue #103 group c), absolute path. Config twin of the node's FLEET_STATE_DIR env var; an explicit FLEET_STATE_DIR env value still overrides this. Default: ~/.openclaw/fleet/state under the service user's home."
+      },
       "nodes": {
         "type": "object",
         "additionalProperties": {

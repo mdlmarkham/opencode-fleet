@@ -108,6 +108,8 @@ without editing this section fails the build. Config lives at
 | `apertureUrl` | `string` | _(none)_ | Model catalog URL (OpenAI-style `/v1/models`). Until set, `fleet_models` and live model resolution are unavailable (they error, not degrade silently). |
 | `fleetRoot` | `string` | `/home/<serviceUser>/fleet` **when every target node has the same serviceUser**; otherwise unset | Default provisioning cwd root on nodes (`src/cwd.ts`). When no default can be derived, pass `cwd` explicitly or set this. |
 | `piDefaultModel` | `string` | _(none)_ | Pi model ref (`provider/id`) used when `harness: "pi"` and the dispatch names no `piModel`. There is no built-in default: a Pi dispatch without either is refused. |
+| `allowedRoots` | `string[]` | _(unset)_ | Issue #103 group c: config twin of the node's `FLEET_ALLOWED_ROOTS` — workspace roots (absolute paths) every dispatch `cwd` must land under on the node. An explicit `FLEET_ALLOWED_ROOTS` env value on the node still overrides this. Unset: the node default (service home + `<home>/fleet`). |
+| `stateDir` | `string` | _(unset)_ | Issue #103 group c: config twin of the node's `FLEET_STATE_DIR` — the node's private per-run state dir (mode 0700, see checklist item 7). An explicit `FLEET_STATE_DIR` env value on the node still overrides this. Unset: `~/.openclaw/fleet/state` under the service user's home. |
 | `ssh` | `{strictHostKeyChecking?: "accept-new" \| "yes"}` | `accept-new` | SSH client policy for manager-to-node commands. `accept-new` = TOFU; `"yes"` requires keys pre-pinned in `known_hosts`. |
 
 Plus one key the manifest does not carry because it is validated separately

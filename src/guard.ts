@@ -19,6 +19,35 @@ export const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 
 export type IdCheck = { ok: true; id: string } | { ok: false; error: string };
 
+/**
+ * Shape of the node-relevant plugin config knobs (issue #103 group c): the
+ * workspace roots and the private state dir can come from the plugin config
+ * instead of process env. ENV remains the override.
+ */
+export interface NodeEnvConfig {
+  /** Workspace roots the node operates in (config twin of FLEET_ALLOWED_ROOTS). */
+  allowedRoots?: string[];
+  /** Node private state dir (config twin of FLEET_STATE_DIR). */
+  stateDir?: string;
+}
+
+/**
+ * The plugin config's node-relevant knobs, captured at register time by
+ * `setNodeEnvConfig` so signature-compatible defaults (`guardCwd`, `ensureStateDir`)
+ * can fall back to config without threading config through every call site.
+ */
+let currentConfig: NodeEnvConfig | undefined;
+
+/** Capture the loaded plugin config's node-relevant knobs (issue #103 group c). */
+export function setNodeEnvConfig(config: NodeEnvConfig | undefined): void {
+  currentConfig = config && (config.allowedRoots?.length || config.stateDir) ? config : undefined;
+}
+
+/** The config captured by setNodeEnvConfig; undefined before registration. */
+export function getDefaultNodeEnvConfig(): NodeEnvConfig | undefined {
+  return currentConfig;
+}
+
 /** Validate an identifier that is used to build a file path. */
 export function validateId(kind: string, value: unknown): IdCheck {
   if (typeof value !== "string" || !ID_RE.test(value)) {
@@ -28,16 +57,24 @@ export function validateId(kind: string, value: unknown): IdCheck {
 }
 
 /**
- * Workspace roots the node will operate in. Override with a path-delimited
- * `FLEET_ALLOWED_ROOTS` env var on the node. The default is the shared fleet
- * root plus the service user's home (existing deployments dispatch under it).
+ * Workspace roots the node will operate in. Precedence (issue #103 group c):
+ * an explicit `FLEET_ALLOWED_ROOTS` env var first, then the plugin config's
+ * `allowedRoots`, then the default (the shared fleet root plus the service
+ * user's home — existing deployments dispatch under it). Behavior is
+ * unchanged when neither env nor config is set.
  */
 export function allowedRoots(
   env: Record<string, string | undefined> = process.env,
   home: string = homedir(),
+  config?: NodeEnvConfig,
 ): string[] {
   const raw = env.FLEET_ALLOWED_ROOTS?.trim();
-  const roots = raw ? raw.split(/[:;]/).map((s) => s.trim()).filter(Boolean) : [join(home, FLEET_DIRNAME), home];
+  const cfgRoots = config?.allowedRoots?.map((s) => s.trim()).filter(Boolean) ?? [];
+  const roots = raw
+    ? raw.split(/[:;]/).map((s) => s.trim()).filter(Boolean)
+    : cfgRoots.length
+      ? cfgRoots
+      : [join(home, FLEET_DIRNAME), home];
   return roots.filter((r) => isAbsolute(r)).map((r) => resolve(r));
 }
 
@@ -99,7 +136,7 @@ export async function resolveReal(p: string): Promise<string> {
 /** Full cwd validation: shape, symlink resolution, then root confinement. */
 export async function guardCwd(
   cwd: unknown,
-  roots: string[] = allowedRoots(),
+  roots: string[] = allowedRoots(process.env, homedir(), getDefaultNodeEnvConfig()),
 ): Promise<CwdCheck> {
   if (typeof cwd !== "string" || !isAbsolute(cwd)) return checkCwd(cwd, roots);
   const rootsReal = await Promise.all(roots.map((r) => resolveReal(r)));
