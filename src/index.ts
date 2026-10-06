@@ -70,6 +70,8 @@ interface FleetConfig {
   isolation?: "none" | "clone";
   /** Deterministic design gate for spec dispatches (issue #117): off | advise (default) | enforce, plus size bounds. */
   /** Concurrency slots (issue #39). */
+  /** GitHub projection of missions (issue #132): the repo and the NAME of the env var that holds the token (the token itself stays in OpenClaw's secrets, never in config). */
+  projection?: { repo?: string; tokenEnv?: string };
   capacity?: { maxConcurrentPerNode?: number; staleAfterMs?: number; minFreeDiskGb?: number };
   /** Spend caps (issue #39): per-UTC-day totals from ledger usage + per-dispatch caps. Validated by parseBudgetConfig. */
   budget?: { dailyCostUsd?: number; dailyTokens?: number; perDispatchCostUsd?: number; perDispatchTokens?: number };
@@ -172,6 +174,15 @@ export default definePluginEntry({
           maxConcurrentPerNode: { type: "integer", minimum: 1, maximum: 64, description: "Default max concurrent runs per node. Unset means unlimited." },
           minFreeDiskGb: { type: "integer", minimum: 1, maximum: 10000, description: "Isolated (clone) runs copy the object store: a node with less free disk than this refuses another, with a retryable no-disk result. Unset means no check." },
           staleAfterMs: { type: "integer", minimum: 60000, default: 21600000, description: "A run still `running` in the ledger after this long without an update stops holding a slot and is reported as suspected stale." },
+        },
+      },
+      projection: {
+        type: "object",
+        additionalProperties: false,
+        description: "One-way GitHub projection of missions (issue #132): the repo, and the NAME of the environment variable holding the token. The token stays in OpenClaw's secrets; it is never stored in config.",
+        properties: {
+          repo: { type: "string", description: "owner/name of the repository whose issues receive mission progress." },
+          tokenEnv: { type: "string", description: "Name of the environment variable that holds the GitHub token on the manager (default GITHUB_TOKEN)." },
         },
       },
       budget: {
@@ -1328,6 +1339,34 @@ export default definePluginEntry({
     });
 
     api.registerTool({
+      name: "fleet_mission_project",
+      label: "Fleet Mission Project",
+      description:
+        "Project a mission's progress onto a GitHub issue: ONE comment (found by a marker, edited in place) and fleet:* labels. One-way and idempotent; never edits the issue's title, body or others' comments. GitHub being down returns pending, never blocks the mission. Needs projection.repo and the token in the env var named by projection.tokenEnv.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: { missionId: { type: "string", description: "Mission id." }, issue: { type: "number", description: "Issue number to project onto." } },
+        required: ["missionId", "issue"],
+      },
+      execute: async (_toolCallId, params) => {
+        const p = params as { missionId: string; issue: number };
+        const cfg = (api.pluginConfig ?? {}) as FleetConfig;
+        const root = api.rootDir ?? process.cwd();
+        const proj = await import("./projection.js");
+        const repo = cfg.projection?.repo;
+        if (!repo) return jsonResult({ ok: false, error: "projection.repo is not configured" });
+        const token = proj.tokenFromEnv(cfg.projection?.tokenEnv);
+        if (!token) return jsonResult({ ok: false, error: `no token: set the environment variable ${cfg.projection?.tokenEnv ?? "GITHUB_TOKEN"} from OpenClaw's secrets on the manager` });
+        const m = await (await import("./mission-store.js")).loadMission(root, p.missionId);
+        if (!m.ok) return jsonResult({ ok: false, error: m.error });
+        let transport;
+        try { transport = proj.restTransport(repo, token, (globalThis as unknown as { fetch: never }).fetch); } catch (e) { return jsonResult({ ok: false, error: (e as Error).message }); }
+        return jsonResult(await proj.flushProjection(root, m.record, p.issue, transport, [token]));
+      },
+    });
+
+    api.registerTool({
       name: "fleet_mission_show",
       label: "Fleet Mission Show",
       description:
@@ -1398,6 +1437,34 @@ export default definePluginEntry({
           staleDecisions: tracked ? staleDecisions(rec.decisions, tracked) : null,
           drift: rec.charter ? charterDrift(rec.charter, prs) : [], drafts,
         });
+      },
+    });
+
+    api.registerTool({
+      name: "fleet_mission_abort",
+      label: "Fleet Mission Abort",
+      description:
+        "Kill switch for a mission: stop new dispatch, abort its live runs (confirmed termination, as fleet_abort) and record why. Idempotent: repeating it re-checks runs and reports alreadyAborted. A run whose termination is not confirmed is reported, never assumed dead.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: { missionId: { type: "string", description: "Mission id." }, reason: { type: "string", description: "Why (journaled)." } },
+        required: ["missionId", "reason"],
+      },
+      execute: async (_toolCallId, params, signal) => {
+        const p = params as { missionId: string; reason: string };
+        const root = api.rootDir ?? process.cwd();
+        const { abortMission } = await import("./mission-autonomy.js");
+        const list = await api.runtime.nodes.list();
+        const r = await abortMission(root, p.missionId, String(p.reason ?? "").slice(0, 300), {
+          abortRun: async ({ node: nodeName, runId }) => {
+            const node = (list.nodes ?? []).find((n) => n.displayName === nodeName || n.nodeId === nodeName);
+            if (!node) return { confirmed: false, note: `node ${nodeName ?? "?"} not found` };
+            const reply = payloadOf(await api.runtime.nodes.invoke({ nodeId: node.nodeId, command: "opencode.run", params: { prompt: "__ABORT__", cwd: "/", transport: "http", runId }, timeoutMs: 15_000, signal }));
+            return { confirmed: reply.ok === true && (reply.confirmed === true || reply.alreadyFinished === true), ...(typeof reply.error === "string" ? { note: reply.error.slice(0, 200) } : {}) };
+          },
+        });
+        return jsonResult(r);
       },
     });
 
@@ -1540,7 +1607,7 @@ export default definePluginEntry({
       name: "fleet_design_check",
       label: "Fleet Design Check",
       description:
-        "Dry-run the deterministic design gate on a task spec WITHOUT dispatching: returns a verdict (accept | accept-with-nudges | decompose | reject-with-reason) and objections, each with severity, message, cited evidence and a suggestion. Checks: missing acceptance/verify/scope, a spec too large for one task, overlap with runs already in flight on the same checkout (pass node and cwd). No model call. Iterate on the spec until it is accepted, then fleet_dispatch it.",
+        "Dry-run the design gate on a spec WITHOUT dispatching: a verdict (accept | accept-with-nudges | decompose | reject-with-reason) and objections with severity, evidence and a suggestion. Checks missing acceptance/verify/scope, size, and overlap with in-flight runs (pass node and cwd). No model call.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -2387,7 +2454,7 @@ export default definePluginEntry({
       name: "fleet_watch",
       label: "Fleet Watch",
       description:
-        "Dispatch a task and watch it live: streams progress updates to the agent as the worker runs (via onUpdate), polls the node's activity, and returns the final result when the task completes. This is the monitoring view — use it when you want to see a task in progress rather than fire-and-forget.",
+        "Dispatch a task and watch it live: streams progress to you via onUpdate, polls node activity, returns the final result. Use when you want to see a task in progress, not fire-and-forget.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -2575,7 +2642,7 @@ export default definePluginEntry({
       name: "fleet_provision",
       label: "Fleet Provision",
       description:
-        "Provision a repository to one or more fleet nodes WITHOUT giving them GitHub credentials. The manager clones the repo (with its own credentials), ships a git bundle to the node, and the node unpacks it into the target directory. Workers stay credential-free and offline-capable.",
+        "Provision a repository to fleet nodes WITHOUT giving them GitHub credentials: the manager clones with its own credentials, ships a git bundle, and the node unpacks it. Workers stay credential-free.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -2744,7 +2811,7 @@ export default definePluginEntry({
       name: "fleet_sync",
       label: "Fleet Sync",
       description:
-        "Pull changes made on a fleet node back to GitHub. The worker creates a bundle of its changes; the manager applies and pushes with its own credentials. Workers never need GitHub credentials.",
+        "Pull a node's changes back to GitHub: the worker bundles them, the manager applies and pushes with its own credentials.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -2848,7 +2915,7 @@ export default definePluginEntry({
       name: "fleet_cleanup",
       label: "Fleet Cleanup",
       description:
-        "Keep fleet nodes tidy: run git GC on checkouts to prevent bloat, report disk usage, and (with cwd) report paths in the checkout not owned by the node's service user (`ownership`; report only, root-side staging poisons ownership: see docs/STAGING.md). Node-side git bundles stage in per-run PRIVATE state dirs and every provision/sync run cleans its own staging, so nothing is swept on other runs' behalf. Run periodically to avoid node bloat.",
+        "Keep nodes tidy: git GC on checkouts, disk usage, prune finished runs' state, and (with cwd) report paths not owned by the service user (`ownership`; report only, see docs/STAGING.md). Run periodically.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -3056,7 +3123,7 @@ export default definePluginEntry({
       name: "fleet_recipe_record",
       label: "Fleet Recipe Record",
       description:
-        "Record the outcome of a fleet dispatch (combo used, tokens, cost, success, churn) so the recipe store learns which LLM/tooling/prompt combos work for which codebases and tasks. Call this after each dispatch to improve future recommendations.",
+        "Record a dispatch's outcome (combo, tokens, cost, success, churn) so fleet_recipe_recommend learns what works for which codebase and task. Call after each dispatch.",
       parameters: {
         type: "object",
         additionalProperties: false,

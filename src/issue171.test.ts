@@ -5,7 +5,10 @@ import { loadEntry, loadPlugin } from "./testkit/plugin.js";
 // fails above a budget, so growth is a visible decision. RATCHET the budget DOWN when you trim; raise it
 // only deliberately, in the PR that adds the tool or parameter, and say why.
 // Raised 37_500 -> 39_900 across #116/#120/#123: fleet_project_start (intake), fleet_project_upkeep (proposal-only), fleet_mission_show (read-only). Merged actual 39_863.
-export const SCHEMA_BUDGET_CHARS = 39_900;
+// Ratcheted down to 39_200 in #239; raised to 39800 in #132: fleet_mission_project and the projection config block.
+// Ratcheted down to 39_200 in #239; raised in #124: fleet_mission_abort (kill switch).
+// Combined in #132 merge: projection additions over #124's autonomy additions. Merged actual 40_286.
+export const SCHEMA_BUDGET_CHARS = 40_300;
 // Per tool: no single tool may balloon unnoticed.
 export const PER_TOOL_BUDGET_CHARS = 10_000;
 

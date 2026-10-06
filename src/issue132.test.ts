@@ -1,176 +1,165 @@
-import { describe, expect, it } from "vitest";
-import { appendFileSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { mkdtempSync, readFileSync, rmSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { TaskError, foldJournal, openTaskTracker } from "./tasks.js";
+import { fleetLabels, flushProjection, marker, renderProgress, restTransport, tokenFromEnv, type Fetch, type GitHubTransport } from "./projection.js";
+import { addAssumption, createMission, loadMission, updateMission } from "./mission-store.js";
+import { loadEntry, loadPlugin } from "./testkit/plugin.js";
 
-const dir = () => mkdtempSync(join(tmpdir(), "tasks-"));
-const code = async (p: Promise<unknown>): Promise<string> => {
-  try { await p; return "ok"; } catch (e) { return e instanceof TaskError ? e.code : `other:${(e as Error).message}`; }
-};
+let root: string;
+beforeEach(() => { root = mkdtempSync(join(tmpdir(), "fleet132-")); });
+afterEach(() => { rmSync(root, { recursive: true, force: true }); });
+const specs = [{ id: "a", goal: "first", deps: [] }, { id: "b", goal: "second", deps: ["a"] }];
+const mission = async (id = "m1") => { await createMission(root, id, specs); const m = await loadMission(root, id); if (!m.ok) throw new Error(m.error); return m.record; };
 
-describe("#132 T-0: items and dependencies", () => {
-  it("creates items with stable ids, deps gate readiness, blocked says what it waits on", async () => {
-    const t = openTaskTracker(dir());
-    const a = await t.create({ type: "spec", title: "schema" });
-    const b = await t.create({ type: "spec", title: "api", deps: [a.id] });
-    const c = await t.create({ type: "checkpoint", title: "review", deps: [a.id, b.id], refs: { issue: 7 } });
-    expect([a.id, b.id, c.id]).toEqual(["T-1", "T-2", "T-3"]);
-    expect((await t.ready()).map((x) => x.id)).toEqual(["T-1"]);
-    expect((await t.blocked()).map((x) => [x.task.id, x.waitingOn])).toEqual([["T-2", ["T-1"]], ["T-3", ["T-1", "T-2"]]]);
-    const got = await t.claim("w1");
-    await t.complete(got!.id, "w1", { ok: true });
-    expect((await t.ready()).map((x) => x.id)).toEqual(["T-2"]);
+class Fake implements GitHubTransport {
+  comments: Array<{ id: number; body: string }> = [];
+  labels: string[] = ["bug", "fleet:old"];
+  calls: string[] = [];
+  fail: Error | undefined;
+  private n = 100;
+  async listComments() { this.calls.push("list"); if (this.fail) throw this.fail; return this.comments; }
+  async createComment(_i: number, body: string) { this.calls.push("create"); if (this.fail) throw this.fail; const c = { id: ++this.n, body }; this.comments.push(c); return { id: c.id }; }
+  async updateComment(id: number, body: string) { this.calls.push("update"); if (this.fail) throw this.fail; this.comments.find((c) => c.id === id)!.body = body; }
+  async setFleetLabels(_i: number, ls: string[]) { this.calls.push("labels"); if (this.fail) throw this.fail; this.labels = [...this.labels.filter((l) => !l.startsWith("fleet:")), ...ls]; }
+}
+
+describe("#132: rendering", () => {
+  it("is deterministic, carries the marker, and clips/strips hostile mission text", async () => {
+    const r = await mission();
+    await addAssumption(root, "m1", "ghp_abcdefghijklmnopqrstuvwxyz0123456789 <script>x</script> | `rm`", "agent");
+    const m = await loadMission(root, "m1");
+    const rec = (m as unknown as { record: typeof r }).record;
+    const a = renderProgress(rec), b = renderProgress(rec);
+    expect(a).toBe(b);
+    expect(a.startsWith(marker("m1"))).toBe(true);
+    expect(a).toContain("0/2 specs verified");
+    expect(a).not.toContain("ghp_abcdefghijklmnopqrstuvwxyz0123456789");
+    expect(a).not.toMatch(/<script>|`rm`/);
   });
-  it("rejects unknown deps, duplicate ids, bad ids and cycles", async () => {
-    const t = openTaskTracker(dir());
-    await t.create({ id: "a", type: "spec", title: "a" });
-    const b = await t.create({ id: "b", type: "spec", title: "b", deps: ["a"] });
-    expect(await code(t.create({ type: "spec", title: "x", deps: ["nope"] }))).toBe("not-found");
-    expect(await code(t.create({ id: "a", type: "spec", title: "dup" }))).toBe("exists");
-    expect(await code(t.create({ id: "../x", type: "spec", title: "bad" }))).toBe("invalid");
-    expect(await code(t.create({ type: "bogus" as never, title: "bad" }))).toBe("invalid");
-    expect(await code(t.link("a", b.id))).toBe("cycle");
-    expect(await code(t.link("a", "a"))).toBe("cycle");
-  });
-  it("update changes title/refs/data only, never state", async () => {
-    const t = openTaskTracker(dir());
-    const a = await t.create({ type: "spec", title: "old" });
-    const u = await t.update(a.id, { title: "new", refs: { pr: 3 }, data: { goal: "g" } });
-    expect(u).toMatchObject({ title: "new", refs: { pr: 3 }, data: { goal: "g" }, state: "pending" });
+  it("labels come from state only", async () => {
+    const r = await mission();
+    expect(fleetLabels(r)).toEqual(["fleet:designing"]);
+    const esc = { ...r, supervisor: { ...r.supervisor, specs: { ...r.supervisor.specs, a: { ...r.supervisor.specs.a!, status: "escalated" as const } } } };
+    expect(fleetLabels(esc)).toEqual(["fleet:designing", "fleet:escalated"]);
   });
 });
 
-describe("#132 T-0: claim", () => {
-  it("concurrent claims of one task: exactly one wins (two tracker instances, one directory)", async () => {
-    const d = dir();
-    const trackers = Array.from({ length: 6 }, () => openTaskTracker(d));
-    await trackers[0].create({ type: "spec", title: "only one" });
-    const got = await Promise.all(trackers.map((t, i) => t.claim(`w${i}`)));
-    expect(got.filter(Boolean)).toHaveLength(1);
+describe("#132: flush is idempotent and one-way", () => {
+  it("creates one comment and the fleet labels (leaving other labels), then does nothing when unchanged", async () => {
+    const t = new Fake();
+    const r = await mission();
+    expect(await flushProjection(root, r, 7, t)).toEqual({ ok: true, sent: ["comment-created", "labels"], skipped: false });
+    expect(t.labels.sort()).toEqual(["bug", "fleet:designing"]);
+    expect(await flushProjection(root, r, 7, t)).toEqual({ ok: true, sent: [], skipped: true });
+    expect(t.calls.filter((c) => c === "create")).toHaveLength(1);
   });
-  it("concurrent claims of many tasks never hand out one twice", async () => {
-    const d = dir();
-    const t = openTaskTracker(d);
-    for (let i = 0; i < 5; i++) await t.create({ type: "spec", title: `s${i}` });
-    const got = await Promise.all(Array.from({ length: 12 }, (_, i) => openTaskTracker(d).claim(`w${i}`)));
-    const ids = got.filter(Boolean).map((x) => x!.id);
-    expect(ids).toHaveLength(5);
-    expect(new Set(ids).size).toBe(5);
+  it("edits the same comment when the mission changes", async () => {
+    const t = new Fake();
+    await flushProjection(root, await mission(), 7, t);
+    await addAssumption(root, "m1", "a new assumption", "agent");
+    const m = await loadMission(root, "m1");
+    const r = await flushProjection(root, (m as unknown as { record: never }).record, 7, t);
+    expect(r.sent).toEqual(["comment-updated"]);
+    expect(t.comments).toHaveLength(1);
+    expect(t.comments[0]!.body).toContain("a new assumption");
   });
-  it("a stale claim is recoverable, a live one is not; only the owner can finish", async () => {
-    let now = 1_000_000;
-    const t = openTaskTracker(dir(), { now: () => now });
-    await t.create({ type: "spec", title: "s" });
-    const first = await t.claim("w1", { leaseMs: 5000 });
-    expect(first).toMatchObject({ state: "claimed", attempts: 1 });
-    now += 4000;
-    expect(await t.claim("w2")).toBeNull();
-    expect(await code(t.complete("T-1", "w2"))).toBe("not-owner");
-    now += 2000;
-    expect((await t.ready()).map((x) => x.id)).toEqual(["T-1"]);
-    const second = await t.claim("w2");
-    expect(second).toMatchObject({ state: "claimed", attempts: 2, claim: { by: "w2" } });
-    expect(await code(t.complete("T-1", "w1"))).toBe("not-owner");
-    expect((await t.journal()).map((e) => e.op)).toEqual(["create", "claim", "claim-expired", "claim"]);
+  it("adopts an existing marker comment instead of posting a duplicate (state lost)", async () => {
+    const t = new Fake();
+    t.comments = [{ id: 5, body: `${marker("m1")}\nold` }, { id: 6, body: "someone else's comment" }];
+    const r = await flushProjection(root, await mission(), 7, t);
+    expect(r.sent[0]).toBe("comment-updated");
+    expect(t.comments.map((c) => c.id)).toEqual([5, 6]);
+    expect(t.comments[1]!.body).toBe("someone else's comment");
   });
-  it("fail, retry and release", async () => {
-    const t = openTaskTracker(dir());
-    await t.create({ type: "spec", title: "s" });
-    await t.claim("w1");
-    expect(await t.fail("T-1", "w1", "boom")).toMatchObject({ state: "failed", error: "boom" });
-    expect(await t.claim("w1")).toBeNull();
-    expect(await t.retry("T-1")).toMatchObject({ state: "pending" });
-    expect(await code(t.retry("T-1"))).toBe("state");
-    await t.claim("w1");
-    expect(await t.release("T-1", "w1")).toMatchObject({ state: "pending" });
-  });
-  it("claim by id respects dependencies", async () => {
-    const t = openTaskTracker(dir());
-    await t.create({ id: "a", type: "spec", title: "a" });
-    await t.create({ id: "b", type: "spec", title: "b", deps: ["a"] });
-    expect(await t.claim("w", { id: "b" })).toBeNull();
-    expect(await code(t.claim("w", { id: "zzz" }))).toBe("not-found");
+  it("a different target issue starts clean", async () => {
+    const t = new Fake();
+    const rec = await mission();
+    await flushProjection(root, rec, 7, t);
+    // issue 8 has no comments of its own (a fresh transport): saved state for issue 7 must not be reused.
+    expect((await flushProjection(root, rec, 8, new Fake())).sent).toContain("comment-created");
   });
 });
 
-describe("#132 T-0: durability", () => {
-  it("state survives reopening; the journal is append-only with a schema header", async () => {
-    const d = dir();
-    const t = openTaskTracker(d);
-    await t.create({ type: "spec", title: "s" });
-    await t.claim("w1");
-    const again = openTaskTracker(d);
-    expect(await again.get("T-1")).toMatchObject({ state: "claimed" });
-    const lines = readFileSync(join(d, "tasks.jsonl"), "utf8").trim().split("\n");
-    expect(JSON.parse(lines[0])).toEqual({ schemaVersion: 1 });
-    expect(lines).toHaveLength(3);
+describe("#132: GitHub down never blocks, and the token never leaks", () => {
+  it("a failure is pending, advances no state, and the next flush retries", async () => {
+    const t = new Fake();
+    const rec = await mission();
+    t.fail = new Error("HTTP 503 with token ghp_abcdefghijklmnopqrstuvwxyz0123456789 and SECRETVALUE");
+    const r = await flushProjection(root, rec, 7, t, ["SECRETVALUE"]);
+    expect(r).toMatchObject({ ok: false, pending: true });
+    expect(r.error).not.toContain("SECRETVALUE");
+    expect(r.error).not.toContain("ghp_abcdefghijklmnopqrstuvwxyz0123456789");
+    t.fail = undefined;
+    expect(await flushProjection(root, rec, 7, t)).toMatchObject({ ok: true, sent: ["comment-created", "labels"] });
   });
-  it("a crash mid-append (torn last line) is ignored and repaired by the next write", async () => {
-    const d = dir();
-    const t = openTaskTracker(d);
-    await t.create({ type: "spec", title: "s" });
-    appendFileSync(join(d, "tasks.jsonl"), '{"seq":2,"ts":"2026-01-01T00:00:00.000Z","op":"claim","id":"T-1","by":"w1","lease');
-    expect(await t.get("T-1")).toMatchObject({ state: "pending" });
-    await t.create({ type: "spec", title: "next" });
-    const text = readFileSync(join(d, "tasks.jsonl"), "utf8");
-    expect(text.endsWith("\n")).toBe(true);
-    expect(foldJournal(text).torn).toBe(false);
-    expect((await t.list()).map((x) => x.id)).toEqual(["T-1", "T-2"]);
+  it("a partial failure (comment ok, labels fail) retries only the labels", async () => {
+    const t = new Fake();
+    const rec = await mission();
+    t.setFleetLabels = async () => { t.calls.push("labels"); throw new Error("boom"); };
+    expect((await flushProjection(root, rec, 7, t)).pending).toBe(true);
+    t.setFleetLabels = Fake.prototype.setFleetLabels.bind(t);
+    expect((await flushProjection(root, rec, 7, t)).sent).toEqual(["labels"]);
   });
-  it("corruption in the middle is an error, not silently skipped", async () => {
-    const d = dir();
-    const t = openTaskTracker(d);
-    await t.create({ type: "spec", title: "s" });
-    await t.create({ type: "spec", title: "s2" });
-    const f = join(d, "tasks.jsonl");
-    const lines = readFileSync(f, "utf8").split("\n");
-    lines[1] = "{broken";
-    writeFileSync(f, lines.join("\n"));
-    expect(await code(t.list())).toBe("corrupt");
-  });
-  it("refuses a journal from a different schema version", async () => {
-    const d = dir();
-    writeFileSync(join(d, "tasks.jsonl"), '{"schemaVersion":99}\n');
-    expect(await code(openTaskTracker(d).list())).toBe("schema");
-  });
-  it("a lock left by a dead process is recovered; a live holder times out", async () => {
-    const d = dir();
-    writeFileSync(join(d, "tasks.lock"), JSON.stringify({ pid: 99999999, ts: Date.now() }));
-    const t = openTaskTracker(d, { pidAlive: () => false });
-    await t.create({ type: "spec", title: "s" });
-    writeFileSync(join(d, "tasks.lock"), JSON.stringify({ pid: process.pid, ts: Date.now() }));
-    const busy = openTaskTracker(d, { pidAlive: () => true, lockTimeoutMs: 100 });
-    expect(await code(busy.create({ type: "spec", title: "x" }))).toBe("lock");
-  });
-  it("journal(since) returns only newer events", async () => {
-    const t = openTaskTracker(dir());
-    await t.create({ type: "spec", title: "a" });
-    await t.create({ type: "spec", title: "b" });
-    expect((await t.journal(1)).map((e) => e.id)).toEqual(["T-2"]);
+  it("the token is never written under the root", async () => {
+    const t = new Fake();
+    await flushProjection(root, await mission(), 7, t, ["TOKEN-VALUE-123"]);
+    const all = (d: string): string[] => readdirSync(d, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? all(join(d, e.name)) : [join(d, e.name)]));
+    for (const f of all(root)) expect(readFileSync(f, "utf8")).not.toContain("TOKEN-VALUE-123");
   });
 });
 
-import { spawn } from "node:child_process";
-import { fileURLToPath } from "node:url";
-describe("#132 T-0: real processes", () => {
-  it("claims from separate OS processes never double-assign", async () => {
-    const d = dir();
-    const t = openTaskTracker(d);
-    for (let i = 0; i < 4; i++) await t.create({ type: "spec", title: `s${i}` });
-    const tasksUrl = new URL("./tasks.ts", import.meta.url).pathname;
-    const script = join(d, "worker.ts");
-    writeFileSync(script, `import { openTaskTracker } from ${JSON.stringify(tasksUrl)};\nconst by = process.argv[2];\nconst t = openTaskTracker(${JSON.stringify(d)});\nconst got = await t.claim(by);\nconsole.log(JSON.stringify(got ? got.id : null));\n`);
-    const bin = fileURLToPath(new URL("../node_modules/.bin/vite-node", import.meta.url));
-    const outs = await Promise.all(Array.from({ length: 8 }, (_, i) => new Promise<string>((resolve, reject) => {
-      const p = spawn(bin, [script, `p${i}`], { cwd: fileURLToPath(new URL("..", import.meta.url)) });
-      let out = "";
-      p.stdout.on("data", (c) => (out += c));
-      p.on("error", reject);
-      p.on("close", () => resolve(out.trim().split("\n").pop() ?? ""));
-    })));
-    const ids = outs.map((o) => JSON.parse(o) as string | null).filter(Boolean);
-    expect(ids).toHaveLength(4);
-    expect(new Set(ids).size).toBe(4);
-  }, 60_000);
+describe("#132: REST transport and token source", () => {
+  it("sends the token only as a bearer header, to api.github.com, and preserves non-fleet labels", async () => {
+    const seen: Array<{ url: string; method: string; auth: string; body?: string }> = [];
+    const fetchFn: Fetch = async (url, init) => {
+      seen.push({ url, method: init.method, auth: init.headers.authorization!, ...(init.body ? { body: init.body } : {}) });
+      const json = init.method === "GET" && url.includes("/labels") ? [{ name: "bug" }, { name: "fleet:old" }] : init.method === "GET" ? [] : { id: 1 };
+      return { ok: true, status: 200, json: async () => json, text: async () => "" };
+    };
+    const t = restTransport("o/r", "TOK", fetchFn);
+    await t.setFleetLabels(3, ["fleet:done"]);
+    await t.createComment(3, "hi");
+    expect(seen.every((s) => s.url.startsWith("https://api.github.com/repos/o/r/") && s.auth === "Bearer TOK")).toBe(true);
+    expect(JSON.parse(seen.find((s) => s.method === "PUT")!.body!)).toEqual({ labels: ["bug", "fleet:done"] });
+    expect(seen.every((s) => !(s.body ?? "").includes("TOK"))).toBe(true);
+  });
+  it("HTTP errors surface the status (rate limits marked retryable) without the token; bad repo names refused", async () => {
+    const t = restTransport("o/r", "TOK", async () => ({ ok: false, status: 403, json: async () => ({}), text: async () => "" }));
+    await expect(t.listComments(1)).rejects.toThrow(/HTTP 403 \(rate limited or forbidden; will retry\)/);
+    expect(() => restTransport("not a repo", "TOK", async () => ({ ok: true, status: 200, json: async () => ({}), text: async () => "" }))).toThrow(/owner\/name/);
+  });
+  it("reads the token from the named env var only (default GITHUB_TOKEN); junk names fall back", () => {
+    expect(tokenFromEnv(undefined, { GITHUB_TOKEN: " abc " })).toBe("abc");
+    expect(tokenFromEnv("FLEET_GH", { FLEET_GH: "x", GITHUB_TOKEN: "y" })).toBe("x");
+    expect(tokenFromEnv("lower; rm", { GITHUB_TOKEN: "y" })).toBe("y");
+    expect(tokenFromEnv("FLEET_GH", {})).toBeUndefined();
+  });
+});
+
+describe("#132: fleet_mission_project", () => {
+  const prevFetch = globalThis.fetch;
+  const prevTok = process.env.FLEET_TEST_GH;
+  afterEach(() => { globalThis.fetch = prevFetch; if (prevTok === undefined) delete process.env.FLEET_TEST_GH; else process.env.FLEET_TEST_GH = prevTok; });
+  it("refuses without repo or token, then projects through a stubbed fetch without ever echoing the token", async () => {
+    const calls: string[] = [];
+    globalThis.fetch = (async (url: string, init: { method: string }) => { calls.push(`${init.method} ${url}`); const j = init.method === "GET" ? [] : { id: 9 }; return { ok: true, status: 200, json: async () => j, text: async () => "" }; }) as never;
+    const none = loadPlugin((await loadEntry())!, {});
+    try {
+      await createMission(none.rootDir, "m1", specs);
+      expect((await none.call("fleet_mission_project", { missionId: "m1", issue: 1 })).error).toMatch(/projection.repo is not configured/);
+    } finally { none.dispose(); }
+    const t = loadPlugin((await loadEntry())!, { config: { projection: { repo: "o/r", tokenEnv: "FLEET_TEST_GH" } } });
+    try {
+      await createMission(t.rootDir, "m1", specs);
+      delete process.env.FLEET_TEST_GH;
+      expect((await t.call("fleet_mission_project", { missionId: "m1", issue: 1 })).error).toMatch(/environment variable FLEET_TEST_GH/);
+      process.env.FLEET_TEST_GH = "SECRET-TOK";
+      const r = await t.call("fleet_mission_project", { missionId: "m1", issue: 4 });
+      expect(r).toMatchObject({ ok: true, sent: ["comment-created", "labels"] });
+      expect(JSON.stringify(r)).not.toContain("SECRET-TOK");
+      expect(calls.some((c) => c.includes("/issues/4/comments"))).toBe(true);
+      expect((await t.call("fleet_mission_project", { missionId: "nope", issue: 4 })).ok).toBe(false);
+    } finally { t.dispose(); }
+  });
 });
