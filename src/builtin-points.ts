@@ -26,6 +26,10 @@ const parsed = parsePoints([
   cfg("handraise.triage", "Can the worker's question be answered from the project charter, decisions and task spec alone, without asking a human?", "escalate-to-caller", "escalate-to-caller"),
   cfg("failure.real-bug", "Is the failing check caused by a defect in the work done this round, as opposed to the environment, a flaky test or a flawed spec?", "treat-as-real-bug", "treat-as-real-bug"),
   cfg("review.depth", "Does this change need two independent blind reviews rather than one?", "more-review", "more-review"),
+  // Issue #250: per-tick convergence verdict against the charter's success criteria.
+  // The question asks about CONVERGENCE (a good thing), so high probabilityTrue = converged.
+  // The static fallback is the mechanical verdict, so the loop is never blind when S1 is down.
+  cfg("progress.rubric", "Is this mission on track to satisfy its charter's success criteria, judging from the specs completed, their verification results, and the remaining work?", "on-track", "drifting"),
 ]);
 if (!parsed.ok) throw new Error(`built-in decision points are invalid: ${parsed.error}`);
 export const BUILTIN_POINTS: readonly DecisionPoint[] = parsed.points;
@@ -53,6 +57,22 @@ export function failureBaseline(f: { error?: string; summary?: string; exitCode?
 /** True (needs two) when the change is large or touches a sensitive surface. */
 export function reviewDepthBaseline(c: { filesChanged: number; touchesSensitive: boolean }): boolean {
   return c.touchesSensitive || c.filesChanged > 10;
+}
+
+/**
+ * Issue #250: the deterministic convergence verdict, the baseline S1 must beat.
+ * `converged` requires every spec done AND every provided charter success criterion marked passed;
+ * `blocked` when a spec is escalated; `on-track` when specs remain and none is blocked;
+ * `drifting` when specs are done but a success criterion is unchecked (the charter is not yet met).
+ */
+export type RubricVerdict = "on-track" | "drifting" | "blocked" | "converged";
+export function rubricBaseline(s: { specsTotal: number; specsDone: number; escalated: number; criteriaTotal: number; criteriaPassed: number }): RubricVerdict {
+  if (s.escalated > 0) return "blocked";
+  const allSpecsDone = s.specsTotal > 0 && s.specsDone === s.specsTotal;
+  if (!allSpecsDone) return "on-track";
+  // every spec verified; the mission converges only if every charter criterion is checkably passed
+  if (s.criteriaTotal > 0 && s.criteriaPassed === s.criteriaTotal) return "converged";
+  return "drifting";
 }
 
 // ---- minimal, quoted state ----------------------------------------------------------------------
