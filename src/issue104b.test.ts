@@ -87,6 +87,19 @@ describe("issue #104b: spec-level verify gate (parseTaskSpec / renderSpec)", () 
     expect(renderSpec({ goal: p0() })).toBe(p0()); // prompt-only path byte-identical
   });
 
+  it("issue #262: references render as a dated References block; absent references are byte-identical to today", () => {
+    const plain = renderSpec({ goal: "Ship it", acceptance: ["works"] });
+    // no references => identical to the pre-#262 output
+    expect(renderSpec({ goal: "Ship it", acceptance: ["works"], references: [] })).toBe(plain);
+    const withRefs = renderSpec({ goal: "Ship it", acceptance: ["works"], references: [{ path: "docs/CONVENTIONS.md", note: "project conventions" }, { note: "ADR 0002 governs this file" }] });
+    expect(withRefs).toContain("References");
+    expect(withRefs).toContain("docs/CONVENTIONS.md — project conventions");
+    expect(withRefs).toContain("ADR 0002 governs this file");
+    // blank entries are dropped, never rendered as empty bullets
+    const blank = renderSpec({ goal: "Ship it", references: [{ path: "  " }, { note: "" }] });
+    expect(blank).not.toContain("References");
+  });
+
   const p0 = (): string => "just a prompt";
 });
 

@@ -49,6 +49,14 @@ export interface TaskSpec {
   };
   /** Advisory file scope (issue #65 slice 2): repo-relative paths/globs the task should stay within. */
   scope?: { files: string[] };
+  /**
+   * Issue #262: references to push into the run's checkout and point the worker
+   * at — convention docs, ADR summaries, interface stubs, skill names. Each entry
+   * is a repo-relative path (installed into the clone) or a short identifier the
+   * worker is told to consult. Rendered as a "References" block in the prompt so
+   * the worker knows what was equipped for this task, not the whole repo.
+   */
+  references?: Array<{ path?: string; note?: string }>;
 }
 
 /**
@@ -115,13 +123,14 @@ export function parseTaskSpec(value: unknown): TaskSpecResult {
  * meaningless bullets); remaining items are kept verbatim. `verify` shapes
  * the run's gate, not the prompt — it never appears in the rendering.
  */
-export function renderSpec(spec: { goal: string; acceptance?: string[]; verify?: unknown; scope?: { files: string[] } }): string {
+export function renderSpec(spec: { goal: string; acceptance?: string[]; verify?: unknown; scope?: { files: string[] }; references?: Array<{ path?: string; note?: string }> }): string {
   const goal = spec.goal;
   const items = (spec.acceptance ?? []).filter((a) => typeof a === "string" && a.trim().length > 0);
   const scope = spec.scope?.files ?? [];
-  if (items.length === 0 && scope.length === 0) return goal;
+  const refs = (spec.references ?? []).filter((r) => (r.path ?? r.note ?? "").trim().length > 0);
   const out = [goal];
   if (items.length) out.push("", "Acceptance criteria:", ...items.map((a) => `- ${a}`));
   if (scope.length) out.push("", "Scope (keep your changes within these paths):", ...scope.map((f) => `- ${f}`));
+  if (refs.length) out.push("", "References (equipped for this task; consult before grepping):", ...refs.map((r) => `- ${[r.path, r.note].filter(Boolean).join(" — ")}`));
   return out.join("\n");
 }
