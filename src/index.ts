@@ -1301,6 +1301,76 @@ export default definePluginEntry({
     });
 
     api.registerTool({
+      name: "fleet_project_start",
+      label: "Fleet Project Start",
+      description:
+        "Start a project through a typed intake that cannot be skipped. Send answers (goal, users, constraints, nonGoals, successCriteria [{criterion, check}], riskiestAssumptions, deferred); state is kept by projectId. Returns ready | needs-more | risky-but-proceed with exactly what is missing. Goal and checkable success criteria cannot be deferred. `write` puts .fleet/charter.md and your `decisions` under project.roots, never overwriting; `backlog` validates proposed specs. Proposals only: nothing is dispatched.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          projectId: { type: "string", description: "Resume an intake (lowercase letters, digits, dashes). Omit to start." },
+          answers: { type: "object", description: "Typed answers for this round; fields you send replace earlier ones." },
+          decisions: { type: "array", items: { type: "object" }, description: "First decisions to record: {title, decision, context?, alternativesRejected?, consequences?, scope?}." },
+          backlog: { type: "array", items: { type: "object" }, description: "Proposed task specs to validate." },
+          write: { type: "string", description: "Absolute checkout path (under project.roots) to write .fleet/ into." },
+          confirmRisks: { type: "boolean", description: "Accept a risky-but-proceed verdict when writing." },
+        },
+      },
+      execute: async (_toolCallId, params) => {
+        const p = params as { projectId?: string; answers?: unknown; decisions?: unknown; backlog?: unknown; write?: string; confirmRisks?: boolean };
+        const { normalizeAnswers, mergeAnswers, assess, renderCharter, renderDecision, writeProject, validateBacklog } = await import("./project-start.js");
+        const fsp = await import("node:fs/promises");
+        const { join } = await import("node:path");
+        const projectId = typeof p.projectId === "string" ? p.projectId : `p-${Date.now().toString(36)}`;
+        if (!/^[a-z0-9][a-z0-9-]{0,39}$/.test(projectId)) return jsonResult({ ok: false, error: "projectId must be 1-40 lowercase letters, digits or dashes" });
+        const dir = join(api.rootDir ?? process.cwd(), ".opencode-fleet", "intake");
+        const file = join(dir, `${projectId}.json`);
+        let saved: import("./project-start.js").IntakeAnswers = {};
+        try { saved = JSON.parse(await fsp.readFile(file, "utf8")); } catch { /* new intake */ }
+        let answers = saved;
+        if (p.answers !== undefined) {
+          const given = new Set(Object.keys((typeof p.answers === "object" && p.answers !== null ? p.answers : {}) as object));
+          answers = mergeAnswers(saved, normalizeAnswers(p.answers), given);
+          await fsp.mkdir(dir, { recursive: true, mode: 0o700 });
+          await fsp.writeFile(file, JSON.stringify(answers), { mode: 0o600 });
+        }
+        const a = assess(answers);
+        const out: Record<string, unknown> = { ok: true, projectId, verdict: a.verdict, missing: a.missing.slice(0, 3), ...(a.missing.length > 3 ? { moreMissing: a.missing.length - 3 } : {}), risks: a.risks, note: "Everything here is a proposal for you to confirm; nothing is dispatched." };
+        if (a.verdict !== "needs-more") out.charterPreview = renderCharter(answers);
+        if (p.backlog !== undefined) out.backlog = validateBacklog(p.backlog);
+        if (typeof p.write === "string") {
+          if (a.verdict === "needs-more") return jsonResult({ ...out, ok: false, error: "intake is not complete: answer what is missing first" });
+          if (a.verdict === "risky-but-proceed" && p.confirmRisks !== true) return jsonResult({ ...out, ok: false, error: "risky-but-proceed: pass confirmRisks:true to write with the deferred items recorded as risks" });
+          if (!p.write.startsWith("/")) return jsonResult({ ...out, ok: false, error: "write must be an absolute path" });
+          const { realpath } = fsp;
+          const { relative, isAbsolute } = await import("node:path");
+          let real: string;
+          try { real = await realpath(p.write); } catch { return jsonResult({ ...out, ok: false, error: `no such directory: ${p.write}` }); }
+          const cfg = (api.pluginConfig ?? {}) as FleetConfig;
+          const roots = cfg.project?.roots?.length ? cfg.project.roots : [process.cwd(), ...(api.rootDir ? [api.rootDir] : [])];
+          let allowed = false;
+          for (const r of roots) { try { const rel = relative(await realpath(r), real); if (rel === "" || (!rel.startsWith("..") && !isAbsolute(rel))) { allowed = true; break; } } catch { /* missing root allows nothing */ } }
+          if (!allowed) return jsonResult({ ...out, ok: false, error: "path is outside the operator's project.roots" });
+          const today = new Date().toISOString().slice(0, 10);
+          const ds: Array<{ name: string; text: string }> = [];
+          for (const [i, d] of (Array.isArray(p.decisions) ? p.decisions : []).entries()) {
+            const o = d as Record<string, unknown>;
+            if (typeof o?.title !== "string" || typeof o?.decision !== "string") return jsonResult({ ...out, ok: false, error: `decisions[${i}] needs title and decision` });
+            const r = renderDecision(i + 1, { title: o.title, decision: o.decision, ...(typeof o.context === "string" ? { context: o.context } : {}), ...(typeof o.alternativesRejected === "string" ? { alternativesRejected: o.alternativesRejected } : {}), ...(typeof o.consequences === "string" ? { consequences: o.consequences } : {}), ...(Array.isArray(o.scope) ? { scope: o.scope.filter((x): x is string => typeof x === "string") } : {}) }, today);
+            if ("error" in r) return jsonResult({ ...out, ok: false, error: `decisions[${i}]: ${r.error}` });
+            ds.push(r);
+          }
+          const w = await writeProject(real, renderCharter(answers), ds);
+          out.write = w;
+          if (!w.ok) out.ok = false;
+          else if (ds.length === 0) out.note = "Wrote the charter with no decision recorded: record at least one with the `decisions` param.";
+        }
+        return jsonResult(out);
+      },
+    });
+
+    api.registerTool({
       name: "fleet_project_show",
       label: "Fleet Project Show",
       description:
