@@ -86,6 +86,50 @@ export function parseAcknowledge(v: unknown): AckResult {
 
 const bounds = (c: GateContext): GateBounds => ({ ...DEFAULT_GATE_BOUNDS, ...c.bounds });
 
+/**
+ * Issue #288: does this spec ask the worker to DISCOVER something rather than DO
+ * something? Pure and conservative — it looks only at the GOAL's wording, never at
+ * acceptance/verify/scope (a discovery brief can carry all three and still be
+ * unanswerable).
+ *
+ *  - `phrases`: strong open-ended-investigation signals -> `needs-design`.
+ *  - `soft`:       weaker investigation/design flavour -> a nudge on its own, but
+ *                  two or more together are reported as design-adjacent.
+ */
+export function discoverySignal(spec: { goal: string }): { phrases: string[]; soft: string[] } {
+  const goal = String(spec.goal ?? "").toLowerCase();
+  // Strong: an explicit ask to find/determine/investigate a cause or to design.
+  const STRONG = [
+    /\b(determine|figure out|find out|work out|diagnose|investigate|root[- ]cause|troubleshoot)\b/,
+    /\bwhy\b[^.?]{0,80}\b(happen|occur|fail|break|orphan|not)\b/,
+    /\b(design|architect|plan)\b[^.?]{0,40}\b(an?|the)\b/,
+    /\b(research|survey|evaluate|assess|explore|compare)\b[^.?]{0,60}\b(options|approach|approaches|alternatives|feasibility)\b/,
+    /\b(propose|recommend|suggest)\b[^.?]{0,60}\b(a|an|the)\b[^.?]{0,40}\b(design|approach|plan|architecture|strategy)\b/,
+  ];
+  // Soft: investigation/design flavour that alone is not conclusive.
+  const SOFT = [
+    /\bunderstand\b/,
+    /\bexplore\b/,
+    /\bclarify\b/,
+    /\bconsider\b/,
+    /\bdecide\b/,
+    /\bstrategy\b/,
+    /\bapproach\b/,
+    /\bbest way\b/,
+    /\btrade[- ]?offs?\b/,
+    /\bdesign\b/,
+  ];
+  const hit = (res: RegExp[]): string[] => {
+    const found: string[] = [];
+    for (const re of res) {
+      const m = goal.match(re);
+      if (m && typeof m[0] === "string") found.push(m[0].trim());
+    }
+    return [...new Set(found)];
+  };
+  return { phrases: hit(STRONG), soft: hit(SOFT) };
+}
+
 function checks(spec: TaskSpec, ctx: GateContext): Objection[] {
   const out: Objection[] = [];
   const b = bounds(ctx);
@@ -98,6 +142,31 @@ function checks(spec: TaskSpec, ctx: GateContext): Objection[] {
   }
   if (!spec.scope || spec.scope.files.length === 0) {
     out.push(objection({ id: "spec.no-scope", severity: "nudge", message: "The spec declares no file scope, so out-of-scope edits cannot be detected and overlap with other runs cannot be checked.", evidence: "spec.scope is absent or empty", suggestion: "Add scope.files listing the paths or globs the task should touch." }));
+  }
+
+  // Issue #288: a spec that asks the worker to DISCOVER something (rather than DO
+  // something) is a design question, not a task. This is the check that makes the
+  // `needs-design` verdict reachable at all — observed live 2026-10-06, when a
+  // "determine why X happens" brief burned 28 minutes and 287k tokens before hitting
+  // the wall-clock limit with an empty clone. Shape checks pass such a spec (it has
+  // acceptance, a verify gate, a scope); only its INTENT gives it away.
+  const discovery = discoverySignal(spec);
+  if (discovery.phrases.length > 0) {
+    out.push(objection({
+      id: "spec.needs-design",
+      severity: "block-candidate",
+      message: "The goal asks the worker to DISCOVER a cause or design, not to make a defined change. That is a design conversation, not a dispatchable task: a worker will spend its whole budget exploring and return nothing usable.",
+      evidence: `open-ended phrasing in the goal: ${discovery.phrases.map((p) => `"${p}"`).join(", ")}`,
+      suggestion: "(a) do the diagnosis/design in a session first, then dispatch the resulting DEFINED fix; or (b) restate the goal as a concrete change with a checkable deliverable.",
+    }));
+  } else if (discovery.soft.length >= 2) {
+    out.push(objection({
+      id: "spec.design-adjacent",
+      severity: "nudge",
+      message: "The goal leans toward investigation or design; make the deliverable concrete or the worker may explore without producing a checkable change.",
+      evidence: `investigation-flavoured wording in the goal: ${discovery.soft.map((p) => `"${p}"`).join(", ")}`,
+      suggestion: "State the change to make, or split the investigation out into a design step.",
+    }));
   }
 
   const nScope = spec.scope?.files.length ?? 0;
@@ -151,6 +220,9 @@ export function applyAcknowledgements(objections: Objection[], acks: Acknowledge
 export function verdictOf(objections: Objection[]): Verdict {
   const open = objections.filter((o) => !o.acknowledged);
   if (open.some((o) => o.id === "overlap.in-flight")) return "reject-with-reason";
+  // Issue #288: a design question outranks "too large" — splitting an unanswerable
+  // spec does not make it answerable. The verdict the vocabulary always had, now emitted.
+  if (open.some((o) => o.id === "spec.needs-design")) return "needs-design";
   if (open.some((o) => o.id === "spec.too-large")) return "decompose";
   if (objections.length > 0) return "accept-with-nudges";
   return "accept";
