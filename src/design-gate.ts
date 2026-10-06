@@ -86,6 +86,97 @@ export function parseAcknowledge(v: unknown): AckResult {
 
 const bounds = (c: GateContext): GateBounds => ({ ...DEFAULT_GATE_BOUNDS, ...c.bounds });
 
+/**
+ * Issue #288: does this spec ask the worker to DISCOVER something rather than DO
+ * something? Pure and conservative — it looks only at the GOAL's wording, never at
+ * acceptance/verify/scope (a discovery brief can carry all three and still be
+ * unanswerable).
+ *
+ * Review-fixed (independent review, 2026-10-06): the first cut produced FALSE POSITIVES
+ * on ordinary tasks — `Add a plan field to the mission record` matched the noun use of
+ * "plan … the", and `Rename why-not-retry to explain-retry` matched "why-not". A false
+ * positive under `project.gate: "enforce"` BLOCKS a normal dispatch, so precision
+ * matters more than recall here. Rules now:
+ *   - a goal that names a CONCRETE CHANGE VERB (add/fix/rename/implement/remove/update/
+ *     refactor/move/delete/… ) is a fix, never a discovery — bail out entirely.
+ *   - strong verbs must be IMPERATIVE at the start of the goal or a sentence
+ *     (`^` or after `[.!?] `), not buried as nouns.
+ *   - `why` must be a STANDALONE word with a following clause, never part of a
+ *     hyphenated token like `why-not`.
+ *   - the noun use of "design/plan/architect" is dropped; only the interrogative/
+ *     imperative construction `design (an|the) … for` counts, and only with no change verb.
+ */
+export function discoverySignal(spec: { goal: string }): { phrases: string[]; soft: string[] } {
+  const goal = String(spec.goal ?? "").toLowerCase().trim();
+  const hit = (res: RegExp[]): string[] => {
+    const found: string[] = [];
+    for (const re of res) {
+      const m = goal.match(re);
+      if (m && typeof m[0] === "string") found.push(m[0].trim());
+    }
+    return [...new Set(found)];
+  };
+  // A goal whose PRIMARY verb is a concrete change ("Add…", "Fix…", "Rename…") is a fix,
+  // not a discovery — the single biggest precision guard (review finding 1). It must be
+  // the LEADING verb: "Determine why … and fix it" is a discovery whose subordinate clause
+  // happens to say `fix`, and exempting it would drop the very case this check exists for
+  // (the reviewer's own counterexample). So we require the change verb at the START
+  // (optionally after an article/pronoun), not anywhere in the string.
+  const CHANGE_VERB_LEADING = /^\s*(?:please\s+)?(?:add|fix|rename|implement|remove|update|refactor|move|delete|bump|migrate|wire|hook up|introduce|extract|inline|split|merge|replace|use|make|create|write|port|upgrade|pin|trim|document)\b/;
+  if (CHANGE_VERB_LEADING.test(goal)) return { phrases: [], soft: hit(SOFT_ONLY) };
+  // Strong: an IMPERATIVE ask (start of goal / start of a sentence) to find a cause.
+  // A bare word is not enough: `Diagnose output should be redacted` and `Investigate and fix
+  // the timeout` LEAD with diagnose/investigate but use them as NOUNS (a titled phrase), not
+  // imperatives — the reviewer's counterexamples. An imperative takes an object directly
+  // ("determine why…", "diagnose the failure"), so the verb must be followed by an object
+  // clause/subject, not by `and`/a noun-compound. We require the verb followed by a
+  // determiner/wh-word/pronoun (the, a, an, why, how, whether, what, this, it) or by the
+  // end of the phrase — the shape of a real instruction.
+  const IMPERATIVE_TAIL = /^\s+(?:the|a|an|why|how|whether|what|which|if|this|that|it|these|those)\b/;
+  const strong = (m: RegExpMatchArray | null): string | undefined => {
+    if (!m) return undefined;
+    const whole = m[0];
+    const verb = m[1] ?? "";
+    // the text right after the matched verb, up to the end of the goal
+    const after = goal.slice(goal.indexOf(verb) + verb.length);
+    // `investigate/… and <change verb>` is a fix phrased with investigation padding
+    if (/^\s+and\s+(?:(?:then|also|finally|subsequently)\s+)?(?:fix|add|update|rename|remove|implement|refactor|move|delete|change|patch)\b/.test(after)) return undefined;
+    // a following noun-compound (`diagnose output`, `investigate helper`) is a noun use, not an imperative
+    if (/^\s+[a-z][a-z-]*\s+(?:should|must|is|are|will|was|were)\b/.test(after)) return undefined;
+    return IMPERATIVE_TAIL.test(after) || after.trim() === "" ? whole.trim() : undefined;
+  };
+  const hits: string[] = [];
+  const imper = goal.match(/(?:^|[.!?]\s+)(determine|figure out|find out|work out|diagnose|investigate|troubleshoot|debug)\b/);
+  const imperHit = strong(imper);
+  if (imperHit) hits.push(imperHit);
+  const extra: RegExp[] = [
+    /\bfind the root cause\b/,
+    /\broot[- ]cause\b/,
+    // a standalone `why` followed by a clause, not part of `why-not` / `why-x`
+    /(?<![\w-])why(?![\w-])\s+\w[^.?]{0,80}\b(happen|happens|happened|occur|occurs|fail|fails|failed|break|breaks|broke|orphan|orphans|not)\b/,
+    // interrogative/imperative design ask: `design (an|the) … for …` (not the noun use)
+    /(?:^|[.!?]\s+)(design|architect|plan)\s+(a|an|the)\s+\w[^.?]{0,60}\bfor\b/,
+    /\b(research|survey|evaluate|assess|compare)\b[^.?]{0,60}\b(options|approaches?|alternatives|feasibility)\b/,
+    // `propose/recommend/suggest … <design|approach|plan|…>`
+    /(?:^|[.!?]\s+)(propose|recommend|suggest)\b[^.?]{0,60}\b(design|approach|plan|architecture|strategy)\b/,
+  ];
+  return { phrases: [...new Set([...hits, ...hit(extra)])], soft: hit(SOFT_ONLY) };
+}
+
+// Soft phrases are their own constant so the concrete-change bail-out can still report them.
+const SOFT_ONLY: RegExp[] = [
+  /\bunderstand\b/,
+  /\bexplore\b/,
+  /\bclarify\b/,
+  /\bconsider\b/,
+  /\bdecide\b/,
+  /\bstrategy\b/,
+  /\bapproach\b/,
+  /\bbest way\b/,
+  /\btrade[- ]?offs?\b/,
+  /\bdesign\b/,
+];
+
 function checks(spec: TaskSpec, ctx: GateContext): Objection[] {
   const out: Objection[] = [];
   const b = bounds(ctx);
@@ -98,6 +189,31 @@ function checks(spec: TaskSpec, ctx: GateContext): Objection[] {
   }
   if (!spec.scope || spec.scope.files.length === 0) {
     out.push(objection({ id: "spec.no-scope", severity: "nudge", message: "The spec declares no file scope, so out-of-scope edits cannot be detected and overlap with other runs cannot be checked.", evidence: "spec.scope is absent or empty", suggestion: "Add scope.files listing the paths or globs the task should touch." }));
+  }
+
+  // Issue #288: a spec that asks the worker to DISCOVER something (rather than DO
+  // something) is a design question, not a task. This is the check that makes the
+  // `needs-design` verdict reachable at all — observed live 2026-10-06, when a
+  // "determine why X happens" brief burned 28 minutes and 287k tokens before hitting
+  // the wall-clock limit with an empty clone. Shape checks pass such a spec (it has
+  // acceptance, a verify gate, a scope); only its INTENT gives it away.
+  const discovery = discoverySignal(spec);
+  if (discovery.phrases.length > 0) {
+    out.push(objection({
+      id: "spec.needs-design",
+      severity: "block-candidate",
+      message: "The goal asks the worker to DISCOVER a cause or design, not to make a defined change. That is a design conversation, not a dispatchable task: a worker will spend its whole budget exploring and return nothing usable.",
+      evidence: `open-ended phrasing in the goal: ${discovery.phrases.map((p) => `"${p}"`).join(", ")}`,
+      suggestion: "(a) do the diagnosis/design in a session first, then dispatch the resulting DEFINED fix; or (b) restate the goal as a concrete change with a checkable deliverable.",
+    }));
+  } else if (discovery.soft.length >= 2) {
+    out.push(objection({
+      id: "spec.design-adjacent",
+      severity: "nudge",
+      message: "The goal leans toward investigation or design; make the deliverable concrete or the worker may explore without producing a checkable change.",
+      evidence: `investigation-flavoured wording in the goal: ${discovery.soft.map((p) => `"${p}"`).join(", ")}`,
+      suggestion: "State the change to make, or split the investigation out into a design step.",
+    }));
   }
 
   const nScope = spec.scope?.files.length ?? 0;
@@ -151,6 +267,9 @@ export function applyAcknowledgements(objections: Objection[], acks: Acknowledge
 export function verdictOf(objections: Objection[]): Verdict {
   const open = objections.filter((o) => !o.acknowledged);
   if (open.some((o) => o.id === "overlap.in-flight")) return "reject-with-reason";
+  // Issue #288: a design question outranks "too large" — splitting an unanswerable
+  // spec does not make it answerable. The verdict the vocabulary always had, now emitted.
+  if (open.some((o) => o.id === "spec.needs-design")) return "needs-design";
   if (open.some((o) => o.id === "spec.too-large")) return "decompose";
   if (objections.length > 0) return "accept-with-nudges";
   return "accept";
