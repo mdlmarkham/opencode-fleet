@@ -13,6 +13,31 @@ import type { TriageResult } from "../s1-hooks.js";
 import type { S1RouteDecision, S1RouteHarnessResult } from "../s1-wire.js";
 import { type FleetConfig, expectParam, payloadOf, internalMissionCalls } from "./shared.js";
 
+// Issue #256: right after a node service restart, the very first detached
+// launch can be refused with "Device pairing authority requires a current
+// worker publication" — a transient (the publication is not ready yet); a
+// retry seconds later succeeds. This is matched EXACTLY on that phrase
+// (case-insensitive) so no other launch error is ever retried: anything else
+// keeps today's behavior byte-for-byte.
+const PUBLICATION_TRANSIENT_PHRASE = "current worker publication";
+/** Bounded pause before the single retry — long enough for the publication, short enough not to stall the caller. */
+const PUBLICATION_RETRY_DELAY_MS = 2_000;
+
+/** Narrow match: the node's launch error mentions the exact transient phrase (case-insensitive). */
+export function isWorkerPublicationTransient(errText: unknown): boolean {
+  return typeof errText === "string" && errText.toLowerCase().includes(PUBLICATION_TRANSIENT_PHRASE);
+}
+
+const publicationRetryDelay = (ms: number, signal?: AbortSignal): Promise<void> =>
+  new Promise((resolve, reject) => {
+    const t = setTimeout(resolve, ms);
+    (t as { unref?: () => void }).unref?.();
+    signal?.addEventListener("abort", () => {
+      clearTimeout(t);
+      reject(signal.reason ?? new Error("aborted"));
+    }, { once: true });
+  });
+
 export function registerDispatchTools(api: OpenClawPluginApi, cfg: FleetConfig): { dispatchTool: { execute: (toolCallId: string, params: never, signal?: AbortSignal) => Promise<unknown> } } {
   const dispatchTool: Parameters<typeof api.registerTool>[0] = {
     name: "fleet_dispatch",
@@ -651,18 +676,31 @@ export function registerDispatchTools(api: OpenClawPluginApi, cfg: FleetConfig):
           // is lost before the command is built — which is exactly how
           // fleet_dispatch ran empty sessions and still reported success.
           const launchParams = { ...task, prompt: "__RUN_START__", realPrompt: p.prompt, runId };
-          inv = await api.runtime.nodes
-            .invoke({
-              nodeId: node.nodeId,
-              command: "opencode.run",
-              params: launchParams,
-              timeoutMs: 30_000,
-              signal,
-            })
-            .catch((err: Error) => ({
-              invokeTimedOut: true as const,
-              message: err.message,
-            }));
+          const invokeDetach = (params: typeof launchParams) =>
+            api.runtime.nodes
+              .invoke({
+                nodeId: node.nodeId,
+                command: "opencode.run",
+                params,
+                timeoutMs: 30_000,
+                signal,
+              })
+              .catch((err: Error) => ({
+                invokeTimedOut: true as const,
+                message: err.message,
+              }));
+          inv = await invokeDetach(launchParams);
+          // Issue #256: the FIRST launch right after a node service restart
+          // can be refused with "Device pairing authority requires a current
+          // worker publication" — transient, gone seconds later. Narrow EXACT
+          // phrase match, ONE bounded retry of the SAME launch, then fall
+          // through to the unchanged failure handling (a second failure is
+          // recorded against the ORIGINAL error below). Any other error text
+          // is never retried.
+          if (isWorkerPublicationTransient(payloadOf(inv).error) && !signal?.aborted) {
+            await publicationRetryDelay(PUBLICATION_RETRY_DELAY_MS, signal);
+            inv = await invokeDetach(launchParams);
+          }
         } else {
           inv = await api.runtime.nodes
             .invoke({
