@@ -213,7 +213,7 @@ export function interpretLiveness(
   const procs = procPart
     .split("\n")
     .map((l) => l.trim())
-    .filter((l) => l && !l.startsWith(PID_ALIVE) && !l.startsWith(`${CMDLINE} `));
+    .filter((l) => l && !l.startsWith(PID_ALIVE) && !l.startsWith(CMDLINE));
   if (pid !== undefined) {
     if (hint === undefined) return { alive: pidAlive || procs.length > 0, procs };
     if (!pidAlive) return { alive: false, procs };
