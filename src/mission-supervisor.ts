@@ -33,6 +33,8 @@ export interface MissionSpec {
   goal: string;
   deps: string[];
   scope?: TaskScope;
+  /** The full task spec (goal, acceptance, verify, scope) dispatched for this mission spec. */
+  task?: unknown;
 }
 
 export interface Limits {

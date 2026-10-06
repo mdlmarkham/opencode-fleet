@@ -53,6 +53,8 @@ export interface MissionRecord {
   openQuestions: string[];
   risks: Risk[];
   budget?: { maxCostUsd?: number; maxTokens?: number };
+  /** Where the mission's specs run: the checkout on the nodes, and which nodes may take them. */
+  target?: { cwd: string; nodes?: string[] };
   autonomy?: { level: "supervised" | "gated" | "unattended"; contract?: string };
   supervisor: MissionState;
 }
@@ -78,6 +80,10 @@ export function validateRecord(raw: unknown): Loaded {
   for (const a of raw.assumptions as unknown[]) if (!isRec(a) || typeof a.id !== "string" || typeof a.text !== "string" || !["open", "confirmed", "overturned"].includes(String(a.status))) return { ok: false, error: "bad assumption entry" };
   for (const q of raw.openQuestions as unknown[]) if (typeof q !== "string") return { ok: false, error: "bad open question" };
   for (const r of raw.risks as unknown[]) if (!isRec(r) || typeof r.id !== "string" || typeof r.text !== "string" || !["low", "medium", "high"].includes(String(r.severity))) return { ok: false, error: "bad risk entry" };
+  if (raw.target !== undefined) {
+    const t = raw.target;
+    if (!isRec(t) || typeof t.cwd !== "string" || !t.cwd.startsWith("/") || t.cwd.length > 300 || (t.nodes !== undefined && (!Array.isArray(t.nodes) || t.nodes.length > 50 || t.nodes.some((n) => typeof n !== "string")))) return { ok: false, error: "bad target" };
+  }
   const sup = raw.supervisor;
   if (!isRec(sup) || sup.schemaVersion !== SUPERVISOR_SCHEMA_VERSION || sup.missionId !== raw.missionId || !isRec(sup.specs) || Object.keys(sup.specs).length > MAX_SPECS || !Array.isArray(sup.journal)) return { ok: false, error: "supervisor state is missing or inconsistent with the mission" };
   return { ok: true, record: raw as unknown as MissionRecord };
@@ -124,7 +130,7 @@ async function writeAtomic(dir: string, rec: MissionRecord): Promise<void> {
 export type Saved = { ok: true; record: MissionRecord } | { ok: false; error: string };
 
 /** Create a mission from specs; refuses to overwrite an existing one. */
-export async function createMission(root: string, missionId: string, specs: MissionSpec[], opts: { limits?: Partial<Limits>; charterRef?: string; designRef?: string; budget?: MissionRecord["budget"]; autonomy?: MissionRecord["autonomy"] } = {}): Promise<Saved> {
+export async function createMission(root: string, missionId: string, specs: MissionSpec[], opts: { limits?: Partial<Limits>; charterRef?: string; designRef?: string; budget?: MissionRecord["budget"]; target?: MissionRecord["target"]; autonomy?: MissionRecord["autonomy"] } = {}): Promise<Saved> {
   const m = newMission(missionId, specs, opts.limits);
   if (!m.ok) return { ok: false, error: m.errors.join("; ") };
   const dir = dirOf(root, missionId);
@@ -132,7 +138,7 @@ export async function createMission(root: string, missionId: string, specs: Miss
   return withLock(dir, async () => {
     try { await lstat(join(dir, "record.json")); return { ok: false as const, error: `mission ${missionId} already exists` }; } catch { /* free */ }
     const t = now();
-    const rec: MissionRecord = { schemaVersion: MISSION_SCHEMA_VERSION, missionId, rev: 1, createdAt: t, updatedAt: t, phase: "designing", planVersion: 1, planDiffs: [], assumptions: [], openQuestions: [], risks: [], ...(opts.charterRef ? { charterRef: clip(opts.charterRef, 200) } : {}), ...(opts.designRef ? { designRef: clip(opts.designRef, 200) } : {}), ...(opts.budget ? { budget: opts.budget } : {}), ...(opts.autonomy ? { autonomy: opts.autonomy } : {}), supervisor: m.state };
+    const rec: MissionRecord = { schemaVersion: MISSION_SCHEMA_VERSION, missionId, rev: 1, createdAt: t, updatedAt: t, phase: "designing", planVersion: 1, planDiffs: [], assumptions: [], openQuestions: [], risks: [], ...(opts.charterRef ? { charterRef: clip(opts.charterRef, 200) } : {}), ...(opts.designRef ? { designRef: clip(opts.designRef, 200) } : {}), ...(opts.budget ? { budget: opts.budget } : {}), ...(opts.autonomy ? { autonomy: opts.autonomy } : {}), ...(opts.target ? { target: opts.target } : {}), supervisor: m.state };
     await writeAtomic(dir, rec);
     await appendJournal(root, missionId, { type: "mission-created", why: `${specs.length} spec(s)`, evidence: specs.map((s) => s.id).join(",") });
     return { ok: true as const, record: rec };
