@@ -603,6 +603,7 @@ export function registerDispatchTools(api: OpenClawPluginApi, cfg: FleetConfig):
         const ledgerEntry = {
           runId,
           node: node.displayName ?? node.nodeId,
+          nodeId: node.nodeId,
           cwd: p.cwd,
           prompt: p.prompt,
           model: p.model,

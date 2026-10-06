@@ -29,6 +29,8 @@ export type RunState =
 export interface LedgerEntry {
   runId: string;
   node: string;
+  /** The node id at dispatch (issue #257): the display name can be absent right after a node restart, so lookups match either. */
+  nodeId?: string;
   cwd: string;
   prompt: string;
   model?: string;
@@ -183,6 +185,10 @@ export function capLedger(runs: LedgerEntry[], cap = LEDGER_TERMINAL_CAP): Ledge
   });
 }
 
+/** A run belongs to a node when the lookup names its display name OR its recorded node id (issue #257). */
+export const onNode = (r: Pick<LedgerEntry, "node" | "nodeId">, nodeNames: string[]): boolean =>
+  nodeNames.includes(r.node) || (r.nodeId !== undefined && nodeNames.includes(r.nodeId));
+
 /**
  * Which run does `fleet_abort` mean when given only a sessionId (issue #63)?
  * Entries must match the session AND the node. Prefers the newest non-terminal
@@ -191,7 +197,7 @@ export function capLedger(runs: LedgerEntry[], cap = LEDGER_TERMINAL_CAP): Ledge
  */
 export function resolveAbortRunId(runs: LedgerEntry[], sessionId: string, nodeNames: string[]): string | undefined {
   const hits = runs
-    .filter((r) => r.sessionId === sessionId && nodeNames.includes(r.node))
+    .filter((r) => r.sessionId === sessionId && onNode(r, nodeNames))
     .sort((a, b) => (a.startedAt < b.startedAt ? 1 : a.startedAt > b.startedAt ? -1 : 0));
   return (hits.find((r) => !TERMINAL.has(r.state)) ?? hits[0])?.runId;
 }
@@ -199,7 +205,7 @@ export function resolveAbortRunId(runs: LedgerEntry[], sessionId: string, nodeNa
 /** The newest run recorded for this node + checkout directory (ledger order independent), if any. */
 export function latestRunFor(runs: LedgerEntry[], nodeNames: string[], cwd: string): LedgerEntry | undefined {
   return runs
-    .filter((r) => nodeNames.includes(r.node) && (r.cwd === cwd || r.runCwd === cwd) && r.state !== "discarded")
+    .filter((r) => onNode(r, nodeNames) && (r.cwd === cwd || r.runCwd === cwd) && r.state !== "discarded")
     .sort((a, b) => (a.startedAt < b.startedAt ? 1 : a.startedAt > b.startedAt ? -1 : 0))[0];
 }
 

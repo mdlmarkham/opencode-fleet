@@ -651,7 +651,7 @@ describe("issue #87c e2e: fleet_dispatch DEFAULT — neither opt-in flag (invari
       const ledger = await loadLedger(rootDir);
       expect(ledger).toHaveLength(1);
       expect(Object.keys(ledger[0]).sort()).toEqual(
-        ["cwd", "node", "pid", "prompt", "runId", "startedAt", "state", "transport", "updatedAt"].sort(),
+        ["cwd", "node", "nodeId", "pid", "prompt", "runId", "startedAt", "state", "transport", "updatedAt"].sort(),
       );
       expect(ledger[0].harness).toBeUndefined();
   });
