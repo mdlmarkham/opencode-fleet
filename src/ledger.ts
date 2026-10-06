@@ -127,6 +127,42 @@ export async function saveLedger(rootDir: string, runs: LedgerEntry[]): Promise<
 }
 
 /**
+ * Issue #269: reconcile ledger entries whose worker process is GONE but whose
+ * state is still `running` — the "dead detached run holds a slot" shape observed
+ * live on 2026-10-06. A run whose node reports `alive: false` with no completion
+ * marker is settled to `failed` ("process gone") on the next read by ANY consumer
+ * (board, resume, capacity), not only when `fleet_run_status` happens to be called.
+ *
+ * Input is what the caller already observed for each run id:
+ *   - `alive: false` and no `finishedAt`  -> reconcile to `failed` (dead without a record)
+ *   - `finishedAt` present               -> NOT touched here (the run-result path owns
+ *                                           the terminal state + gate classification)
+ *   - alive, or not probed               -> left untouched (never void live work)
+ *
+ * Pure over the entry list: returns the updated list and the ids it settled, so a
+ * caller can persist and report. Never touches a run it was not told about.
+ */
+export function reconcileDeadRuns(
+  runs: LedgerEntry[],
+  observed: ReadonlyMap<string, { alive?: boolean; finishedAt?: string }>,
+  now: string = new Date().toISOString(),
+): { runs: LedgerEntry[]; settled: string[] } {
+  const settled: string[] = [];
+  const next = runs.map((r) => {
+    if (r.state !== "running") return r;
+    const o = observed.get(r.runId);
+    if (!o) return r;
+    // Only a definitively-dead, record-less run is settled. A finished run belongs to
+    // the run-result path; a live one must never be voided.
+    if (o.finishedAt !== undefined) return r;
+    if (o.alive !== false) return r;
+    settled.push(r.runId);
+    return { ...r, state: "failed" as RunState, updatedAt: now, summary: "worker process gone with no completion record (reconciled on read, issue #269)" };
+  });
+  return { runs: next, settled };
+}
+
+/**
  * Terminal states: only these are subject to the retention cap. `timed-out` is
  * deliberately NOT terminal: a relay timeout does not mean the worker stopped
  * (fleet_resume treats it as incomplete), so its recovery record is kept until

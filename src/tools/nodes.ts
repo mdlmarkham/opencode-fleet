@@ -145,7 +145,44 @@ export function registerNodesTools(api: OpenClawPluginApi, cfg: FleetConfig): vo
       const p = params as { includeLanded?: boolean; staleMinutes?: number; tasksDir?: string };
       const { loadLedger } = await import("../ledger.js");
       const { renderBoard } = await import("../board.js");
-      const entries = await loadLedger(api.rootDir ?? process.cwd());
+      let entries = await loadLedger(api.rootDir ?? process.cwd());
+      // Issue #269: settle a dead detached run (alive:false, no completion record) on
+      // read, so a stuck `running` entry stops holding its slot and stops reading as
+      // in-flight. Best-effort: a node that cannot be probed leaves the entry alone.
+      try {
+        const { reconcileDeadRuns } = await import("../ledger.js");
+        const { staleAfter } = await import("../capacity.js");
+        const { resolveFleetNodes } = await import("../membership.js");
+        const list = await api.runtime.nodes.list();
+        const fleet = resolveFleetNodes(list.nodes ?? [], cfg);
+        const now = Date.now();
+        const stale = staleAfter(cfg.capacity);
+        const observed = new Map<string, { alive?: boolean; finishedAt?: string }>();
+        for (const r of entries) {
+          if (r.state !== "running") continue;
+          const node = fleet.find((n) => (n.displayName ?? n.nodeId) === r.node);
+          if (!node) continue;
+          const invocable = (node as { invocableCommands?: string[] }).invocableCommands ?? [];
+          if (!invocable.includes("opencode.run")) continue;
+          const t = Date.parse(r.updatedAt || r.startedAt);
+          // only probe entries recent enough to matter (past the capacity window they
+          // already release their slot; probing them is wasted round-trips)
+          if (Number.isFinite(t) && now - t > stale) continue;
+          try {
+            const st = (await api.runtime.nodes.invoke({ nodeId: node.nodeId, command: "opencode.run", params: { prompt: "__RUN_STATUS__", cwd: "/", transport: "http", runId: r.runId }, timeoutMs: 15000, signal: undefined })) as { details?: unknown; payload?: unknown; content?: Array<{ text?: string }> };
+            const payload = (st.details ?? st.payload ?? (st.content?.[0]?.text ? JSON.parse(st.content[0].text) : undefined)) as { alive?: boolean; finishedAt?: string } | undefined;
+            if (payload && typeof payload === "object") observed.set(r.runId, { alive: payload.alive, finishedAt: payload.finishedAt });
+          } catch { /* unreachable node: leave the entry for the next read */ }
+        }
+        if (observed.size) {
+          const rec = reconcileDeadRuns(entries, observed);
+          if (rec.settled.length) {
+            entries = rec.runs;
+            const { saveLedger } = await import("../ledger.js");
+            await saveLedger(api.rootDir ?? process.cwd(), entries);
+          }
+        }
+      } catch { /* board must never fail on the reconcile pass */ }
       const opts: {
         staleMs?: number;
         buckets?: Array<"in-flight" | "needs-you" | "landed" | "failed" | "stale">;
