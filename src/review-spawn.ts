@@ -98,6 +98,22 @@ export function unexecutedClaims(claimed: string[], manifest: Array<{ tool?: str
   });
 }
 
+/**
+ * Claims the manifest CONTRADICTS: the reviewer says a command exited 0 but the engine's own record of
+ * that command carries a non-zero exit code. A manifest without exit codes (older node, engine that
+ * does not report them) contradicts nothing: unknown stays unknown.
+ */
+export function contradictedClaims(claimed: Array<{ command?: unknown; exitCode?: unknown }>, manifest: Array<{ input?: string; exitCode?: number }>): string[] {
+  const out: string[] = [];
+  for (const c of claimed) {
+    if (typeof c.command !== "string" || c.exitCode !== 0) continue;
+    const n = norm(c.command);
+    const hit = manifest.find((m) => typeof m.exitCode === "number" && m.exitCode !== 0 && (norm(String(m.input ?? "")) === n || norm(String(m.input ?? "")).includes(n)));
+    if (hit) out.push(`${c.command.slice(0, 80)} (manifest exit ${hit.exitCode})`);
+  }
+  return out;
+}
+
 /** Is `git rev-parse HEAD` among the executed commands, and did the reviewer report the head sha as its output? */
 export function headBinding(report: ReviewerReport, headSha: string, manifest: Array<{ input?: string }>): { ok: true } | { ok: false; error: string } {
   const claim = (report.commands ?? []).find((c) => typeof c.command === "string" && /\bgit\s+rev-parse\s+(--verify\s+)?HEAD\b/.test(c.command));
