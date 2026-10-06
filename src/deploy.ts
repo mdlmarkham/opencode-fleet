@@ -81,10 +81,23 @@ function shq(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
-/** Hash the built dist/index.js so we can prove the installed copy matches. */
+/**
+ * Hash the built dist CODE TREE so we can prove the installed copy matches.
+ *
+ * Issue #281: this used to hash only `dist/index.js` — a thin ESM re-export stub
+ * (280 lines of `import … from "./x.js"`) that does NOT change when the logic in
+ * a deeper module changes. A stale install therefore reported a MATCH, which is
+ * the mechanical reason "merged but not deployed" went unnoticed.
+ *
+ * The build's identity is the CONTENT of its code modules. We compute a single
+ * tree digest whose scheme the node must reproduce EXACTLY (see verifyScript): sort
+ * the `.js` paths, then sha256 the string `path\0sha\0path\0sha…`. `digestOfDist`
+ * in build-provenance.ts is the canonical implementation; the shell side mirrors it.
+ */
 async function builtIndexHash(pluginDir: string): Promise<string> {
-  const { stdout } = await execFileP("sha256sum", [join(pluginDir, "dist", "index.js")], { timeout: 30_000 });
-  return stdout.trim().split(/\s+/)[0];
+  const { digestOfDist } = await import("./build-provenance.js");
+  const { digest } = await digestOfDist(join(pluginDir, "dist"));
+  return digest;
 }
 
 /**
@@ -316,12 +329,22 @@ export async function deployPlugin(req: DeployRequest): Promise<DeployResult> {
           serviceUser ? `installed as ${serviceUser}` : "installed as SSH login user (service principal unverified)",
         );
 
-        // Issue #18 defect 3: verify the installed build matches what we made.
-        // Compare the sha256 of the *service user's* installed dist/index.js
-        // against the hash of the artifact we just built. Fail closed.
+        // Issue #18 defect 3 / issue #281: verify the installed build matches
+        // what we made. Compare the TREE digest of the *service user's* installed
+        // dist code modules against the digest of the artifact we just built.
+        // Fail closed. The scheme MUST match build-provenance.treeDigest EXACTLY:
+        // sort the `.js` paths, then sha256 the string `path\0sha\0path\0sha…` —
+        // each pair joined by a NUL, pairs joined by a NUL, and NO trailing NUL
+        // (a trailing NUL meant the shell digest could never match the JS one).
+        // Compute each hash into a variable first: nested quoting inside a
+        // printf-format command substitution let sha256sum's FILENAME leak into
+        // the payload, which also could never match.
         const verifyScript =
-          `ROOT="\${HOME}/.openclaw/extensions/opencode-fleet/dist/index.js"; ` +
-          `if [ -f "$ROOT" ]; then sha256sum "$ROOT" | awk '{print $1}'; else echo MISSING; fi`;
+          `ROOT="\${HOME}/.openclaw/extensions/opencode-fleet/dist"; ` +
+          `if [ ! -d "$ROOT" ]; then echo MISSING; exit 0; fi; ` +
+          `find "$ROOT" -type f -name '*.js' | LC_ALL=C sort | ` +
+          `while IFS= read -r f; do h=$(sha256sum -- "$f"); h=\${h%% *}; printf '%s\\0%s\\0' "\${f#$ROOT/}" "$h"; done ` +
+          `| head -c -1 | sha256sum | awk '{print $1}'`;
         // Non-login shell again: banner text on stdout would be misparsed as
         // the hash. `sudo -H` provides the service user's HOME.
         const verifyCmd = serviceUser
