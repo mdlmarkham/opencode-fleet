@@ -2,7 +2,9 @@
 # Hygiene guard (issue #159): refuses an index that tracks
 #   1. symlinks with absolute targets or targets escaping the repo root,
 #   2. any path under node_modules/, or
-#   3. TASK-*.md agent briefs.
+#   3. TASK-*.md agent briefs, including the dot-prefixed convention fleet_sync's auto-commit uses
+#      (e.g. .fleet-TASK-39.md; issue #205). Matching is by basename, so the tracked project
+#      record under .fleet/ (charter.md, decisions/, rules.yml) is never caught.
 # Usage: scripts/check-hygiene.sh [repo-dir]   (default: this repo's root)
 # Read-only: uses `git ls-files -s`, never touches the worktree.
 set -u
@@ -79,7 +81,7 @@ while IFS= read -r line; do
 
   name=${path##*/}
   case $name in
-    TASK-*.md) fail "hygiene: violation: TASK-*.md agent brief is tracked: '$path'" ;;
+    TASK-*.md|.*TASK-*.md) fail "hygiene: violation: TASK-*.md agent brief is tracked: '$path'" ;;
   esac
 done < "$tmp"
 

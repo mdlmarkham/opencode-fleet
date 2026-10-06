@@ -6,7 +6,7 @@ Rules for any agent working autonomously in this repo.
 
 - Never run `git add -A`, `git add .`, or `git add <dir>` without checking `git status` first and deliberately choosing what you are staging. Stage explicit paths.
 - Never commit:
-  - `TASK-*.md` files (agent briefs; see the `# Agent scratch` section of `.gitignore`),
+  - `TASK-*.md` and dot-prefixed `.*TASK-*.md` files such as `.fleet-TASK-39.md` (agent briefs; see the `# Agent scratch` section of `.gitignore`),
   - symlinks (the guard rejects committed symlinks with absolute or repo-escaping targets),
   - anything under `node_modules/`,
   - secrets, keys, or credentials.
