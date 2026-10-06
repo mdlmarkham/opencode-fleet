@@ -138,7 +138,7 @@ export async function deployPlugin(req: DeployRequest): Promise<DeployResult> {
 
     // 3. Install on gateway.
     try {
-      await execFileP("openclaw", ["plugins", "install", tarball, "--force", "--accept-capabilities"], {
+      await execFileP("openclaw", ["plugins", "install", tarball, "--force", "--accept-capabilities", "--acknowledge-install-policy-warning"], {
         timeout: 120_000,
       });
       add("install-gateway", true);
@@ -257,7 +257,7 @@ export async function deployPlugin(req: DeployRequest): Promise<DeployResult> {
         // exit code must gate the step; we capture output and require an
         // explicit success sentinel.
         const installInner =
-          `cd ${shq(stage)} && openclaw plugins install ${shq(tarballName)} --force --accept-capabilities 2>&1; ` +
+          `cd ${shq(stage)} && openclaw plugins install ${shq(tarballName)} --force --accept-capabilities --acknowledge-install-policy-warning 2>&1; ` +
           `rc=$?; echo "FLEET_INSTALL_RC=$rc"; exit $rc`;
         // Use a NON-login shell (`bash -c`): a login shell (`bash -lc`) sources
         // the user's profile and can print MOTD/banner text on stdout, which
