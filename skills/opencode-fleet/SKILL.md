@@ -62,6 +62,7 @@ Per run you get `state`, `exitCode`, `verified` (true / false / null for no gate
 - **`fleet_iterate`**: retry a task against its gate with bounded attempts and no-progress detection.
 - **Interrupted?** `fleet_resume` finds runs left in flight after a crash or timeout; `fleet_abort` stops one. Never re-dispatch a run that `fleet_run_status` says is still live.
 - **Failed gate?** Read `verifyDetails`, fix the spec or the instructions, and re-dispatch. Do not edit the gate to make it pass.
+- **Adopting an existing repo?** `fleet_project_adopt` surveys a checkout on a node without writing to it: conventions plus the install/build/test/lint commands it declares, each with its source file. Commands run only with `run` set AND `disposableClone: true` (use a clone); scripts that download, pipe to a shell or chain are reported, not run. The first survey is saved as the baseline and later ones are diffed against it, so pre-existing failures are not blamed on new work. Unknown is `null`, never none.
 - **Starting a project from one sentence?** `fleet_project_start` runs a typed intake (goal, users, constraints, non-goals, checkable success criteria, riskiest assumptions) and answers `ready | needs-more | risky-but-proceed` with exactly what is missing. Success criteria cannot be deferred. Only after it passes does `write` put `.fleet/charter.md` and your first decisions in a checkout (never overwriting), and `backlog` checks proposed specs for acceptance, verify, scope and overlap. Everything it returns is a proposal; nothing is dispatched.
 - **Specs failing too often?** `fleet_spec_quality` shows which spec shapes fail, from the outcomes of finished runs (no-op, failed gate, failed, complete) grouped by acceptance/verify/scope; read-only, rates need a minimum group size (`minN`).
 
@@ -85,7 +86,7 @@ If the operator set `sync.requireVerified` / `blockOnScopeViolation` / `requireR
 | Recover / stop | `fleet_resume`, `fleet_abort` |
 | Fleet state | `fleet_status`, `fleet_capabilities`, `fleet_capacity`, `fleet_models` |
 | Set up nodes | `fleet_provision`, `fleet_provision_config`, `fleet_cleanup` |
-| Gates and review | `fleet_design_check`, `fleet_review`, `fleet_sync`, `fleet_project_show`, `fleet_project_start` |
+| Gates and review | `fleet_design_check`, `fleet_review`, `fleet_sync`, `fleet_project_show`, `fleet_project_start`, `fleet_project_adopt` |
 | Recipes | `fleet_recipe_recommend`, `fleet_recipe_record`, `fleet_recipe_list` |
 | Operator only | `fleet_deploy` (build and install the plugin; apply with a gateway restart, not a reload) |
 
