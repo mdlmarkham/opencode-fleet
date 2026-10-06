@@ -26,9 +26,10 @@ import { parseOpenCodeOutput, parsePiOutput } from "./opencode.js";
 import type { ExecStatus } from "./opencode.js";
 import { loadLedger, upsertRun, type LedgerEntry } from "./ledger.js";
 import { withVerified } from "./verify.js";
+import { gatewaySrc } from "./testkit/src.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const indexSrc = readFileSync(join(here, "index.ts"), "utf8").replace(/\r\n/g, "\n");
+const indexSrc = gatewaySrc().replace(/\r\n/g, "\n");
 const opencodeSrc = readFileSync(join(here, "opencode.ts"), "utf8").replace(/\r\n/g, "\n");
 
 // The fleet_iterate tool block only (its siblings have different shapes).

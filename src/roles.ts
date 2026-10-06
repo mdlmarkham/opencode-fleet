@@ -22,9 +22,9 @@ import { quoteUntrusted } from "./untrusted.js";
 import { parseTaskSpec } from "./spec.js";
 import { scopeOverlap } from "./scope.js";
 
-export const ROLE_NAMES = ["implementer", "adversarial-reviewer", "security-reviewer", "design-developer", "decomposer", "integrator"] as const;
+export const ROLE_NAMES = ["implementer", "adversarial-reviewer", "security-reviewer", "design-developer", "design-critic", "decomposer", "integrator"] as const;
 export type RoleName = (typeof ROLE_NAMES)[number];
-export type OutputKind = "diff" | "findings" | "design" | "specs" | "branches";
+export type OutputKind = "diff" | "findings" | "design" | "specs" | "branches" | "critique";
 
 export interface Permissions { readOnly: boolean; network: boolean; scripts: boolean }
 export interface RoleDef {
@@ -48,6 +48,7 @@ export const BUILTIN_ROLES: Readonly<Record<RoleName, RoleDef>> = {
   "adversarial-reviewer": { name: "adversarial-reviewer", version: 1, prompt: "Try to break this change. Re-run the build and tests yourself in your own clone. Report only findings you can show: a cited line or a failing test. Do not edit anything.", output: { kind: "findings", required: FINDING_FIELDS }, permissions: RO, skills: [], checklist: [] },
   "security-reviewer": { name: "security-reviewer", version: 1, prompt: "Review this change for security defects and write a short threat model. State what you could not check. Do not edit anything.", output: { kind: "findings", required: [...FINDING_FIELDS, "threatModel", "notChecked"] }, permissions: RO, skills: [], checklist: [] },
   "design-developer": { name: "design-developer", version: 1, prompt: "Produce a design: the options with trade-offs, a recommendation, the risks and a rollout. Do not edit code.", output: { kind: "design", required: ["options", "recommendation", "risks", "rollout"] }, permissions: RO, skills: [], checklist: [] },
+  "design-critic": { name: "design-critic", version: 1, prompt: "Read the charter, the decision log and the spec. Say whether this is the right change, whether a simpler alternative exists, and whether it fits the recorded direction. Every claim needs cited evidence and a concrete alternative. Do not edit anything.", output: { kind: "critique", required: ["claim", "evidence", "alternative", "confidence", "severity"] }, permissions: RO, skills: [], checklist: [] },
   decomposer: { name: "decomposer", version: 1, prompt: "Break the goal into specs, each with a goal, acceptance criteria, a file scope and a verify gate, with non-overlapping scopes.", output: { kind: "specs", required: ["goal", "acceptance", "scope", "verify"] }, permissions: RO, skills: [], checklist: [] },
   integrator: { name: "integrator", version: 1, prompt: "Merge the verified branches in dependency order. Resolve nothing silently: report any conflict.", output: { kind: "branches", required: [] }, permissions: { readOnly: false, network: false, scripts: false }, skills: [], checklist: [] },
 };
@@ -176,6 +177,18 @@ export function checkOutput(role: Pick<RoleDef, "output" | "permissions">, outpu
       if (!["blocking", "major", "minor", "nit"].includes(String(f.severity))) return { ok: false, error: `findings[${i}].severity must be blocking|major|minor|nit` };
     }
     for (const extra of role.output.required.filter((r) => !FINDING_FIELDS.includes(r))) if (!(o as Record<string, unknown>)[extra] || String((o as Record<string, unknown>)[extra]).trim() === "") return { ok: false, error: `${extra} is required for this role` };
+    return { ok: true };
+  }
+  if (kind === "critique") {
+    const items = (output as { critiques?: unknown } | undefined)?.critiques;
+    if (!isRec(output) || !Array.isArray(items) || items.length > 20) return { ok: false, error: "critique output must be {critiques: [...]} with at most 20 items" };
+    for (const [i, c] of items.entries()) {
+      if (!isRec(c)) return { ok: false, error: `critiques[${i}] is not an object` };
+      const missing = role.output.required.filter((r) => c[r] === undefined || c[r] === null || String(c[r]).trim() === "");
+      if (missing.length) return { ok: false, error: `critiques[${i}] is missing ${missing.join(", ")}: a claim without evidence and an alternative is rejected` };
+      if (typeof c.confidence !== "number" || c.confidence < 0 || c.confidence > 1) return { ok: false, error: `critiques[${i}].confidence must be a number from 0 to 1` };
+      if (!["low", "medium", "high"].includes(String(c.severity))) return { ok: false, error: `critiques[${i}].severity must be low|medium|high` };
+    }
     return { ok: true };
   }
   if (kind === "design") {

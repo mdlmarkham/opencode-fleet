@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { latestRunFor, recipeSuccess, syncGate, type LedgerEntry } from "./ledger.js";
+import { gatewaySrc } from "./testkit/src.js";
 
 const run = (runId: string, over: Partial<LedgerEntry> = {}): LedgerEntry => ({
   runId, node: "dev2", cwd: "/w/p", prompt: "x", startedAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z", state: "completed", ...over,
@@ -62,7 +63,7 @@ describe("#65: recipe success derives from the run", () => {
 });
 
 describe("#65: wiring", () => {
-  const src = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
+  const src = gatewaySrc();
   const manifest = JSON.parse(readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8"));
   it("fleet_sync consults the gate before any publish path, and recipe_record uses runId", () => {
     const sync = src.slice(src.indexOf('name: "fleet_sync"'), src.indexOf('name: "fleet_cleanup"'));
