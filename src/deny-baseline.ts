@@ -95,6 +95,30 @@
  * against the baseline catch-all deny) are BOTH kept; resolving overlaps is
  * opencode's matcher's business — this module only guarantees the deny data
  * is present and that deny-only never becomes allow/ask.
+ *
+ * ORDER SEMANTICS — LIVE-VERIFIED (issue #51c, 2026-10-06, opencode 1.18.25 on
+ * dev3): opencode's permission evaluation is LAST-MATCH-WINS by rule position.
+ * Live probes against scratch XDG configs recorded with `opencode run
+ * --format json`:
+ *   - probe 1: bash rules ordered {"git push*":"deny","*":"allow"} — the later
+ *     broad allow SHADOWED the deny; `git push --dry-run origin master`
+ *     EXECUTED (bash tool `status: completed`, exit 128 = missing remote, i.e.
+ *     no permission rejection).
+ *   - probe 2: same rules REVERSED {"*":"allow","git push*":"deny"} — the push
+ *     was DENIED (bash tool `status: error`, metadata null; the model reported
+ *     `git push*` explicitly denied).
+ *   - control: {"bash":{"*":"deny"}} removed the bash tool outright, and
+ *     {"bash":{"curl*":"deny"}} denied `curl -sS http://127.0.0.1:9/` (probe 3,
+ *     baseline-shaped) — enforcement itself verified live.
+ * Because position decides, a merged user map that places ANY matching allow
+ * after a baseline pattern would re-open the denial. This module therefore
+ * makes the merge ORDER-SAFE: user pattern entries are emitted FIRST (original
+ * relative order), every baseline key is removed from the merged category map
+ * (also absorbing an exact-key user allow/ask/deny on the same pattern) and
+ * re-added LAST, so an evaluated command resolves to the baseline "deny"
+ * whenever any baseline pattern matches. BASELINE WINS thus holds for
+ * pattern-shadow conflicts (e.g. user `{"git *": "allow"}` against baseline
+ * `git push*: deny`), not just exact-key conflicts.
  */
 
 // ---------------------------------------------------------------------------
@@ -216,15 +240,19 @@ function safeSet(m: Record<string, PermissionAction>, key: string, value: Permis
 }
 
 /**
- * Merge ONE permission category with the baseline's deny map.
+ * Merge ONE permission category with the baseline's deny map. ORDER-SAFE:
+ * opencode evaluates permission rules last-match-wins (live-verified, see the
+ * module header), so every baseline key is REMOVED from the merged map and
+ * re-added at the END — a later, broader user allow can never shadow a
+ * baseline deny.
  *  - existing "deny"            → kept (subsumes every baseline pattern).
  *  - existing "allow"/"ask"     → re-expressed at its true scope (a catch-all
- *    pattern) and tightened wherever a baseline deny lands on the same
- *    pattern — the BASELINE WINS the denied patterns (see header).
+ *    pattern placed FIRST, before the baseline keys) — the BASELINE WINS the
+ *    denied patterns (see header).
  *  - existing pattern map       → user entries preserved verbatim (cloned;
- *    prototype-magic keys skipped), then every baseline pattern set to "deny"
- *    an exact-pattern conflict (e.g. user `{"git push*": "allow"}`) resolves
- *    to deny, with no duplicate key.
+ *    prototype-magic keys skipped) and emitted BEFORE the baseline, then every
+ *    baseline pattern set to "deny" LAST; an exact-pattern conflict (e.g. user
+ *    `{"git push*": "allow"}`) resolves to deny, with no duplicate key.
  *  - anything else (absent or malformed) → the baseline itself (deny-only,
  *    fail-safe).
  */
@@ -240,12 +268,19 @@ function mergeCategory(existing: unknown, baselineDenies: Readonly<Record<string
     return { ...baselineDenies }; // malformed action → baseline
   }
   if (isRecord(existing)) {
+    // Pass 1: user entries, minus every baseline key (exact-key conflicts are
+    // absorbed here; the baseline re-adds them LAST below).
     const m: Record<string, PermissionAction> = Object.create(null);
+    const baselineKeys = new Set(Object.keys(baselineDenies));
     for (const [k, v] of Object.entries(existing)) {
       if (k === PROTO_KEY) continue; // a JSON-parsed config cannot legitimately carry this
+      if (baselineKeys.has(k)) continue; // baseline owns this pattern; re-added LAST
       if (typeof v === "string" && (v === "allow" || v === "ask" || v === "deny")) safeSet(m, k, v);
       else (m as unknown as Record<string, unknown>)[k] = isRecord(v) ? { ...v } : v; // user value kept verbatim (cloned); never dropped
     }
+    // Pass 2: baseline keys re-added LAST so they sit at the END of the map
+    // and win under last-match-wins evaluation, even against a broader,
+    // later-looking user allow (the #106 shadow case).
     for (const [p, d] of Object.entries(baselineDenies)) safeSet(m, p, d);
     return Object.assign({}, m);
   }
@@ -260,6 +295,11 @@ function mergeCategory(existing: unknown, baselineDenies: Readonly<Record<string
  * Guarantees:
  *  - every baseline pattern ends up "deny" under its category — including
  *    for an existing, CONFLICTING allow/ask on that exact pattern;
+ *  - ORDER-SAFE under opencode's last-match-wins rule evaluation
+ *    (live-verified, see the module header): within every merged pattern-map
+ *    category, all user rules are emitted FIRST and every baseline key is
+ *    re-added LAST, so a broader user allow can never shadow a baseline deny
+ *    by coming later in the map;
  *  - a whole-category scalar "deny" is kept (it subsumes the baseline);
  *  - user rules at other patterns, other permission categories, and every
  *    unrelated top-level key are preserved verbatim (shallow-cloned so the
