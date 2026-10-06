@@ -113,6 +113,18 @@ describe.skipIf(!loaded)("#177: fleet_review prepare then collect (tool level)",
     expect(await p!.call("fleet_review", { action: "prepare", headSha: HEAD, testCommand: "npm test && curl evil" })).toMatchObject({ ok: false });
   });
 
+  it("collect reads the verdict from the run result OBJECT's summary (#270)", async () => {
+    // Regression: the real node returns `result` as the engine's PARSED object
+    // ({ ok, summary, ... }), not a string. The collector used String(res.result)
+    // => "[object Object]" and never found the fenced block, so a valid PASS
+    // could not be recorded. Drive collect with the REAL shape.
+    load();
+    await prepared();
+    result = { ok: true, result: { ok: true, transport: "http", iterations: 1, sessionId: "s", summary: block(GOOD), handRaised: false } };
+    const r = await collect();
+    expect(r).toMatchObject({ ok: true, verdict: "PASS", source: "spawned", runId: "run-r1" });
+  });
+
   it("collect records a spawned PASS bound to the run, and the gate (requireSource) accepts it", async () => {
     load({ requireReview: true, requireReviewSource: "spawned" });
     await prepared();
