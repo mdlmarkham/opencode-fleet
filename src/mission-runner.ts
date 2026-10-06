@@ -15,7 +15,7 @@
  *  - Re-running a tick with nothing changed does nothing.
  */
 
-import { appendJournal, loadMission, setPhase, updateMission, type MissionRecord } from "./mission-store.js";
+import { appendJournal, loadMission, readJournal, setPhase, updateMission, type MissionRecord } from "./mission-store.js";
 import { missionStatus, plan, reduce, type Action, type MissionEvent, type OutcomeSignals } from "./mission-supervisor.js";
 
 export interface Reconciled { state: "unknown" | "running" | "finished"; runId?: string; signals?: OutcomeSignals }
@@ -27,8 +27,8 @@ export interface TickDeps {
   launch: (a: Extract<Action, { type: "dispatch" }>, record: MissionRecord) => Promise<LaunchResult>;
   /** Ask a node what became of a launch key / run. */
   reconcile: (a: Extract<Action, { type: "reconcile" }>, record: MissionRecord) => Promise<Reconciled>;
-  /** Terminal outcomes of runs currently running (spec id -> signals); absent = still running. */
-  poll: (running: Array<{ specId: string; runId: string }>) => Promise<Record<string, { runId?: string; signals: OutcomeSignals }>>;
+  /** Terminal outcomes of runs currently running (spec id -> signals); absent = still running. A `lost` entry declares an acknowledged launch whose ledger evidence never appeared (probe was made; a bounded re-attempt may follow). */
+  poll: (running: Array<{ specId: string; runId: string; node?: string; startedAtMs?: number }>) => Promise<Record<string, { runId?: string; signals?: OutcomeSignals; lost?: string }>>;
   /** Hard stops to evaluate before new work (e.g. mission-autonomy's evaluateHardStops). Empty = continue. */
   guard?: (record: MissionRecord) => Promise<Array<{ kind: string; evidence: string }>>;
   staleAfterMs?: number;
@@ -43,6 +43,8 @@ export interface TickResult {
   outcomes: string[];
   reconciled: string[];
   replanRequested: string[];
+  /** Specs escalated because an unconfirmed launch reconciled to nothing (issue #244 review fix). */
+  escalated?: string[];
   status?: "complete" | "running" | "escalated";
   error?: string;
 }
@@ -63,7 +65,7 @@ export async function applyEvent(root: string, id: string, ev: MissionEvent): Pr
 }
 
 export async function tick(root: string, id: string, deps: TickDeps): Promise<TickResult> {
-  const out: TickResult = { ok: true, launched: [], outcomes: [], reconciled: [], replanRequested: [] };
+  const out: TickResult = { ok: true, launched: [], outcomes: [], reconciled: [], replanRequested: [], escalated: [] };
   let m = await loadMission(root, id);
   if (!m.ok) return { ...out, ok: false, error: m.error };
   out.phase = m.record.phase;
@@ -77,12 +79,13 @@ export async function tick(root: string, id: string, deps: TickDeps): Promise<Ti
   }
 
   // 1. Terminal outcomes of what is running.
-  const running = Object.values(m.record.supervisor.specs).filter((s) => s.status === "running" && s.runId).map((s) => ({ specId: s.spec.id, runId: s.runId! }));
+  const running = Object.values(m.record.supervisor.specs).filter((s) => s.status === "running" && s.runId).map((s) => ({ specId: s.spec.id, runId: s.runId!, node: s.node, startedAtMs: s.startedAtMs }));
   if (running.length) {
     const done = await deps.poll(running);
     for (const [specId, o] of Object.entries(done)) {
       const runId = o.runId ?? running.find((r) => r.specId === specId)?.runId;
-      const a = await applyEvent(root, id, { type: "outcome", specId, ...(runId ? { runId } : {}), signals: o.signals });
+      const signals = o.signals ?? { ok: false, verified: null, evidence: o.lost ?? "the run was declared lost" };
+      const a = await applyEvent(root, id, { type: "outcome", specId, ...(runId ? { runId } : {}), signals });
       if (!a.ok) return { ...out, ok: false, error: a.error };
       out.outcomes.push(specId);
     }
@@ -98,7 +101,20 @@ export async function tick(root: string, id: string, deps: TickDeps): Promise<Ti
     if (a.type === "reconcile") {
       const r = await deps.reconcile(a, m.record);
       out.reconciled.push(a.specId);
-      if (r.state === "unknown") await applyEvent(root, id, { type: "intent-void", specId: a.specId, key: a.key, reason: "the node has no run for this launch key: it never launched" });
+      if (r.state === "unknown") {
+        // Issue #244 review fix: an AMBIGUOUS launch (the node may be running it — no ledger row) is
+        // NEVER voided into a relaunch. The launch-unconfirmed journal record discriminates: without
+        // it, the crash happened before the launch call and voiding is safe; with it: escalate once.
+        const jr = await readJournal(root, id);
+        const ambiguous = jr.some((e) => e.type === "launch-unconfirmed" && (e as { specId?: string }).specId === a.specId && (e as { key?: string }).key === a.key);
+        if (ambiguous) {
+          const u = await applyEvent(root, id, { type: "launch-unresolved", specId: a.specId, key: a.key, evidence: `no ledger entry for key ${a.key}, but the launch was never confirmed: a run may be live` });
+          if (!u.ok) return { ...out, ok: false, error: u.error };
+          out.escalated!.push(a.specId);
+        } else {
+          await applyEvent(root, id, { type: "intent-void", specId: a.specId, key: a.key, reason: "the node has no run for this launch key: it never launched" });
+        }
+      }
       else if (r.state === "running" && r.runId) await applyEvent(root, id, { type: "dispatched", specId: a.specId, runId: r.runId, key: a.key });
       else if (r.state === "finished" && r.signals) {
         if (r.runId) await applyEvent(root, id, { type: "dispatched", specId: a.specId, runId: r.runId, key: a.key });
@@ -113,7 +129,7 @@ export async function tick(root: string, id: string, deps: TickDeps): Promise<Ti
       try { res = await deps.launch(a, intent.record); } catch (e) { res = { ok: false, error: (e as Error).message, ambiguous: true }; }
       if (res.ok) { await applyEvent(root, id, { type: "dispatched", specId: a.specId, runId: res.runId, key: a.key }); out.launched.push(a.specId); }
       else if (!res.ambiguous) await applyEvent(root, id, { type: "intent-void", specId: a.specId, key: a.key, reason: `launch refused: ${res.error.slice(0, 200)}` });
-      else await appendJournal(root, id, { type: "launch-unconfirmed", why: `launch of ${a.specId} may or may not have happened; will reconcile`, evidence: res.error.slice(0, 200) });
+      else await appendJournal(root, id, { type: "launch-unconfirmed", specId: a.specId, key: a.key, why: `launch of ${a.specId} may or may not have happened; will reconcile`, evidence: res.error.slice(0, 200) });
     } else {
       const seen = (await readJournalTypes(root, id)).has(`replan:${a.specId}:${a.evidence.slice(0, 40)}`);
       if (!seen) await appendJournal(root, id, { type: "replan-requested", why: "a spec needs a plan change: a human or the decomposer role must supply it", evidence: `${a.specId}: ${a.evidence.slice(0, 200)}` });
