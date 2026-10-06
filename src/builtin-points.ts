@@ -30,6 +30,11 @@ const parsed = parsePoints([
   // The question asks about CONVERGENCE (a good thing), so high probabilityTrue = converged.
   // The static fallback is the mechanical verdict, so the loop is never blind when S1 is down.
   cfg("progress.rubric", "Is this mission on track to satisfy its charter's success criteria, judging from the specs completed, their verification results, and the remaining work?", "on-track", "drifting"),
+  // Issue #304: is a task spec defined well enough for a worker to implement without making a
+  // design decision the author has not made? High probabilityTrue = READY (safe to dispatch).
+  // The safe default and uncertain action both push back with guidance, never silently dispatch:
+  // a low/uncertain score means "ask the author for the detail", which is the point of the gate.
+  cfg("readiness.dispatch", "Is this task spec defined well enough for a worker to implement without making a design decision the author has not made? It is ready when the goal states a concrete change, the deliverable is named, every design decision is made, acceptance is checkable, the verify gate tests that acceptance, and the scope is one task.", "needs-clarification", "needs-clarification"),
 ]);
 if (!parsed.ok) throw new Error(`built-in decision points are invalid: ${parsed.error}`);
 export const BUILTIN_POINTS: readonly DecisionPoint[] = parsed.points;

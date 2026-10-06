@@ -441,6 +441,24 @@ export function registerDispatchTools(api: OpenClawPluginApi, cfg: FleetConfig):
       if (noGate && gateMode === "enforce") {
         return jsonResult({ ok: false, error: "project.gate=enforce: this dispatch has no verification gate, so success would be just the process exit code. Pass a `spec` with `verify` (or `expect`), or set project.gate to advise/off." });
       }
+      // Issue #304: dispatch-readiness rubric. The DETERMINISTIC baseline runs for free (no model
+      // call on the cheap path) and ALWAYS returns actionable guidance when a criterion fails. The
+      // S1 `readiness.dispatch` point is additive evidence in shadow, logged alongside the baseline
+      // so `pointReport` can compare them before the point earns `enforce` (the #131/#234 ladder).
+      //
+      // This slice is ADVISORY ONLY: it reports `readiness` guidance and never refuses a dispatch.
+      // Refusal would stack a second enforce-path onto `project.gate: "enforce"` before the rubric
+      // has a calibration corpus — the ladder exists precisely to stop that. Promote to a refusal
+      // later, per-point, once the shadow data says the baseline (or S1) earns it.
+      let readiness: { ready: boolean; guidance: import("../readiness.js").Guidance[] } | undefined;
+      if (specCheck.spec && gateMode !== "off") {
+        const { readinessOf } = await import("../readiness.js");
+        readiness = readinessOf(specCheck.spec);
+        // Shadow: fire the S1 point (never blocks, never throws). Fire-and-forget so a slow or
+        // unavailable S1 never delays a dispatch.
+        const { shadowPoint } = await import("../builtin-points.js");
+        void shadowPoint(cfg.s1, "readiness.dispatch", { text: JSON.stringify({ goal: specCheck.spec.goal, acceptance: specCheck.spec.acceptance ?? [], verify: specCheck.spec.verify ?? null, scope: specCheck.spec.scope ?? null }) }, readiness.ready, rootDir);
+      }
       const dispatchWarnings: string[] = [];
       if (p.timeoutMs !== undefined && p.timeoutMs < 600_000 && (specCheck.spec?.acceptance?.length ?? 0) >= 2) {
         dispatchWarnings.push(`timeoutMs ${p.timeoutMs} is under 10 minutes for a spec with ${specCheck.spec!.acceptance!.length} acceptance criteria; the run will be killed at the limit with the work half-done. Omit timeoutMs for the 30-minute default.`);
@@ -452,6 +470,8 @@ export function registerDispatchTools(api: OpenClawPluginApi, cfg: FleetConfig):
       // result entirely. Report it alongside the dispatchable targets.
       if (staleNodes.length) results.staleNodes = staleNodes;
       if (design && design.verdict !== "accept") results.design = design;
+      // Issue #304: surface the readiness verdict + its actionable guidance (advise mode).
+      if (readiness && !readiness.ready) results.readiness = readiness;
       if (noGate && gateMode !== "off") results.verification = { gate: "none", note: "no verify gate: success is just the process exit code and is unchecked. Pass a `spec` with `verify` (or `expect`) so a run that exits 0 but did nothing is caught." };
       if (dispatchWarnings.length) results.warnings = dispatchWarnings;
       // Issue #87, slice 3: surface the opt-in routing decision — only when
