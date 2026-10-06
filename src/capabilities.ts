@@ -62,11 +62,18 @@ export interface NodeCapabilities {
    */
   isolationLevels?: string[];
   /**
-   * Build provenance: which CODE this node is actually running. A digest of the
-   * node's installed dist .js modules (not the entry stub, which never changes) —
-   * the manager can compare it to its own build to answer "merged but deployed?".
+   * Build provenance: which CODE this node is actually running (issue #191).
+   * `short` is the first 12 hex chars of the whole-dist code-tree digest of the
+   * node's installed plugin dist — the same scheme as build-provenance.ts
+   * digestOfDist (every `.js` under dist, sorted, `path\0sha\0…` with no
+   * trailing NUL, sha256 of the stream). Not the entry stub, which never
+   * changes. The manager compares it to its own build to answer "merged but
+   * deployed?" and to detect a stale node at a glance.
+   *
+   * null when the extension dir does not exist on the node — absent is
+   * NEVER reported as a fabricated digest.
    */
-  build?: { digest: string; short: string; modules: number };
+  build?: { short: string | null };
   error?: string;
 }
 
@@ -116,6 +123,23 @@ export async function detectNodeCapabilities(nodeHost: string, nodeName: string,
       // usable-ness, not mere presence).
       `echo "GITCLONE=$(git --version >/dev/null 2>&1 && echo yes || echo no)"`,
       `echo "BWRAP=$(bwrap --version >/dev/null 2>&1 && echo yes || echo no)"`,
+      // Build provenance (issue #191): the whole-dist code-tree digest of the
+      // node's installed plugin dist, computed ON the node within the SAME
+      // single SSH pass as every other fact. The byte scheme MUST match
+      // build-provenance.treeDigest EXACTLY (see src/issue191.test.ts: the
+      // shell digest is proven equal to treeDigest on a real fixture tree):
+      // every `.js` under dist, dist-relative paths sorted with `LC_ALL=C
+      // sort`, then sha256 of the stream `path\0sha\0path\0sha…` with NO
+      // trailing NUL (`head -c -1`). `sha256sum --` and hashing into `h`
+      // FIRST (never interpolating sha256sum's own "hash  filename" output)
+      // follow deploy.ts's verifyScript lessons: the filename must not leak
+      // into the payload, and `--` guards against option-like paths. The ext
+      // dir is probed by the outer `[ -d … ]`, not inside here.
+      `if [ ! -d "\${HOME}/.openclaw/extensions/opencode-fleet/dist" ]; then echo "BUILDPROV=MISSING"; ` +
+        `else echo "BUILDPROV=$(ROOT="\${HOME}/.openclaw/extensions/opencode-fleet/dist"; cd "\$ROOT" || echo MISSING; ` +
+        `find . -type f -name '*.js' | LC_ALL=C sort | ` +
+        `while IFS= read -r f; do h=\$(sha256sum -- "\$f"); h=\${h%% *}; printf '%s\\0%s\\0' "\${f#./}" "\$h"; done ` +
+        `| head -c -1 | sha256sum | awk '{print \$1}')"; fi`,
     ].join(" && ");
     const { stdout } = await execFileP("ssh", [...sshPrefix(nodeHost, SSH_ARGS), cmd], {
       timeout: 30_000,
@@ -162,6 +186,17 @@ export async function detectNodeCapabilities(nodeHost: string, nodeName: string,
         case "BWRAP":
           caps.bwrap = val === "yes";
           break;
+        case "BUILDPROV": {
+          // Issue #191: the probe echoes the FULL tree digest (the same wire
+          // format deploy.ts's verifyScript produces); the record carries the
+          // 12-char short form. The absent-dir sentinel (MISSING), a stray
+          // banner line, or an empty reply from a probe that never ran all
+          // degrade to null: only a well-formed digest is ever reported, and
+          // an ABSENT build is a fact — never a fabricated value.
+          const digest = /^[0-9a-f]{64}$/.test(val) ? val.slice(0, 12) : null;
+          caps.build = { short: digest };
+          break;
+        }
       }
     }
 
