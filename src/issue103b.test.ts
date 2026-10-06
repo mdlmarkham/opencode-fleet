@@ -313,3 +313,30 @@ describe("issue #103b: per-commit secret scan in fleet_sync", () => {
     await expect(secretsInCommits(seed, "does-not-exist", "HEAD")).rejects.toThrow();
   }, T);
 });
+describe("issue #103b follow-up: a merge is judged by its own resolution", () => {
+  it("merging a base that already contains a fixture token passes; a token only in the resolution is still refused", async () => {
+    const base = mkdtempSync(join(tmpdir(), "fleet103m-"));
+    try {
+      const repo = join(base, "r");
+      mkdirSync(repo);
+      git(repo, "init", "-q", "-b", "main");
+      commit(repo, "a.txt", "a\n", "init");
+      git(repo, "checkout", "-q", "-b", "worker");
+      commit(repo, "w.txt", "w\n", "worker work");
+      git(repo, "checkout", "-q", "main");
+      commit(repo, "fixture.txt", `TOKEN=${SECRET}\n`, "main gains a fixture token");
+      const baseTip = git(repo, "rev-parse", "main");
+      git(repo, "checkout", "-q", "worker");
+      git(repo, "merge", "-q", "--no-edit", "main");
+      await expect(secretsInCommits(repo, baseTip, "worker")).resolves.toBeUndefined();
+      // A resolution that adds a NEW token is still caught: it is new against both parents.
+      git(repo, "checkout", "-q", "-b", "worker2", "worker~1");
+      commit(repo, "w2.txt", "w2\n", "more work");
+      git(repo, "merge", "--no-commit", "--no-ff", "main");
+      writeFileSync(join(repo, "new.txt"), "TOKEN=ghp_zyxwvutsrqponmlkjihgfedcba9876543210\n");
+      git(repo, "add", "-A");
+      git(repo, "commit", "-q", "-m", "merge with new secret");
+      await expect(secretsInCommits(repo, baseTip, "worker2")).rejects.toThrow(/credential-shaped/);
+    } finally { rmSync(base, { recursive: true, force: true }); }
+  });
+});
