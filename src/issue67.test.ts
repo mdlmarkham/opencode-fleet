@@ -10,6 +10,7 @@ import { handleOpencodeRunPolicy, newProtocolCache, type PolicyCtx } from "./gat
 import { evaluateExpect, expectFileOk, parseExpectSpec, relayTimeoutWithGate, DEFAULT_EXPECT_COMMAND_TIMEOUT_MS } from "./verify.js";
 import { verifyGateScript } from "./node/runtime.js";
 import { checkSetup } from "./policy.js";
+import { gatewaySrc } from "./testkit/src.js";
 
 /** Running = exists and is not a zombie (a killed child whose parent never reaped it is still dead). */
 function running(pid: number): boolean {
@@ -265,7 +266,7 @@ describe("#70 review: the command rule holds at the policy chokepoint", () => {
     expect((await handleOpencodeRunPolicy(status.ctx, newProtocolCache())).ok).toBe(true);
   });
   it("the three tool schemas describe the rules that are actually enforced", () => {
-    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.ts"), "utf8");
+    const src = gatewaySrc();
     expect(src).not.toContain("absolute allowed");
     expect(src).not.toContain("bash -lc");
     // Issue #171: the three tools share ONE expect schema (expectParam), which states the enforced rules.

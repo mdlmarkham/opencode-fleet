@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { PROTOCOL_VERSION, SENTINEL_OPS, isSentinelPrompt, nodeProtocolOf, opFromPrompt, resolveOp, sentinelForOp, stampProtocol } from "./protocol.js";
 import { handleOpencodeRun } from "./node/handler.js";
 import { handleOpencodeRunPolicy, newProtocolCache, type PolicyCtx } from "./gateway-policy.js";
+import { gatewaySrc } from "./testkit/src.js";
 
 describe("issue #43: protocol op resolution", () => {
   it("maps every sentinel to an op and back", () => {
@@ -181,7 +182,7 @@ describe("issue #43: gateway policy", () => {
     expect(await handleOpencodeRunPolicy(runFail.ctx, newProtocolCache())).toEqual({ ok: false, message: "boom" });
   });
   it("fleet_dispatch rejects a task prompt that is a control sentinel", () => {
-    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.ts"), "utf8");
+    const src = gatewaySrc();
     expect(src).toContain("is reserved for node control messages");
   });
 });
