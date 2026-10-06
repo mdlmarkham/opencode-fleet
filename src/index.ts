@@ -874,6 +874,8 @@ export default definePluginEntry({
             ...(specCheck.spec ? { spec: specCheck.spec } : {}),
             // Issue #117: overrides are part of the run's record.
             ...(design?.acknowledged.length ? { gateAcknowledged: design.acknowledged } : {}),
+            // Issue #166: what the gate said at dispatch, as ids (no text), for the spec-quality view.
+            ...(design ? { design: { verdict: design.verdict, objectionIds: design.objections.map((o) => o.id) } } : {}),
             // Issue #39 (budget slice): the per-dispatch caps this run was admitted under,
             // so the day's accounting can show them; absent when no override was given.
             ...(overrideCheck.override ? { budgetCap: overrideCheck.override } : {}),
@@ -1395,7 +1397,7 @@ export default definePluginEntry({
       name: "fleet_capacity",
       label: "Fleet Capacity",
       description:
-        "Concurrency slots per node: the limit (node `maxConcurrent`, else `capacity.maxConcurrentPerNode`, else unlimited), the runs holding slots with their ages, free slots, and runs suspected stale (still `running` in the ledger past `capacity.staleAfterMs`, so no longer holding a slot; settle them with fleet_run_status or fleet_recover). A fleet_dispatch to a node at its limit returns a retryable `no-capacity` result instead of starting. Also shows today's budget: spent, remaining, and the per-dispatch caps a dispatch is admitted under, when a budget block is configured.",
+        "Concurrency slots per node: the limit (node `maxConcurrent`, else `capacity.maxConcurrentPerNode`, else unlimited), runs holding slots with ages, free slots, and runs suspected stale (still `running` past `capacity.staleAfterMs`; settle with fleet_run_status or fleet_recover). A dispatch to a full node returns a retryable `no-capacity`. Also today's budget (spent, remaining, per-dispatch caps) when configured.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -1534,6 +1536,28 @@ export default definePluginEntry({
     });
 
     api.registerTool({
+      name: "fleet_spec_quality",
+      label: "Fleet Spec Quality",
+      description:
+        "Which spec shapes fail: outcomes of finished spec runs (no-op, failed gate, failed, complete) by acceptance/verify/scope, gate verdict and objection id. Read-only, from the ledger; rates need minN runs.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          days: { type: "number", description: "Last N days (default all)." },
+          minN: { type: "number", description: "Min group size for a rate (default 10)." },
+        },
+      },
+      execute: async (_toolCallId, params) => {
+        const p = params as { days?: number; minN?: number };
+        const { loadLedger } = await import("./ledger.js");
+        const { qualityReport } = await import("./spec-quality.js");
+        const sinceMs = typeof p.days === "number" && p.days > 0 ? Date.now() - p.days * 86_400_000 : undefined;
+        return jsonResult({ ok: true, ...qualityReport(await loadLedger(api.rootDir ?? process.cwd()), { ...(sinceMs !== undefined ? { sinceMs } : {}), ...(p.minN !== undefined ? { minN: p.minN } : {}) }) });
+      },
+    });
+
+    api.registerTool({
       name: "fleet_run_report",
       label: "Fleet Run Report",
       description:
@@ -1662,6 +1686,8 @@ export default definePluginEntry({
             // Issue #39: usage rides the ledger once, from the manifest; the run's own
             // startedAt attributes it to its day. A recorded entry keeps its usage.
             ...(usage && !alreadyCounted ? { usage } : {}),
+            // Issue #166: a captured change list (null = capture missing, never "no changes").
+            ...(Array.isArray((st.manifest as { filesChanged?: unknown } | undefined)?.filesChanged) ? { filesChanged: ((st.manifest as { filesChanged: unknown[] }).filesChanged).length } : {}),
             summary:
               state === "failed" && !st.finishedAt
                 ? "worker process died without completion record (silent death)"
@@ -1720,7 +1746,7 @@ export default definePluginEntry({
       name: "fleet_run_status",
       label: "Fleet Run Status",
       description:
-        "Poll a detached fleet run: liveness, state (running/finished/aborted), exit code, and final output when complete. Reconciles the run ledger on terminal state. Use with the runId returned by an async fleet_dispatch; also detects the issue-#6 inconsistent state (ledger says running, no live process, no completion record).",
+        "Poll a detached run: liveness, state, exit code, final output when complete. Reconciles the ledger on terminal state and detects the inconsistent state (ledger running, no live process, no completion record).",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -2719,7 +2745,7 @@ export default definePluginEntry({
       name: "fleet_recipe_recommend",
       label: "Fleet Recipe Recommend",
       description:
-        "Recommend the best (model, thinking, agent, transport) combo for a task type + codebase, learned from past outcomes. Gives agents knobs to turn for speed / token efficiency: use a light model for simple tasks, a heavier model for complex ones, and a review-grade model for review. Returns the recommended combo and whether it was learned or a default.",
+        "Recommend a (model, thinking, agent, transport) combo for a task type + codebase, learned from past outcomes: light model for simple tasks, heavier for complex, review-grade for review. Says whether it was learned or a default.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -3034,7 +3060,7 @@ export default definePluginEntry({
       name: "fleet_capabilities",
       label: "Fleet Capabilities",
       description:
-        "Detect and report each fleet node's capabilities (CPU, RAM, disk, GPU, installed tools, available models, and whether the issue-#51 deny-rule baseline is installed in the node's opencode config, as denyBaseline). also reports per-node isolation capabilities: gitClone (a working git), bwrap (bubblewrap present AND usable — a broken install counts as absent), and isolationLevels (e.g. ['clone','bwrap']) — fleet_dispatch refuses an isolation level the node does not list. Use this to route work to nodes that can handle it, especially when nodes have diverging capabilities.",
+        "Report each node's capabilities: CPU, RAM, disk, GPU, installed tools, models, denyBaseline (whether the deny-rule baseline is installed), and isolation support: gitClone, bwrap (present AND usable), isolationLevels (fleet_dispatch refuses a level the node does not list). Use to route work to capable nodes.",
       parameters: {
         type: "object",
         additionalProperties: false,
