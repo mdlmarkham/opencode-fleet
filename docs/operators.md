@@ -238,6 +238,16 @@ Line references are to the emitting module so you can confirm in place.
 | `refusing to dispatch: cwd <cwd> is unusable — it is not traversable by the worker principal (<svcUser>) (a /root path is mode 0700 …)` (`src/tools/dispatch.ts`, pre-dispatch cwd check) | The dispatch cwd is invisible to the worker principal — the classic "provision into /root" mistake, caught before a run is recorded. | Provision into a path both principals can enter (e.g. `<fleetRoot>/<repo>`; the error names an example). See `docs/STAGING.md` for the ownership hand-over rules. |
 | `refused: cwd <cwd> is outside the allowed workspace roots (…)` (`src/guard.ts` `checkCwd`, node-side) | The requested cwd is not a strict descendant of any root in the node's `FLEET_ALLOWED_ROOTS` (or *is* an allowed root — those are refused too, a destructive op on a root would wipe the workspace). | Put the checkout under an allowed root, or add the intended root to `FLEET_ALLOWED_ROOTS` on the node and restart its service. |
 
+## A new tool is not landed until agents can call it
+
+The host filters each agent's tools through `agents.entries.<id>.tools.allow` in `openclaw.json`. An allow array written before a tool existed silently hides that tool from the agent: the plugin registers it, the manifest lists it, and no session ever sees it (ten mission/project tools were invisible this way until the arrays were updated). After every `fleet_deploy` or upgrade, run:
+
+```
+npm run tools:check-allow -- /path/to/openclaw.json
+```
+
+It exits 0 when every agent that allows any `fleet_*` tool can call every tool in the manifest's `contracts.tools`, 1 on drift (it lists, per agent, the tools it cannot call and any `fleet_*` entries naming a tool that no longer exists), and 2 on unreadable input. Agents that allow no `fleet_*` tool are not fleet agents and are left alone; a `*` or `fleet_*` entry covers everything. The check is read-only and never edits the config: adding the names is an operator action.
+
 ## Packaging
 
 - **Build:** `npm run plugin:build` = `tsc -p tsconfig.json` +
