@@ -51,3 +51,19 @@ the labelled set changes materially. Commit the dated report alongside the data.
 Synthetic secrets (`ghp_…`, `xoxb-…`, keys) are stored with a `⟦⟧` marker spliced
 in so repository secret scanning does not block the push; `loadLabelled` removes
 it. Keep that convention when adding more.
+
+## Reviewer calibration corpus (issue #127)
+
+`reviewer-corpus.json` is a versioned corpus for `src/reviewer-calibration.ts` (`loadCorpus`, `scoreReviewers`,
+`buildReport`, `meetsBar`). It is derived from this repo's own history, so every case is checkable:
+
+- **planted** (6): the diff of the commit that *introduced* a defect later fixed (`git diff <introducer>^ <introducer>`,
+  non-test `src/` files only: that is what a reviewer is shown), with `baseCommit` = the introducer's parent. `expected`
+  names the file and the line in the introducing version (taken by `git blame` of the lines the fix changed) and the defect
+  in words; `source` names the introducer and the repairing commit.
+- **clean** (5): the repairing commits themselves (diff of `<fix>^ <fix>`), each correct and accepted in review, with a
+  `scary` note on why a reviewer might object. A repair is not proof of absence of every defect; a flagged clean case should
+  be looked at before it is counted against a reviewer, and labels need a human pass like the S1 set above.
+
+Running the configured reviewers over it is the live part (it needs a reviewer endpoint); the scorer takes the findings.
+Extend it with escaped defects via `caseFromEscapedDefect`.
