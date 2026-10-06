@@ -247,6 +247,73 @@ export async function mirrorToRepo(root: string, id: string, repoDir: string): P
   return { ok: true, path: dest };
 }
 
+/**
+ * Issue #249: materialize a mission's design as reviewable artifact FILES in the
+ * project checkout — `.fleet/missions/<id>/plan.md` and `tasks.md` — so an
+ * operator can approve a design from the files alone, not from a chat summary or
+ * the record.json. Returns the sha256 of each file so the approval can pin which
+ * revision was approved.
+ *
+ * Pure formatting from the record (no model calls); the files are derived data,
+ * regenerated from the record. Never overwrites an existing `.fleet/missions/<id>`
+ * that is a symlink (the mirror path's guard).
+ */
+export async function materializeDesign(repoDir: string, id: string): Promise<{ ok: true; written: string[]; planSha: string; tasksSha: string } | { ok: false; error: string }> {
+  const m = await loadMission(repoDir, id);
+  if (!m.ok) return m;
+  const rec = m.record;
+  const dest = join(repoDir, ".fleet", "missions", id);
+  for (const p of [join(repoDir, ".fleet"), join(repoDir, ".fleet", "missions"), dest]) {
+    try { if ((await lstat(p)).isSymbolicLink()) return { ok: false, error: `${p} is a symlink; refusing` }; } catch { /* absent */ }
+  }
+  const specs = Object.values(rec.supervisor?.specs ?? {}) as Array<{ spec: { id: string; goal: string; deps?: string[]; task?: { acceptance?: string[]; verify?: { command?: string; commands?: string[]; files?: string[] }; scope?: { files?: string[] } } } }>;
+  const plan = [
+    `# Mission plan — ${rec.missionId}`,
+    "",
+    `Phase: ${rec.phase}  ·  plan version: ${rec.planVersion}`,
+    rec.charterRef ? `Charter: ${rec.charterRef}` : "Charter: (none recorded)",
+    "",
+    "## Goal",
+    ...(rec.designRef ? [rec.designRef] : ["(no design note recorded; see the mission journal for the plan's reasoning)"]),
+    "",
+    "## Specs",
+    ...specs.map((st) => `- **${st.spec.id}** — ${st.spec.goal}${st.spec.deps && st.spec.deps.length ? ` (depends on: ${st.spec.deps.join(", ")})` : ""}`),
+    "",
+    "## Risks",
+    ...(rec.risks.length ? rec.risks.map((r: { text: string; severity: string }) => `- [${r.severity}] ${r.text}`) : ["(none recorded)"]),
+    "",
+    "## Riskiest assumptions",
+    ...(rec.assumptions.length ? rec.assumptions.map((a: { text: string; status: string }) => `- (${a.status}) ${a.text}`) : ["(none recorded)"]),
+    "",
+    "## Open questions",
+    ...(rec.openQuestions.length ? rec.openQuestions.map((q: string) => `- ${q}`) : ["(none)"]),
+    "",
+  ].join("\n");
+  const tasks = [
+    `# Mission tasks — ${rec.missionId}`,
+    "",
+    `${specs.length} spec(s). Each is dispatched in its own clone and must pass its verify gate.`,
+    "",
+    "| id | goal | deps | scope | acceptance | verify |",
+    "| --- | --- | --- | --- | --- | --- |",
+    ...specs.map((st) => {
+      const s = st.spec;
+      const t = s.task ?? {};
+      const scope = t.scope?.files?.join(" ") ?? "—";
+      const accept = t.acceptance?.join("; ") ?? "—";
+      const verify = t.verify?.command ?? t.verify?.commands?.join(" && ") ?? (t.verify?.files?.length ? `files: ${t.verify.files.join(" ")}` : "—");
+      return `| ${s.id} | ${s.goal} | ${(s.deps ?? []).join(", ") || "—"} | ${scope} | ${accept} | ${verify} |`;
+    }),
+    "",
+  ].join("\n");
+  const { createHash } = await import("node:crypto");
+  const sha = (s: string): string => createHash("sha256").update(s).digest("hex");
+  await mkdir(dest, { recursive: true });
+  await writeFile(join(dest, "plan.md"), plan);
+  await writeFile(join(dest, "tasks.md"), tasks);
+  return { ok: true, written: [`.fleet/missions/${id}/plan.md`, `.fleet/missions/${id}/tasks.md`], planSha: sha(plan), tasksSha: sha(tasks) };
+}
+
 export async function listMissions(root: string): Promise<Array<{ missionId: string; phase?: Phase; rev?: number; error?: string }>> {
   const { readdir } = await import("node:fs/promises");
   let names: string[] = [];
