@@ -46,3 +46,19 @@ export function renderAllowReport(r: AllowReport): string {
   if (r.skipped.length) L.push(`  (not fleet agents, left alone: ${r.skipped.join(", ")})`);
   return L.join("\n");
 }
+
+export type DeployAllow = { checked: false; reason: string } | { checked: true; ok: boolean; agents: AllowFinding[]; skipped: string[]; summary: string };
+
+/**
+ * The parity report for a deploy (issue #289): read-only, never edits the host config, and never throws.
+ * An absent/unreadable config or manifest reports `checked: false` with the reason, so a deploy is never failed by it.
+ */
+export async function toolAllowForDeploy(configPath: string, manifestPath: string, read: (p: string) => Promise<string>): Promise<DeployAllow> {
+  let config: unknown;
+  try { config = JSON.parse(await read(configPath)); } catch (e) { return { checked: false, reason: `cannot read ${configPath}: ${(e as Error).message}`.slice(0, 200) }; }
+  let tools: unknown;
+  try { tools = (JSON.parse(await read(manifestPath)) as { contracts?: { tools?: unknown } }).contracts?.tools; } catch (e) { return { checked: false, reason: `cannot read ${manifestPath}: ${(e as Error).message}`.slice(0, 200) }; }
+  if (!Array.isArray(tools) || tools.length === 0 || !tools.every((t) => typeof t === "string")) return { checked: false, reason: "the manifest has no contracts.tools" };
+  const r = checkToolAllow(config, tools as string[]);
+  return { checked: true, ok: r.ok, agents: r.agents, skipped: r.skipped, summary: renderAllowReport(r) };
+}

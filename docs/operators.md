@@ -246,7 +246,7 @@ The host filters each agent's tools through `agents.entries.<id>.tools.allow` in
 npm run tools:check-allow -- /path/to/openclaw.json
 ```
 
-It exits 0 when every agent that allows any `fleet_*` tool can call every tool in the manifest's `contracts.tools`, 1 on drift (it lists, per agent, the tools it cannot call and any `fleet_*` entries naming a tool that no longer exists), and 2 on unreadable input. Agents that allow no `fleet_*` tool are not fleet agents and are left alone; a `*` or `fleet_*` entry covers everything. The check is read-only and never edits the config: adding the names is an operator action.
+It exits 0 when every agent that allows any `fleet_*` tool can call every tool in the manifest's `contracts.tools`, 1 on drift (it lists, per agent, the tools it cannot call and any `fleet_*` entries naming a tool that no longer exists), and 2 on unreadable input. Agents that allow no `fleet_*` tool are not fleet agents and are left alone; a `*` or `fleet_*` entry covers everything. The check is read-only and never edits the config: adding the names is an operator action. `fleet_deploy` also runs it and attaches the result as `toolAllow` (`{checked:false, reason}` when `~/.openclaw/openclaw.json`, or `$OPENCLAW_CONFIG_PATH`, cannot be read); drift never fails the deploy.
 
 ## Packaging
 
