@@ -46,6 +46,8 @@ import type { S1RouteDecision, S1RouteHarnessResult } from "./s1-wire.js";
  */
 
 interface FleetConfig {
+  /** Issue #238: where the plugin REPO checkout (package.json) lives on this host, used as fleet_deploy's default pluginDir when the installed plugin dir is not the repo. */
+  deploy?: { pluginDir?: string };
   defaultTransport?: "http" | "acp";
   nodePrefixes?: string[];
   defaultTimeoutMs?: number;
@@ -2984,7 +2986,7 @@ export default definePluginEntry({
           if (svc) nodeUsers[host] = svc;
           if (n.member?.user) nodeLoginUsers[host] = n.member.user;
         }
-        const pluginDir = p.pluginDir ?? join(api.rootDir ?? process.cwd(), "..");
+        const pluginDir = p.pluginDir ?? (cfg.deploy?.pluginDir || join(api.rootDir ?? process.cwd(), ".."));
         const r = await deployPlugin({
           pluginDir,
           nodes: hosts,
