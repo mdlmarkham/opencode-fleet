@@ -13,7 +13,7 @@ export interface FleetConfig {
   /** Node-side private state dir (issue #103 group c); env FLEET_STATE_DIR still overrides. */
   stateDir?: string;
   /** Dispatch target policy (issue #168). */
-  dispatch?: { defaultTarget?: "all" };
+  dispatch?: { defaultTarget?: "all"; piMinVersion?: string };
   /** Opt-in (issue #189): commits made in a provisioned checkout carry this identity (set in the checkout's local git config, only when it has none). */
   workerGitIdentity?: { name?: string; email?: string };
   apertureUrl?: string;
