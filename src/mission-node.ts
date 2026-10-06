@@ -27,7 +27,7 @@ export interface World {
   status(node: string, runId: string): Promise<void>;
   nowMs(): number;
   /** Publish one verified spec (issue #251); absent = the loop does not publish. */
-  publish?(specId: string, record: MissionRecord): Promise<PublishResult>;
+  publish?(specId: string, record: MissionRecord, ctx: { resume: boolean }): Promise<PublishResult>;
 }
 
 // Issue #244 review fix: `timed-out` is terminal for the mission loop (a wall-clocked run must
@@ -111,7 +111,7 @@ export function nodeDeps(root: string, record: MissionRecord, world: World, extr
       }
       return out;
     },
-    ...(world.publish ? { publish: (id: string, r: MissionRecord) => world.publish!(id, r) } : {}),
+    ...(world.publish ? { publish: (id: string, r: MissionRecord, ctx: { resume: boolean }) => world.publish!(id, r, ctx) } : {}),
     ...extra,
   };
 }

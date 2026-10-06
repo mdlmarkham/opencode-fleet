@@ -100,6 +100,29 @@ describe("#251: each verified spec is published during the loop", () => {
     expect((await rec()).publications).toBeUndefined();
   });
 
+  it("the intent is persisted BEFORE publishing, and a crash mid-publish resumes (never blindly republishes)", async () => {
+    await start();
+    const seen: Array<{ id: string; state: string | undefined; resume: boolean }> = [];
+    let crashOnce = true;
+    const { finished, deps } = harness(async (id, record, ctx) => {
+      seen.push({ id, state: record.publications?.[id]?.state, resume: ctx.resume });
+      if (crashOnce) { crashOnce = false; throw new Error("process died after the remote publish"); }
+      return { ok: true, ref: "found-existing" };
+    });
+    await tick(root, "m1", deps);
+    finished.a = { signals: OK as never };
+    await tick(root, "m1", deps);
+    // The call saw the durable intent; a throw is recorded as a failure, not a publication.
+    expect(seen[0]).toEqual({ id: "a", state: "publishing", resume: false });
+    expect((await rec()).publications!.a).toMatchObject({ state: "failed", failures: 1 });
+    // A real crash leaves `publishing` on disk: simulate it and check the next call resumes.
+    const { updateMission } = await import("./mission-store.js");
+    await updateMission(root, "m1", (r) => ({ ...r, publications: { ...r.publications, a: { state: "publishing", failures: 0, at: "t" } } }));
+    await tick(root, "m1", deps);
+    expect(seen[seen.length - 1]).toMatchObject({ id: "a", resume: true });
+    expect((await rec()).publications!.a).toMatchObject({ state: "published", ref: "found-existing" });
+  });
+
   it("the record validator keeps publications and refuses a malformed entry", async () => {
     await start();
     const r = await rec();

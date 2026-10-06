@@ -38,7 +38,7 @@ export interface Risk { id: string; text: string; severity: "low" | "medium" | "
 export interface PlanDiff { version: number; at: string; summary: string }
 
 /** Per-spec publication state (issue #251): a verified spec is published once, in dependency order. */
-export interface Publication { state: "published" | "failed" | "escalated"; ref?: string; failures: number; lastError?: string; at: string }
+export interface Publication { state: "publishing" | "published" | "failed" | "escalated"; ref?: string; failures: number; lastError?: string; at: string }
 
 export interface MissionRecord {
   schemaVersion: number;
@@ -93,7 +93,7 @@ export function validateRecord(raw: unknown): Loaded {
     const pubs = raw.publications;
     if (!isRec(pubs) || Object.keys(pubs).length > MAX_SPECS) return { ok: false, error: "bad publications" };
     for (const [id, v] of Object.entries(pubs)) {
-      if (!isRec(v) || !["published", "failed", "escalated"].includes(String(v.state)) || !Number.isInteger(v.failures) || (v.failures as number) < 0 || typeof v.at !== "string" || (v.ref !== undefined && typeof v.ref !== "string") || (v.lastError !== undefined && typeof v.lastError !== "string")) return { ok: false, error: `bad publication entry for ${id}` };
+      if (!isRec(v) || !["publishing", "published", "failed", "escalated"].includes(String(v.state)) || !Number.isInteger(v.failures) || (v.failures as number) < 0 || typeof v.at !== "string" || (v.ref !== undefined && typeof v.ref !== "string") || (v.lastError !== undefined && typeof v.lastError !== "string")) return { ok: false, error: `bad publication entry for ${id}` };
     }
   }
   const sup = raw.supervisor;

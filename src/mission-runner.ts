@@ -37,8 +37,11 @@ export interface TickDeps {
    * Publish one verified spec (issue #251: the repo stays current per verified run): sync it to the mission
    * branch and open/update the mission PR through the normal reviewed-head gates. Absent = no publication.
    * A refusal (review FAIL, sync refuse) is `{ok:false}`; `retryable:false` escalates at once.
+   * The intent is persisted BEFORE the call (`publishing`), so after a crash the next tick calls again with
+   * `resume: true`: the adapter must then look for an existing publication of this spec and return it instead
+   * of publishing a second time (find the PR/branch by the spec id), exactly like launch reconcile.
    */
-  publish?: (specId: string, record: MissionRecord) => Promise<PublishResult>;
+  publish?: (specId: string, record: MissionRecord, ctx: { resume: boolean }) => Promise<PublishResult>;
 }
 
 export type PublishResult = { ok: true; ref: string } | { ok: false; error: string; retryable?: boolean };
@@ -215,9 +218,13 @@ async function publishReady(root: string, id: string, publish: NonNullable<TickD
     const next = ready[0];
     if (!next) return;
     const specId = next.spec.id;
-    let res: PublishResult;
-    try { res = await publish(specId, m.record); } catch (e) { res = { ok: false, error: (e as Error).message }; }
     const prev = pubs[specId];
+    // Intent first, durably: a crash between a successful publish and the record write must not publish twice.
+    const resume = prev?.state === "publishing";
+    const marked = await updateMission(root, id, (r) => ({ ...r, publications: { ...(r.publications ?? {}), [specId]: { state: "publishing" as const, failures: prev?.failures ?? 0, at: new Date().toISOString(), ...(prev?.lastError ? { lastError: prev.lastError } : {}) } } }));
+    if (!marked.ok) return;
+    let res: PublishResult;
+    try { res = await publish(specId, marked.record, { resume }); } catch (e) { res = { ok: false, error: (e as Error).message }; }
     const at = new Date().toISOString();
     const entry: Publication = res.ok
       ? { state: "published", ref: res.ref.slice(0, 300), failures: prev?.failures ?? 0, at }
