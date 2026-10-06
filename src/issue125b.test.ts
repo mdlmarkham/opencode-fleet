@@ -64,13 +64,19 @@ describe("#125: durable tick", () => {
     expect(r.launched).toEqual([]);
     expect((await rec()).supervisor.specs.a).toMatchObject({ status: "dispatching", attempts: 1 });
     expect((await readJournal(root, "m1")).some((e) => e.type === "launch-unconfirmed")).toBe(true);
-    // next tick: the node has no run for the key, so the intent is voided, then the spec relaunches under a fresh attempt
+    // Issue #244 review fix: a crash MID-LAUNCH is ambiguous — the node may be running it. The next
+    // tick reconciles but must NEVER void the intent into a relaunch: it escalates once for a human.
+    // (The old pin expected void+relaunch here — precisely the double-dispatch defect the independent
+    // review reproduced; see issue125d.test.ts for the recovery matrix.)
     const r2 = await tick(root, "m1", deps);
     expect(r2.reconciled).toEqual(["a"]);
-    expect(w.launches).toHaveLength(0); // reconcile never relaunches in the same pass
+    expect(w.launches).toHaveLength(0); // reconcile never relaunches
     const r3 = await tick(root, "m1", deps);
-    expect(r3.launched).toEqual(["a"]);
-    expect((await rec()).supervisor.specs.a!.attempts).toBe(1);
+    expect(r3.launched).toEqual([]); // an ambiguous launch is never retried by the loop
+    const spec = (await rec()).supervisor.specs.a!;
+    expect(spec.status).toBe("escalated");
+    expect(spec.attempts).toBe(1);
+    expect((await readJournal(root, "m1")).some((e) => e.type === "launch-unresolved")).toBe(true);
   });
   it("reconcile finds a run that DID launch and adopts it instead of relaunching", async () => {
     await start();

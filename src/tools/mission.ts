@@ -1,8 +1,13 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { jsonResult } from "openclaw/plugin-sdk/core";
-import { type FleetConfig, payloadOf } from "./shared.js";
+import { type FleetConfig, payloadOf, internalMissionCalls } from "./shared.js";
 
-export function registerMissionTools(api: OpenClawPluginApi, cfg: FleetConfig): void {
+export function registerMissionTools(
+  api: OpenClawPluginApi,
+  cfg: FleetConfig,
+  deps: { dispatchTool: { execute: (toolCallId: string, params: never, signal?: AbortSignal) => Promise<unknown> }; runStatusExecute: (toolCallId: string, params: unknown, signal?: AbortSignal) => Promise<unknown> },
+): void {
+  const { dispatchTool, runStatusExecute } = deps;
   api.registerTool({
     name: "fleet_mission_project",
     label: "Fleet Mission Project",
@@ -28,6 +33,82 @@ export function registerMissionTools(api: OpenClawPluginApi, cfg: FleetConfig): 
       let transport;
       try { transport = proj.restTransport(repo, token, (globalThis as unknown as { fetch: never }).fetch); } catch (e) { return jsonResult({ ok: false, error: (e as Error).message }); }
       return jsonResult(await proj.flushProjection(root, m.record, p.issue, transport, [token]));
+    },
+  });
+
+  api.registerTool({
+    name: "fleet_mission_run",
+    label: "Fleet Mission Run",
+    description:
+      "Run a durable mission step by step: `create` {specs:[{id, goal, deps?, task}], cwd, nodes?}, `approve:true` (the human go-ahead), then each call runs `ticks` loop steps: finish runs, launch ready specs via fleet_dispatch (clone isolation), halt on an exhausted budget. Failures escalate and block with evidence; see fleet_mission_show.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        missionId: { type: "string", description: "Mission id." },
+        create: { type: "object", description: "{specs, cwd, nodes?}; each task needs acceptance, verify, scope; scopes disjoint." },
+        approve: { type: "boolean", description: "Human approval to execute. Never infer it." },
+        ticks: { type: "number", description: "Steps now (1-5, default 1)." },
+      },
+      required: ["missionId"],
+    },
+    execute: async (_toolCallId, params, signal) => {
+      const p = params as { missionId: string; create?: { specs?: unknown; cwd?: string; nodes?: string[] }; approve?: boolean; ticks?: number };
+            const root = api.rootDir ?? process.cwd();
+      const store = await import("../mission-store.js");
+      if (p.create !== undefined) {
+        const { validateBacklog } = await import("../project-start.js");
+        const c = p.create;
+        if (!Array.isArray(c.specs) || typeof c.cwd !== "string" || !c.cwd.startsWith("/")) return jsonResult({ ok: false, error: "create needs specs[] and an absolute cwd" });
+        const check = validateBacklog((c.specs as Array<{ task?: unknown }>).map((x) => x.task));
+        if (!check.ok) return jsonResult({ ok: false, error: "the specs are not ready to run", backlog: check });
+        const specs = (c.specs as Array<{ id: string; goal: string; deps?: string[]; task: { scope?: { files: string[] } } }>).map((x) => ({ id: String(x.id), goal: String(x.goal ?? ""), deps: Array.isArray(x.deps) ? x.deps.map(String) : [], task: x.task, ...(x.task.scope ? { scope: x.task.scope } : {}) }));
+        const made = await store.createMission(root, p.missionId, specs, { target: { cwd: c.cwd, ...(Array.isArray(c.nodes) ? { nodes: c.nodes.map(String) } : {}) } });
+        if (!made.ok) return jsonResult({ ok: false, error: made.error });
+      }
+      const loaded = await store.loadMission(root, p.missionId);
+      if (!loaded.ok) return jsonResult({ ok: false, error: loaded.error });
+      if (p.approve === true) {
+        if (loaded.record.phase === "designing") { const a = await store.setPhase(root, p.missionId, "awaiting-approval", "plan submitted"); if (!a.ok) return jsonResult({ ok: false, error: a.error }); }
+        const b = await store.setPhase(root, p.missionId, "executing", "approved by the caller (human go-ahead)");
+        if (!b.ok) return jsonResult({ ok: false, error: b.error });
+      }
+      const { tick } = await import("../mission-runner.js");
+      const { nodeDeps } = await import("../mission-node.js");
+      const { loadLedger } = await import("../ledger.js");
+      const { parseBudgetConfig, budgetCheck: checkBudget } = await import("../budget.js");
+      const decode = (res: unknown): Record<string, unknown> => {
+        const r = res as { details?: unknown; content?: Array<{ text?: string }> };
+        if (r?.details && typeof r.details === "object") return r.details as Record<string, unknown>;
+        const text = r?.content?.[0]?.text;
+        if (typeof text === "string") { try { return JSON.parse(text) as Record<string, unknown>; } catch { return { error: text.slice(0, 200) }; } }
+        return {};
+      };
+      const world = {
+        nodes: async () => { const l = await api.runtime.nodes.list(); const names = (l.nodes ?? []).filter((n) => n.connected !== false).map((n) => n.displayName ?? n.nodeId); const nodesCfg = (cfg as { nodes?: Record<string, unknown> }).nodes; const cfgd = nodesCfg ? Object.keys(nodesCfg) : []; return cfgd.length ? names.filter((n) => cfgd.includes(n)) : names; },
+        limitFor: (n: string) => ((cfg as { nodes?: Record<string, { maxConcurrent?: number }> }).nodes)?.[n]?.maxConcurrent ?? cfg.capacity?.maxConcurrentPerNode,
+        ledger: () => loadLedger(root),
+        dispatch: async (params: Record<string, unknown>) => { internalMissionCalls.add(params); return decode(await dispatchTool.execute("mission", params as never, signal)); },
+        status: async (node: string, runId: string) => { await runStatusExecute("mission", { node, runId, includeOutput: false }, signal); },
+        nowMs: () => Date.now(),
+      };
+      const budget = parseBudgetConfig(cfg.budget);
+      const guard = async () => {
+        if (!budget.ok || !budget.config) return [];
+        const v = checkBudget(await loadLedger(root), budget.config, new Date().toISOString());
+        return v.allowed ? [] : [{ kind: "budget-exhausted", evidence: String(v.reason ?? "budget exhausted") }];
+      };
+      const n = Math.min(5, Math.max(1, Math.floor(typeof p.ticks === "number" ? p.ticks : 1)));
+      const results = [];
+      for (let i = 0; i < n; i++) {
+        const m = await store.loadMission(root, p.missionId);
+        if (!m.ok) return jsonResult({ ok: false, error: m.error });
+        const r = await tick(root, p.missionId, nodeDeps(root, m.record, world, { guard }));
+        results.push(r);
+        if (r.skipped || r.halted || r.phase !== "executing" || !r.ok) break;
+        if (r.launched.length === 0 && r.outcomes.length === 0) break;
+      }
+      return jsonResult({ ok: results.every((r) => r.ok), ticks: results });
     },
   });
 

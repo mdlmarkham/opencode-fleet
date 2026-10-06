@@ -11,10 +11,10 @@ import { isSentinelPrompt } from "../protocol.js";
 import { parseBudgetConfig } from "../budget.js";
 import type { TriageResult } from "../s1-hooks.js";
 import type { S1RouteDecision, S1RouteHarnessResult } from "../s1-wire.js";
-import { type FleetConfig, expectParam, payloadOf } from "./shared.js";
+import { type FleetConfig, expectParam, payloadOf, internalMissionCalls } from "./shared.js";
 
-export function registerDispatchTools(api: OpenClawPluginApi, cfg: FleetConfig): void {
-  api.registerTool({
+export function registerDispatchTools(api: OpenClawPluginApi, cfg: FleetConfig): { dispatchTool: { execute: (toolCallId: string, params: never, signal?: AbortSignal) => Promise<unknown> } } {
+  const dispatchTool: Parameters<typeof api.registerTool>[0] = {
     name: "fleet_dispatch",
     label: "Fleet Dispatch",
     description:
@@ -119,6 +119,7 @@ export function registerDispatchTools(api: OpenClawPluginApi, cfg: FleetConfig):
         piOffline?: boolean;
         piJson?: boolean;
         acknowledge?: unknown;
+        missionKey?: string;
         model?: string;
         agent?: string;
         autoApprove?: boolean;
@@ -591,6 +592,7 @@ export function registerDispatchTools(api: OpenClawPluginApi, cfg: FleetConfig):
           ...(specCheck.spec ? { spec: specCheck.spec } : {}),
           // Issue #117: overrides are part of the run's record.
           ...(design?.acknowledged.length ? { gateAcknowledged: design.acknowledged } : {}),
+          ...(internalMissionCalls.has(rawParams as object) && typeof raw.missionKey === "string" && raw.missionKey.length <= 160 ? { missionKey: raw.missionKey } : {}),
           // Issue #166: what the gate said at dispatch, as ids (no text), for the spec-quality view.
           ...(design ? { design: { verdict: design.verdict, objectionIds: design.objections.map((o) => o.id) } } : {}),
           // Issue #39 (budget slice): the per-dispatch caps this run was admitted under,
@@ -922,7 +924,8 @@ export function registerDispatchTools(api: OpenClawPluginApi, cfg: FleetConfig):
       }
       return jsonResult(results);
     },
-  });
+  };
+  api.registerTool(dispatchTool);
 
   api.registerTool({
     name: "fleet_resume",
@@ -1016,4 +1019,5 @@ export function registerDispatchTools(api: OpenClawPluginApi, cfg: FleetConfig):
       });
     },
   });
+  return { dispatchTool };
 }

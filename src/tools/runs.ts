@@ -6,7 +6,7 @@ import { sanitizeQuestion } from "../untrusted.js";
 import { checkSetup } from "../policy.js";
 import { type FleetConfig, expectParam, payloadOf } from "./shared.js";
 
-export function registerRunsTools(api: OpenClawPluginApi, cfg: FleetConfig): void {
+export function registerRunsTools(api: OpenClawPluginApi, cfg: FleetConfig): { runStatusExecute: (toolCallId: string, params: unknown, signal?: AbortSignal) => Promise<unknown> } {
   api.registerTool({
     name: "fleet_run_report",
     label: "Fleet Run Report",
@@ -628,4 +628,5 @@ export function registerRunsTools(api: OpenClawPluginApi, cfg: FleetConfig): voi
       return jsonResult(inv);
     },
   });
+  return { runStatusExecute };
 }

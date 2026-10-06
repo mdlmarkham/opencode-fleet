@@ -68,6 +68,8 @@ export interface LedgerEntry {
   scopeViolations?: string[] | null;
   /** Design-gate objections the caller acknowledged to dispatch anyway (issue #117), with their reasons. */
   gateAcknowledged?: Array<{ objectionId: string; reason: string }>;
+  /** The mission loop's launch key for this run (mission:spec:attempt), so a crashed launch can be reconciled from the ledger. */
+  missionKey?: string;
   /** The design gate's verdict and the objection ids that fired at dispatch (issue #166): ids only, never text. */
   design?: { verdict: string; objectionIds: string[] };
   /** How many files the run changed against its start commit, from the audit manifest at reconcile (issue #166). Absent: never captured. */

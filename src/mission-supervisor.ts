@@ -33,6 +33,8 @@ export interface MissionSpec {
   goal: string;
   deps: string[];
   scope?: TaskScope;
+  /** The full task spec (goal, acceptance, verify, scope) dispatched for this mission spec. */
+  task?: unknown;
 }
 
 export interface Limits {
@@ -180,7 +182,9 @@ export type MissionEvent =
   | { type: "dispatched"; specId: string; runId: string; key: string }
   /** The intent was reconciled: the node has no run for this key, so it never launched. */
   | { type: "intent-void"; specId: string; key: string; reason: string }
-  | { type: "outcome"; specId: string; runId?: string; signals: OutcomeSignals };
+  | { type: "outcome"; specId: string; runId?: string; signals: OutcomeSignals }
+  /** Issue #244 review fix: an unconfirmed launch reconciled to nothing — a run may be live, so this ESCALATES; it is never voided into a relaunch. */
+  | { type: "launch-unresolved"; specId: string; key: string; evidence: string };
 
 export function reduce(state: MissionState, ev: MissionEvent): MissionState {
   const cur = state.specs[ev.specId];
@@ -201,6 +205,16 @@ export function reduce(state: MissionState, ev: MissionEvent): MissionState {
     if (cur.dispatchKey !== ev.key || cur.status !== "dispatching") return state;
     // The launch never happened: undo the attempt so it is not counted, and make it runnable again.
     return log(patch(state, ev.specId, { status: "pending", attempts: Math.max(0, cur.attempts - 1), node: undefined, dispatchKey: undefined }), { type: "intent-void", specId: ev.specId, why: ev.reason, evidence: ev.key });
+  }
+
+  // Issue #244 review fix: an unconfirmed launch reconciled to nothing is NEVER voided into a
+  // relaunch (the node may be running it): escalate once for a human.
+  if (ev.type === "launch-unresolved") {
+    if (cur.dispatchKey !== ev.key || cur.status !== "dispatching") return log(state, { type: "ignored", specId: ev.specId, why: `launch-unresolved while ${cur.status} for ${ev.key}` });
+    return log(
+      patch(state, ev.specId, { status: "escalated", escalation: { reason: "the launch was never confirmed and no run is recorded for its key: a run may be live on the node — do not relaunch until a human settles it", evidence: ev.evidence } }),
+      { type: "launch-unresolved", specId: ev.specId, why: "an unconfirmed launch is never voided into a relaunch: a run may be live; a human must settle it", evidence: `${ev.key}: ${ev.evidence.slice(0, 150)}` },
+    );
   }
 
   // outcome

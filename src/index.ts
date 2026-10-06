@@ -291,10 +291,10 @@ export default definePluginEntry({
     // Tools
     // ------------------------------------------------------------------
 
-    registerDispatchTools(api, cfg);
+    const { dispatchTool } = registerDispatchTools(api, cfg);
     registerIterateTools(api, cfg);
-    registerRunsTools(api, cfg);
-    registerMissionTools(api, cfg);
+    const { runStatusExecute } = registerRunsTools(api, cfg);
+    registerMissionTools(api, cfg, { dispatchTool, runStatusExecute });
     registerProjectTools(api, cfg);
     registerReviewTools(api, cfg);
     registerNodesTools(api, cfg);
