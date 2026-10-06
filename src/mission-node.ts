@@ -13,7 +13,7 @@
 import type { LedgerEntry } from "./ledger.js";
 import type { MissionRecord } from "./mission-store.js";
 import type { OutcomeSignals } from "./mission-supervisor.js";
-import type { TickDeps } from "./mission-runner.js";
+import type { PublishResult, TickDeps } from "./mission-runner.js";
 import { quoteUntrusted } from "./untrusted.js";
 
 export interface World {
@@ -26,6 +26,8 @@ export interface World {
   /** fleet_run_status for one run (reconciles the ledger as a side effect). */
   status(node: string, runId: string): Promise<void>;
   nowMs(): number;
+  /** Publish one verified spec (issue #251); absent = the loop does not publish. */
+  publish?(specId: string, record: MissionRecord): Promise<PublishResult>;
 }
 
 // Issue #244 review fix: `timed-out` is terminal for the mission loop (a wall-clocked run must
@@ -109,6 +111,7 @@ export function nodeDeps(root: string, record: MissionRecord, world: World, extr
       }
       return out;
     },
+    ...(world.publish ? { publish: (id: string, r: MissionRecord) => world.publish!(id, r) } : {}),
     ...extra,
   };
 }

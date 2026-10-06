@@ -15,7 +15,7 @@
  *  - Re-running a tick with nothing changed does nothing.
  */
 
-import { appendJournal, loadMission, readJournal, setPhase, updateMission, type MissionRecord } from "./mission-store.js";
+import { appendJournal, loadMission, readJournal, setPhase, updateMission, type MissionRecord, type Publication } from "./mission-store.js";
 import { missionStatus, plan, reduce, type Action, type MissionEvent, type OutcomeSignals } from "./mission-supervisor.js";
 import { rubricBaseline } from "./builtin-points.js";
 
@@ -33,7 +33,20 @@ export interface TickDeps {
   /** Hard stops to evaluate before new work (e.g. mission-autonomy's evaluateHardStops). Empty = continue. */
   guard?: (record: MissionRecord) => Promise<Array<{ kind: string; evidence: string }>>;
   staleAfterMs?: number;
+  /**
+   * Publish one verified spec (issue #251: the repo stays current per verified run): sync it to the mission
+   * branch and open/update the mission PR through the normal reviewed-head gates. Absent = no publication.
+   * A refusal (review FAIL, sync refuse) is `{ok:false}`; `retryable:false` escalates at once.
+   */
+  publish?: (specId: string, record: MissionRecord) => Promise<PublishResult>;
 }
+
+export type PublishResult = { ok: true; ref: string } | { ok: false; error: string; retryable?: boolean };
+
+/** Publication attempts per spec before a human is asked (a refusal is repaired once, like any failed gate). */
+export const MAX_PUBLISH_FAILURES = 2;
+/** Specs published per tick, so one tick stays short. */
+export const MAX_PUBLISH_PER_TICK = 3;
 
 export interface TickResult {
   ok: boolean;
@@ -44,6 +57,9 @@ export interface TickResult {
   outcomes: string[];
   reconciled: string[];
   replanRequested: string[];
+  /** Specs published this tick, and those whose publication was refused (issue #251). */
+  published: string[];
+  publishRefused: string[];
   /** Specs escalated because an unconfirmed launch reconciled to nothing (issue #244 review fix). */
   escalated?: string[];
   status?: "complete" | "running" | "escalated";
@@ -68,7 +84,7 @@ export async function applyEvent(root: string, id: string, ev: MissionEvent): Pr
 }
 
 export async function tick(root: string, id: string, deps: TickDeps): Promise<TickResult> {
-  const out: TickResult = { ok: true, launched: [], outcomes: [], reconciled: [], replanRequested: [], escalated: [] };
+  const out: TickResult = { ok: true, launched: [], outcomes: [], reconciled: [], replanRequested: [], escalated: [], published: [], publishRefused: [] };
   let m = await loadMission(root, id);
   if (!m.ok) return { ...out, ok: false, error: m.error };
   out.phase = m.record.phase;
@@ -93,6 +109,10 @@ export async function tick(root: string, id: string, deps: TickDeps): Promise<Ti
       out.outcomes.push(specId);
     }
   }
+
+  // 1b. Publish verified specs (issue #251), once each, in dependency order: a spec only after everything it
+  //     depends on is published. Deduped by the durable `publications` record, so a re-run never re-publishes.
+  if (deps.publish) await publishReady(root, id, deps.publish, out);
 
   // 2. Plan from the fresh state.
   m = await loadMission(root, id);
@@ -159,7 +179,15 @@ export async function tick(root: string, id: string, deps: TickDeps): Promise<Ti
   await appendJournal(root, id, { type: "progress-rubric", why: verdict, evidence: `specs ${rubricSignals.specsDone}/${rubricSignals.specsTotal}, escalated ${rubricSignals.escalated}` });
   const st = missionStatus(m.record.supervisor, { ...ctx, freeSlots: await deps.freeSlots() });
   out.status = st.status;
-  if (st.status === "complete") {
+  const unpublished = deps.publish ? Object.values(m.record.supervisor.specs).filter((s) => s.status === "verified" && m.record.publications?.[s.spec.id]?.state !== "published") : [];
+  if (st.status === "complete" && unpublished.length > 0) {
+    // Issue #251: with publication on, the mission is not delivered until every verified spec is published.
+    const stuck = unpublished.filter((s) => m.record.publications?.[s.spec.id]?.state === "escalated");
+    if (stuck.length > 0) {
+      const p = await setPhase(root, id, "blocked", `publication escalated for ${stuck.map((s) => s.spec.id).join(", ")}`);
+      out.phase = p.ok ? p.record.phase : out.phase;
+    } else out.status = "running";
+  } else if (st.status === "complete") {
     const p = await setPhase(root, id, "delivering", "every spec is verified");
     out.phase = p.ok ? p.record.phase : out.phase;
   } else if (st.status === "escalated") {
@@ -173,4 +201,34 @@ export async function tick(root: string, id: string, deps: TickDeps): Promise<Ti
 async function readJournalTypes(root: string, id: string): Promise<Set<string>> {
   const { readJournal } = await import("./mission-store.js");
   return new Set((await readJournal(root, id)).filter((e) => e.type === "replan-requested").map((e) => `replan:${(e.evidence ?? "").split(": ")[0]}:${(e.evidence ?? "").split(": ").slice(1).join(": ").slice(0, 40)}`));
+}
+
+async function publishReady(root: string, id: string, publish: NonNullable<TickDeps["publish"]>, out: TickResult): Promise<void> {
+  for (let n = 0; n < MAX_PUBLISH_PER_TICK; n++) {
+    const m = await loadMission(root, id);
+    if (!m.ok) return;
+    const pubs = m.record.publications ?? {};
+    const specs = m.record.supervisor.specs;
+    const ready = Object.values(specs).filter((s) => s.status === "verified" && (pubs[s.spec.id]?.state ?? "failed") !== "published" && pubs[s.spec.id]?.state !== "escalated"
+      && s.spec.deps.every((d) => specs[d]?.status === "superseded" || pubs[d]?.state === "published"))
+      .sort((a, b) => a.spec.id.localeCompare(b.spec.id));
+    const next = ready[0];
+    if (!next) return;
+    const specId = next.spec.id;
+    let res: PublishResult;
+    try { res = await publish(specId, m.record); } catch (e) { res = { ok: false, error: (e as Error).message }; }
+    const prev = pubs[specId];
+    const at = new Date().toISOString();
+    const entry: Publication = res.ok
+      ? { state: "published", ref: res.ref.slice(0, 300), failures: prev?.failures ?? 0, at }
+      : { state: res.retryable === false || (prev?.failures ?? 0) + 1 >= MAX_PUBLISH_FAILURES ? "escalated" : "failed", failures: (prev?.failures ?? 0) + 1, lastError: res.error.slice(0, 300), at };
+    const saved = await updateMission(root, id, (r) => ({ ...r, publications: { ...(r.publications ?? {}), [specId]: entry } }));
+    if (!saved.ok) return;
+    if (res.ok) { out.published.push(specId); await appendJournal(root, id, { type: "published", why: `${specId} is verified and published`, evidence: res.ref.slice(0, 200) }); }
+    else {
+      out.publishRefused.push(specId);
+      await appendJournal(root, id, { type: entry.state === "escalated" ? "publish-escalated" : "publish-refused", why: entry.state === "escalated" ? `publishing ${specId} failed ${entry.failures}x (or is not retryable): a human decides` : `publishing ${specId} was refused; it will be retried once`, evidence: res.error.slice(0, 200) });
+      return; // do not publish later specs past a refused one in the same tick
+    }
+  }
 }
