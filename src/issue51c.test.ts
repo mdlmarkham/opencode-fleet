@@ -141,6 +141,65 @@ describe("#51c: mergeDenyBaseline is order-safe under live-verified last-match-w
     expect(Object.keys(bashOf(mergeDenyBaseline(fromJson)))).toEqual(Object.keys(bashOf(once)));
   });
 
+  it("exact-key allow plus a LATER broad allow: the baseline-denied broad pattern yields last-match DENY (the merge cannot re-open what the baseline denies)", () => {
+    // The #254 hazard: a node config that denies an exact pattern but then
+    // allows broadly AFTER it. Naive value-merging preserves that key order,
+    // and under live-verified last-match-wins the trailing broad allow would
+    // RE-OPEN the exact denial. The merge must absorb the conflicting exact
+    // key and re-add every baseline pattern LAST, so the evaluated
+    // `git push ...` resolves to the baseline deny.
+    const config = {
+      permission: {
+        bash: { "git push*": "allow", "*": "allow" },
+      },
+    };
+    const merged = mergeDenyBaseline(config);
+    const bash = bashOf(merged);
+
+    // The broad allow is preserved verbatim —
+    expect(bash["*"]).toBe("allow");
+    // ...the exact conflicting key became deny, as a SINGLE key (absorbed)...
+    expect(bash["git push*"]).toBe("deny");
+    expect(Object.keys(bash).filter((k) => k === "git push*").length).toBe(1);
+    // ...and the WINNER BY KEY ORDER for `git push ...` is the baseline deny:
+    // the last listed matching rule is the baseline pattern, not the allow.
+    expect(positionOf(bash, "git push*")).toBeGreaterThan(positionOf(bash, "*"));
+    // Generalized: every baseline pattern outranks the broad allow by position.
+    for (const [p, a] of Object.entries(BASELINE_DENY.bash)) {
+      expect(bash[p], p).toBe(a);
+      expect(positionOf(bash, p), p).toBeGreaterThan(positionOf(bash, "*"));
+    }
+    expect(baselinePresent(merged)).toBe(true);
+
+    // Reversed fixture — same verdict, order must not matter.
+    const reversed = mergeDenyBaseline({
+      permission: { bash: { "*": "allow", "git push*": "allow" } },
+    });
+    const rbash = bashOf(reversed);
+    expect(rbash["git push*"]).toBe("deny");
+    expect(rbash["*"]).toBe("allow");
+    expect(positionOf(rbash, "git push*")).toBeGreaterThan(positionOf(rbash, "*"));
+
+    // The discriminating edge within the hazard: the broad allow is the LAST
+    // user rule, yet the baseline STILL lands after it — even an exact-key
+    // DENY earlier in the user map cannot make the broad allow the final word.
+    const denyThenBroad = mergeDenyBaseline({
+      permission: { bash: { "curl*": "deny", "*": "allow" } },
+    });
+    const dbash = bashOf(denyThenBroad);
+    expect(dbash["*"]).toBe("allow");
+    expect(dbash["curl*"]).toBe("deny");
+    expect(positionOf(dbash, "curl*")).toBeGreaterThan(positionOf(dbash, "*"));
+    // "curl*" is NOT the literal last key (later baseline patterns follow it)
+    // but it must sit with the baseline tail, after every user rule.
+    const dkeys = Object.keys(dbash);
+    const dUserIdxs = dkeys
+      .map((_, idx) => idx)
+      .filter((idx) => !Object.prototype.hasOwnProperty.call(BASELINE_DENY.bash, dkeys[idx]));
+    expect(positionOf(dbash, "curl*")).toBeGreaterThan(Math.max(...dUserIdxs));
+    expect(baselinePresent(denyThenBroad)).toBe(true);
+  });
+
   it("control pin: the merged map keeps the exact probe-2 shape that DENIED live, deny last", () => {
     // probe 2 live evidence (opencode 1.18.25): {"*":"allow","git push*":"deny"}
     // DENIED `git push --dry-run origin master`. The merge of a user map must

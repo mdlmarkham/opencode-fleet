@@ -102,6 +102,77 @@ describe("#51 slice 2: config provisioning applies mergeDenyBaseline (opt-in)", 
     expect(mergedTwice).toEqual(merged);
     // And the emitted module agrees with the TS source on the same input.
     expect(merged).toEqual(mergeDenyBaseline(before));
+
+    // #254 reconciliation: the emitted MERGE_FN is order-safe like the TS
+    // mergeDenyBaseline — under live-verified LAST-MATCH-WINS evaluation, a
+    // baseline deny must outrank a conflicting user allow regardless of the
+    // key order the node's config had. Asserted by KEY POSITION, not by an
+    // order-blind deep-equal.
+    const posOf = (m: Record<string, unknown>, k: string): number => Object.keys(m).indexOf(k);
+    /** Action of the LAST listed matching rule — what opencode evaluates. */
+    const winnerUnderLastMatchWins = (
+      bash: Record<string, string>,
+      matching: readonly string[],
+    ): string | undefined => {
+      const hits = Object.keys(bash).filter((k) => matching.indexOf(k) !== -1);
+      if (hits.length === 0) return undefined;
+      const last = hits.reduce((a, b) => (posOf(bash, b) > posOf(bash, a) ? b : a));
+      return bash[last];
+    };
+    // CONFLICTING-KEY fixtures: baseline deny vs user allow on the SAME key,
+    // in both orders, plus broad allows that shadow the deny pattern.
+    const conflicts: Array<{ fixture: Record<string, unknown>; matching: string[] }> = [
+      // exact-key allow FIRST, broad allow LATER — the re-open hazard
+      { fixture: { permission: { bash: { "git push*": "allow", "*": "allow" } } }, matching: ["*", "git push*"] },
+      // same conflicting keys, REVERSED order
+      { fixture: { permission: { bash: { "*": "allow", "git push*": "allow" } } }, matching: ["*", "git push*"] },
+      // broad shadow of the deny with no exact-key rule at all
+      { fixture: { permission: { bash: { "git *": "allow" } } }, matching: ["git *", "git push*"] },
+      // exact-key ask on one baseline pattern + broad allow later
+      { fixture: { permission: { bash: { "curl*": "ask", "*": "allow" } } }, matching: ["*", "curl*"] },
+    ];
+    for (const [i, { fixture, matching }] of conflicts.entries()) {
+      // Document the hazard: on the RAW user map, last-match-wins resolves to
+      // the user's (broad or later) ALLOW.
+      const rawBash = (fixture as { permission: { bash: Record<string, string> } }).permission.bash;
+      expect(winnerUnderLastMatchWins(rawBash, matching), `raw winner, variant ${i}`).toBe("allow");
+
+      for (const impl of [nodeModule.mergeDenyBaseline, mergeDenyBaseline]) {
+        const mergedConf = impl(fixture) as { permission: { bash: Record<string, unknown> } };
+        const cbash = mergedConf.permission.bash;
+        // The conflicting pattern is deny in the merged map — no duplicate key.
+        for (const p of matching) {
+          if (p in BASELINE_DENY.bash) {
+            expect(cbash[p], `${p}, variant ${i}`).toBe(BASELINE_DENY.bash[p as keyof typeof BASELINE_DENY.bash]);
+            expect(Object.keys(cbash).filter((k) => k === p).length, `variant ${i}`).toBe(1);
+          }
+        }
+        // WINNER BY KEY ORDER/INDEX: under last-match-wins the evaluated
+        // command resolves to the baseline DENY, not the user allow.
+        const evaluated = winnerUnderLastMatchWins(cbash as Record<string, string>, matching);
+        expect(evaluated, `evaluated winner, variant ${i}, impl ${impl.name || "emitted"}`).toBe(
+          BASELINE_DENY.bash[matching[matching.length - 1] as keyof typeof BASELINE_DENY.bash] ?? "deny",
+        );
+        // Structural form of the same claim: EVERY baseline key sits AFTER
+        // every surviving user key, in BOTH implementations.
+        const keys = Object.keys(cbash);
+        const userIdxs = keys
+          .map((_, idx) => idx)
+          .filter((idx) => !Object.prototype.hasOwnProperty.call(BASELINE_DENY.bash, keys[idx]));
+        for (const [p, a] of Object.entries(BASELINE_DENY.bash)) {
+          expect(cbash[p], `${p}, variant ${i}`).toBe(a);
+          expect(posOf(cbash, p), `${p} not last, variant ${i}`).toBeGreaterThan(Math.max(...userIdxs));
+        }
+        // PARITY: emitted module and TS source produce byte-identical JSON —
+        // key order AND values — for every conflicting fixture.
+        expect(JSON.stringify(nodeModule.mergeDenyBaseline(fixture)), `emitted ≡ TS, variant ${i}`).toBe(
+          JSON.stringify(mergeDenyBaseline(fixture)),
+        );
+      }
+      // And re-merging the merged output is a no-op (install re-run hazard).
+      const once = (nodeModule.mergeDenyBaseline(fixture) as { permission: unknown });
+      expect(JSON.stringify(nodeModule.mergeDenyBaseline(once))).toBe(JSON.stringify(once));
+    }
   }, 20_000);
 
   it("the emitted module is syntactically valid standalone node (the install would not no-op or crash the node)", async () => {
