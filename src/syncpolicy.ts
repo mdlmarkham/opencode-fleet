@@ -217,6 +217,25 @@ const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
  * commit when any commit in the range introduces a secret; diff failures are
  * fatal (fail closed), never swallowed.
  */
+/** Added lines (with their leading "+") of a unified diff, hunks only. */
+function addedLines(diff: string): string[] {
+  const out: string[] = [];
+  let inHunk = false;
+  for (const line of diff.split("\n")) {
+    if (line.startsWith("diff --git ")) { inHunk = false; continue; }
+    if (line.startsWith("@@")) { inHunk = true; continue; }
+    if (inHunk && line.startsWith("+")) out.push(line);
+  }
+  return out;
+}
+
+/** The added lines present in every diff, as one synthetic hunk countSecretLines can scan. */
+function commonAddedAsDiff(diffs: string[]): string {
+  const sets = diffs.map((d) => new Set(addedLines(d)));
+  const common = [...sets[0]!].filter((l) => sets.every((x) => x.has(l)));
+  return ["diff --git a/merge b/merge", "@@ -0,0 +1 @@", ...common].join("\n");
+}
+
 export async function secretsInCommits(
   repoDir: string,
   base: string,
@@ -228,16 +247,20 @@ export async function secretsInCommits(
   for (const row of revs.split("\n").filter(Boolean)) {
     const [commit, ...parents] = row.split(" ");
     const against = parents.length ? parents : [EMPTY_TREE];
+    const diffs: string[] = [];
     for (const p of against) {
-      const diff = await gitExec(
+      diffs.push(await gitExec(
         repoDir, ["diff", "--text", "--no-textconv", "--no-ext-diff", "--unified=0", p, commit],
+      ));
+    }
+    // A merge introduces only the lines that are new against EVERY parent (its resolution). A line
+    // present in one parent merely came in with that side: if that side is already on the base it is
+    // not this merge's doing, and if it is in the range its own commits are scanned here (#103).
+    const secrets = diffs.length > 1 ? countSecretLines(commonAddedAsDiff(diffs)) : countSecretLines(diffs[0]!);
+    if (secrets > 0) {
+      throw new Error(
+        `commit ${commit.slice(0, 12)} introduces ${secrets} credential-shaped added line(s) (tokens, keys, passwords)`,
       );
-      const secrets = countSecretLines(diff);
-      if (secrets > 0) {
-        throw new Error(
-          `commit ${commit.slice(0, 12)} introduces ${secrets} credential-shaped added line(s) (tokens, keys, passwords)`,
-        );
-      }
     }
   }
 }

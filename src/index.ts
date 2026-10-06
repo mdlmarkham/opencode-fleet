@@ -1327,6 +1327,76 @@ export default definePluginEntry({
     });
 
     api.registerTool({
+      name: "fleet_project_start",
+      label: "Fleet Project Start",
+      description:
+        "Start a project through a typed intake that cannot be skipped. Send answers (goal, users, constraints, nonGoals, successCriteria [{criterion, check}], riskiestAssumptions, deferred); state is kept by projectId. Returns ready | needs-more | risky-but-proceed with exactly what is missing. Goal and checkable success criteria cannot be deferred. `write` puts .fleet/charter.md and your `decisions` under project.roots, never overwriting; `backlog` validates proposed specs. Proposals only: nothing is dispatched.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          projectId: { type: "string", description: "Resume an intake (lowercase letters, digits, dashes). Omit to start." },
+          answers: { type: "object", description: "Typed answers for this round; fields you send replace earlier ones." },
+          decisions: { type: "array", items: { type: "object" }, description: "First decisions to record: {title, decision, context?, alternativesRejected?, consequences?, scope?}." },
+          backlog: { type: "array", items: { type: "object" }, description: "Proposed task specs to validate." },
+          write: { type: "string", description: "Absolute checkout path (under project.roots) to write .fleet/ into." },
+          confirmRisks: { type: "boolean", description: "Accept a risky-but-proceed verdict when writing." },
+        },
+      },
+      execute: async (_toolCallId, params) => {
+        const p = params as { projectId?: string; answers?: unknown; decisions?: unknown; backlog?: unknown; write?: string; confirmRisks?: boolean };
+        const { normalizeAnswers, mergeAnswers, assess, renderCharter, renderDecision, writeProject, validateBacklog } = await import("./project-start.js");
+        const fsp = await import("node:fs/promises");
+        const { join } = await import("node:path");
+        const projectId = typeof p.projectId === "string" ? p.projectId : `p-${Date.now().toString(36)}`;
+        if (!/^[a-z0-9][a-z0-9-]{0,39}$/.test(projectId)) return jsonResult({ ok: false, error: "projectId must be 1-40 lowercase letters, digits or dashes" });
+        const dir = join(api.rootDir ?? process.cwd(), ".opencode-fleet", "intake");
+        const file = join(dir, `${projectId}.json`);
+        let saved: import("./project-start.js").IntakeAnswers = {};
+        try { saved = JSON.parse(await fsp.readFile(file, "utf8")); } catch { /* new intake */ }
+        let answers = saved;
+        if (p.answers !== undefined) {
+          const given = new Set(Object.keys((typeof p.answers === "object" && p.answers !== null ? p.answers : {}) as object));
+          answers = mergeAnswers(saved, normalizeAnswers(p.answers), given);
+          await fsp.mkdir(dir, { recursive: true, mode: 0o700 });
+          await fsp.writeFile(file, JSON.stringify(answers), { mode: 0o600 });
+        }
+        const a = assess(answers);
+        const out: Record<string, unknown> = { ok: true, projectId, verdict: a.verdict, missing: a.missing.slice(0, 3), ...(a.missing.length > 3 ? { moreMissing: a.missing.length - 3 } : {}), risks: a.risks, note: "Everything here is a proposal for you to confirm; nothing is dispatched." };
+        if (a.verdict !== "needs-more") out.charterPreview = renderCharter(answers);
+        if (p.backlog !== undefined) out.backlog = validateBacklog(p.backlog);
+        if (typeof p.write === "string") {
+          if (a.verdict === "needs-more") return jsonResult({ ...out, ok: false, error: "intake is not complete: answer what is missing first" });
+          if (a.verdict === "risky-but-proceed" && p.confirmRisks !== true) return jsonResult({ ...out, ok: false, error: "risky-but-proceed: pass confirmRisks:true to write with the deferred items recorded as risks" });
+          if (!p.write.startsWith("/")) return jsonResult({ ...out, ok: false, error: "write must be an absolute path" });
+          const { realpath } = fsp;
+          const { relative, isAbsolute } = await import("node:path");
+          let real: string;
+          try { real = await realpath(p.write); } catch { return jsonResult({ ...out, ok: false, error: `no such directory: ${p.write}` }); }
+          const cfg = (api.pluginConfig ?? {}) as FleetConfig;
+          const roots = cfg.project?.roots?.length ? cfg.project.roots : [process.cwd(), ...(api.rootDir ? [api.rootDir] : [])];
+          let allowed = false;
+          for (const r of roots) { try { const rel = relative(await realpath(r), real); if (rel === "" || (!rel.startsWith("..") && !isAbsolute(rel))) { allowed = true; break; } } catch { /* missing root allows nothing */ } }
+          if (!allowed) return jsonResult({ ...out, ok: false, error: "path is outside the operator's project.roots" });
+          const today = new Date().toISOString().slice(0, 10);
+          const ds: Array<{ name: string; text: string }> = [];
+          for (const [i, d] of (Array.isArray(p.decisions) ? p.decisions : []).entries()) {
+            const o = d as Record<string, unknown>;
+            if (typeof o?.title !== "string" || typeof o?.decision !== "string") return jsonResult({ ...out, ok: false, error: `decisions[${i}] needs title and decision` });
+            const r = renderDecision(i + 1, { title: o.title, decision: o.decision, ...(typeof o.context === "string" ? { context: o.context } : {}), ...(typeof o.alternativesRejected === "string" ? { alternativesRejected: o.alternativesRejected } : {}), ...(typeof o.consequences === "string" ? { consequences: o.consequences } : {}), ...(Array.isArray(o.scope) ? { scope: o.scope.filter((x): x is string => typeof x === "string") } : {}) }, today);
+            if ("error" in r) return jsonResult({ ...out, ok: false, error: `decisions[${i}]: ${r.error}` });
+            ds.push(r);
+          }
+          const w = await writeProject(real, renderCharter(answers), ds);
+          out.write = w;
+          if (!w.ok) out.ok = false;
+          else if (ds.length === 0) out.note = "Wrote the charter with no decision recorded: record at least one with the `decisions` param.";
+        }
+        return jsonResult(out);
+      },
+    });
+
+    api.registerTool({
       name: "fleet_project_show",
       label: "Fleet Project Show",
       description:
@@ -1590,7 +1660,7 @@ export default definePluginEntry({
       name: "fleet_spec_quality",
       label: "Fleet Spec Quality",
       description:
-        "Which spec shapes fail: outcomes of finished spec runs (no-op, failed gate, failed, complete) by acceptance/verify/scope, gate verdict and objection id. Read-only, from the ledger; rates need minN runs.",
+        "Which spec shapes fail: outcomes of finished spec runs by acceptance/verify/scope, gate verdict and objection id, plus per-objection regret-vs-noise proposals. Read-only, from the ledger; rates need minN runs.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -1604,7 +1674,10 @@ export default definePluginEntry({
         const { loadLedger } = await import("./ledger.js");
         const { qualityReport } = await import("./spec-quality.js");
         const sinceMs = typeof p.days === "number" && p.days > 0 ? Date.now() - p.days * 86_400_000 : undefined;
-        return jsonResult({ ok: true, ...qualityReport(await loadLedger(api.rootDir ?? process.cwd()), { ...(sinceMs !== undefined ? { sinceMs } : {}), ...(p.minN !== undefined ? { minN: p.minN } : {}) }) });
+        const ledger = await loadLedger(api.rootDir ?? process.cwd());
+        const opts = { ...(sinceMs !== undefined ? { sinceMs } : {}), ...(p.minN !== undefined ? { minN: p.minN } : {}) };
+        const { regretReport } = await import("./override-regret.js");
+        return jsonResult({ ok: true, ...qualityReport(ledger, opts), regret: regretReport(ledger, opts) });
       },
     });
 
@@ -1961,7 +2034,7 @@ export default definePluginEntry({
       name: "fleet_iterate",
       label: "Fleet Iterate",
       description:
-        "Dispatch a task and auto-iterate: if the worker's result indicates failure (build errors, test failures, or a hand-raise), re-dispatch with the errors appended until success, maxIterations, or NO-PROGRESS escalation. Tracks whether each iteration's output differs from the last — if the worker repeats the same errors (no progress), it escalates instead of burning tokens in a blind retry loop.",
+        "Dispatch a task and auto-iterate: on failure (build errors, test failures, hand-raise) re-dispatch with the errors appended until success, maxIterations, or NO-PROGRESS escalation (identical output twice in a row stops instead of burning tokens).",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -1981,6 +2054,7 @@ export default definePluginEntry({
             type: "boolean",
             description: "Escalate (stop + report) when consecutive iterations produce identical output (no progress). Default true.",
           },
+          judgeProgress: { type: "boolean", description: "Shadow only: log S1's closer-to-done estimate per round beside the string-diff baseline. Changes nothing. Needs `expect` and `s1`." },
           expect: expectParam("Post-run gate after each iteration, as for fleet_dispatch. An iteration with verified:false is not success: the loop keeps iterating or escalates."),
         },
         required: ["node", "cwd", "prompt"],
@@ -1996,11 +2070,16 @@ export default definePluginEntry({
           timeoutMs?: number;
           successMarker?: string;
           noProgressEscalate?: boolean;
+          judgeProgress?: boolean;
           expect?: { files?: string[]; command?: string; commands?: string[]; timeoutMs?: number };
         };
         const list = await api.runtime.nodes.list();
         const node = (list.nodes ?? []).find((n) => n.displayName === p.node || n.nodeId === p.node);
         if (!node) return jsonResult(`Node "${p.node}" not found.`);
+        // Issue #165: with no gate there is nothing objective to compare rounds on.
+        if (p.judgeProgress === true && p.expect === undefined) {
+          return jsonResult({ ok: false, error: "judgeProgress needs an `expect` verification gate: without one there is nothing objective to judge progress against" });
+        }
 
         // Issue #62 review (coverage gap): fleet_iterate accepts the same
         // optional verification gate as fleet_dispatch, validated up front and
@@ -2029,6 +2108,12 @@ export default definePluginEntry({
         const iterations: Array<{ iter: number; summary?: string; handRaised?: boolean; question?: string; error?: string; verified?: boolean | null; progress?: boolean }> = [];
         let currentPrompt = p.prompt;
         let prevFingerprint = "";
+        const labelRun = (success: boolean, verified: boolean | null, iterations: number): void => {
+          if (p.judgeProgress !== true || cfg.s1 == null) return;
+          void import("./progress-judge.js").then((m) => m.recordProgressLabel(judgeKey, { verified, success, iterations }, api.rootDir ?? process.cwd())).catch(() => { /* best effort */ });
+        };
+        let prevRound: { summary?: string; error?: string; verified: boolean | null } | undefined;
+        const judgeKey = `iter-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
         // Last iteration's parsed outcome, in scope after the loop exits.
         let lastOutcome: { verified?: boolean; verifyDetails?: unknown } | null = null;
         // Issue #39 (budget slice): each iteration is a run seed counted against the same
@@ -2094,6 +2179,16 @@ export default definePluginEntry({
           const progress = i === 1 ? true : fingerprint !== prevFingerprint;
           prevFingerprint = fingerprint;
 
+          // Issue #165 (shadow): record S1's view of this round next to the baseline's. Fire-and-forget;
+          // nothing below reads it.
+          if (p.judgeProgress === true && cfg.s1 != null && i > 1 && prevRound) {
+            const previous = prevRound;
+            void import("./progress-judge.js")
+              .then((m) => m.recordProgressShadow(cfg.s1, { goal: p.prompt, previous, current: { summary: parsed.summary, error: parsed.error, verified } }, { runKey: judgeKey, iter: i, baselineProgress: progress }, api.rootDir ?? process.cwd()))
+              .catch(() => { /* never breaks the loop */ });
+          }
+          prevRound = { summary: parsed.summary, error: parsed.error, verified };
+
           iterations.push({
             iter: i,
             summary: parsed.summary,
@@ -2128,11 +2223,13 @@ export default definePluginEntry({
           const markerSeen = p.successMarker ? (parsed.summary ?? "").includes(p.successMarker) : false;
           const success = (p.successMarker ? markerSeen && !looksFailed : !looksFailed) && verified !== false;
           if (success) {
+            labelRun(true, verified, i);
             return jsonResult(withVerified({ iterations, done: true, success: true, finalSummary: parsed.summary }, parsed));
           }
 
           // NO-PROGRESS escalation: same output as last iteration → stop, don't burn tokens.
           if (escalateOnNoProgress && i > 1 && !progress) {
+            labelRun(false, verified, i);
             // Issue #103: every return shape goes through withVerified —
             // `verified`/`verifyDetails` are ALWAYS present here too (null when
             // no gate ran), matching the helper's contract.
@@ -2172,6 +2269,7 @@ export default definePluginEntry({
           ].join("\n");
         }
 
+        labelRun(false, prevRound?.verified ?? null, iterations.length);
         return jsonResult(
           withVerified({ iterations, done: true, success: false, note: `exceeded ${maxIter} iterations` }, lastOutcome),
         );
