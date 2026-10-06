@@ -47,6 +47,23 @@ export function renderAllowReport(r: AllowReport): string {
   return L.join("\n");
 }
 
+/**
+ * The host config is JSON5 (the host parses it with JSON5): comments and trailing commas are legal, so plain
+ * JSON.parse would report a perfectly good config as unreadable. Strict JSON first, then json5 when it resolves
+ * (the host ships it); if neither works the caller reports `checked:false` rather than guessing.
+ */
+export async function parseHostConfig(text: string): Promise<unknown> {
+  try { return JSON.parse(text); } catch (strict) {
+    try {
+      const name = "json5";
+      const mod = (await import(name)) as { default?: { parse: (s: string) => unknown }; parse?: (s: string) => unknown };
+      const parse = mod.default?.parse ?? mod.parse;
+      if (!parse) throw strict;
+      return parse(text);
+    } catch { throw strict; }
+  }
+}
+
 export type DeployAllow = { checked: false; reason: string } | { checked: true; ok: boolean; agents: AllowFinding[]; skipped: string[]; summary: string };
 
 /**
@@ -55,7 +72,7 @@ export type DeployAllow = { checked: false; reason: string } | { checked: true; 
  */
 export async function toolAllowForDeploy(configPath: string, manifestPath: string, read: (p: string) => Promise<string>): Promise<DeployAllow> {
   let config: unknown;
-  try { config = JSON.parse(await read(configPath)); } catch (e) { return { checked: false, reason: `cannot read ${configPath}: ${(e as Error).message}`.slice(0, 200) }; }
+  try { config = await parseHostConfig(await read(configPath)); } catch (e) { return { checked: false, reason: `cannot read ${configPath}: ${(e as Error).message}`.slice(0, 200) }; }
   let tools: unknown;
   try { tools = (JSON.parse(await read(manifestPath)) as { contracts?: { tools?: unknown } }).contracts?.tools; } catch (e) { return { checked: false, reason: `cannot read ${manifestPath}: ${(e as Error).message}`.slice(0, 200) }; }
   if (!Array.isArray(tools) || tools.length === 0 || !tools.every((t) => typeof t === "string")) return { checked: false, reason: "the manifest has no contracts.tools" };
