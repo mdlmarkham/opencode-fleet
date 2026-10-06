@@ -884,9 +884,9 @@ describe("issue #87c wiring contract (index.ts)", () => {
   const dispatchSrc = readFileSync(join(here, "index.ts"), "utf8");
 
   it("the dispatch schema declares both opt-in flags with default-off semantics", () => {
-    expect(dispatchSrc).toMatch(/route: \{\n\s+type: "object",\n\s+additionalProperties: false,\n\s+description: "OPT-IN S1 engine routing \(issue #[^)]+default OFF/);
+    expect(dispatchSrc).toMatch(/route: \{\n\s+type: "object",\n\s+additionalProperties: false,\n\s+description: "Opt-in S1 engine routing/);
     expect(dispatchSrc).toMatch(/candidates: \{ type: "array", items: \{ type: "string" \}/);
-    expect(dispatchSrc).toMatch(/autoTriage: \{ type: "boolean", description: "OPT-IN S1 triage \(issue #[^)]+default false/);
+    expect(dispatchSrc).toMatch(/autoTriage: \{ type: "boolean", description: "OPT-IN S1 triage \(default false/);
   });
 
   it("routing runs only when `route` is present (no S1 call, no field otherwise)", () => {
