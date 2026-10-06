@@ -18,7 +18,7 @@ describe("#63: abort never kills by name pattern", () => {
   });
 
   it("fleet_abort asks the ledger resolver and requires some runId", () => {
-    const src = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
+    const src = gatewaySrc();
     const body = src.slice(src.indexOf('name: "fleet_abort"'), src.indexOf('name: "fleet_diff"'));
     expect(body).toContain("resolveAbortRunId");
     expect(body).toContain("runId required");
@@ -54,6 +54,7 @@ describe("#63: resolveAbortRunId", () => {
 });
 
 import { parsePiOutput } from "./opencode.js";
+import { gatewaySrc } from "./testkit/src.js";
 
 describe("#63: Pi FLEET_ERROR is only a marker at the start of a line", () => {
   it("a worker that merely prints the text mid-line is not a cd failure", () => {

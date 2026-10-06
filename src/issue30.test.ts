@@ -13,6 +13,7 @@ import {
   ACK_INCONCLUSIVE_NOTE,
 } from "./recovery.js";
 import { shq } from "./shell.js";
+import { gatewaySrc } from "./testkit/src.js";
 
 /**
  * Issue #30 regression guards — the three converging reviews' findings.
@@ -265,7 +266,7 @@ describe("issue #30I: engine-independent liveness", () => {
 
 describe("issue #48: validateHarnessTransport is the single production guard", () => {
   const dir = dirname(fileURLToPath(import.meta.url));
-  const index = ["index.ts", "node/handler.ts"].map((f) => readFileSync(join(dir, f), "utf8")).join("\n");
+  const index = [gatewaySrc(), readFileSync(join(dir, "node/handler.ts"), "utf8")].join("\n");
   it("is called from both the gateway dispatch and the node handler", () => {
     expect((index.match(/validateHarnessTransport\(/g) ?? []).length).toBe(2);
   });

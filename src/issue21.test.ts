@@ -3,10 +3,11 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { ACK_ABSENT_NOTE, ACK_INCONCLUSIVE_NOTE } from "./recovery.js";
+import { gatewaySrc } from "./testkit/src.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 // The node handler moved to node/handler.ts (issue #43); these guards span both sides.
-const src = ["index.ts", "node/handler.ts"].map((f) => readFileSync(join(here, f), "utf8")).join("\n");
+const src = [gatewaySrc(), readFileSync(join(here, "node/handler.ts"), "utf8")].join("\n");
 
 /**
  * Issue #21 regression guards. The bug was a false-negative-as-success: the

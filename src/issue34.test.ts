@@ -4,9 +4,10 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { checkSetup, isEnvNameAllowed, partitionEnv } from "./policy.js";
 import { buildOpenCodeCommand } from "./opencode.js";
+import { gatewaySrc } from "./testkit/src.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const index = readFileSync(join(here, "index.ts"), "utf8");
+const index = gatewaySrc();
 
 describe("issue #34: env policy", () => {
   it("allows ordinary variables", () => {

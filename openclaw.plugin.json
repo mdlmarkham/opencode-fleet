@@ -87,6 +87,14 @@
           "email": { "type": "string" }
         }
       },
+      "deploy": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Deploy plumbing (issue #238): where the plugin REPO checkout (package.json) lives on this host, when the installed plugin location is not the repo.",
+        "properties": {
+          "pluginDir": { "type": "string", "description": "Path to the plugin repo checkout (contains package.json). fleet_deploy's default pluginDir when the installed plugin dir is not the repo." }
+        }
+},
       "dispatch": {
         "type": "object",
         "additionalProperties": false,
