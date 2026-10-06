@@ -11,9 +11,10 @@ import {
   evaluateCwdCheck,
   resolveFleetRoot,
 } from "./cwd.js";
+import { gatewaySrc } from "./testkit/src.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const index = readFileSync(join(here, "index.ts"), "utf8");
+const index = gatewaySrc();
 
 /**
  * Issue #26 regression guards.
@@ -145,7 +146,7 @@ describe("issue #44: fleet root is configuration, not a constant", () => {
 });
 
 describe("issue #44: no deployment-specific literals in shipped code", () => {
-  const read = (f: string) => readFileSync(join(here, f), "utf8");
+  const read = (f: string) => (f === "index.ts" ? gatewaySrc() : readFileSync(join(here, f), "utf8"));
   it("the tailnet catalog host, Pi model and fleet root are not hardcoded", () => {
     for (const f of ["index.ts", "opencode.ts", "cwd.ts", "guard.ts", "membership.ts"]) {
       const src = read(f);
