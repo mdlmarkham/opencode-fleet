@@ -49,6 +49,13 @@ export interface DeployRequest {
    * whole point is that "hash matches" is not "works".
    */
   selfCheck?: boolean;
+  /**
+   * Issue #255: skip the gateway install step entirely. Build + pack still run
+   * (nodes need the tarball); the gateway install is skipped and reported
+   * ok:true with detail "skipped by request (skipGateway)";
+   * gatewayRestartRequired stays false. Default (absent/false): unchanged.
+   */
+  skipGateway?: boolean;
 }
 
 /**
@@ -137,14 +144,19 @@ export async function deployPlugin(req: DeployRequest): Promise<DeployResult> {
     }
 
     // 3. Install on gateway.
-    try {
-      await execFileP("openclaw", ["plugins", "install", tarball, "--force", "--accept-capabilities", "--acknowledge-install-policy-warning"], {
-        timeout: 120_000,
-      });
-      add("install-gateway", true);
-    } catch (e) {
-      add("install-gateway", false, (e as Error).message);
-      return { ok: false, steps, gatewayRestartRequired: false, error: "gateway install failed" };
+    // Issue #255: skipGateway skips this step without touching node sync.
+    if (req.skipGateway) {
+      add("install-gateway", true, "skipped by request (skipGateway)");
+    } else {
+      try {
+        await execFileP("openclaw", ["plugins", "install", tarball, "--force", "--accept-capabilities", "--acknowledge-install-policy-warning"], {
+          timeout: 120_000,
+        });
+        add("install-gateway", true);
+      } catch (e) {
+        add("install-gateway", false, (e as Error).message);
+        return { ok: false, steps, gatewayRestartRequired: false, error: "gateway install failed" };
+      }
     }
 
     // Hash the build we just produced so we can prove the node-installed copy
@@ -424,13 +436,15 @@ export async function deployPlugin(req: DeployRequest): Promise<DeployResult> {
     }
 
     // Issue #18 defect 4: aggregate. `ok` is false if ANY node failed. A
-    // partial deploy that reports success is worse than a failed one.
+    // partial deploy that reports success is worse than a failed one. Issue
+    // #255: a skipGateway deploy never touches the gateway, so it does not
+    // demand a gateway restart either.
     const gatewayOk = steps.filter((s) => s.step === "build" || s.step === "pack" || s.step === "install-gateway").every((s) => s.ok);
     const ok = gatewayOk && !anyNodeFailed;
     return {
       ok,
       steps,
-      gatewayRestartRequired: true,
+      gatewayRestartRequired: !req.skipGateway,
       ...(ok ? { notes: DEPLOY_NOTES } : { error: "one or more deploy steps failed — see steps" }),
     };
   } catch (err) {
