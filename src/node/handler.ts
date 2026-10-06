@@ -336,6 +336,27 @@ OPS["run.start"] = async ({ task, io, context }: OpCtx) => {
         if (!clone.ok) return JSON.stringify({ ok: false, error: `refused: cannot isolate the run: ${clone.error}` });
         isolation = { mode: "clone", source: task.cwd, cwd: clone.cwd, branch: clone.branch, sourceDirty: clone.sourceDirty };
         eff = { ...task, cwd: clone.cwd };
+      } else {
+        // Issue #275: a run into a SHARED, non-isolated checkout must not start
+        // on top of another run's uncommitted work. A dirty source mixes
+        // workstreams in the diff and lets scope violations slip through (the
+        // #271/#255 tangle). The ref path already refuses a dirty source; this
+        // extends the same guard to the ordinary (non-ref, non-clone) path.
+        // Fail closed only when the checkout IS a git work tree with changes;
+        // a non-git cwd (or a clean one) proceeds exactly as before.
+        const dirtyCheck = await runShell(
+          `cd ${shq(task.cwd)} 2>/dev/null && git rev-parse --is-inside-work-tree >/dev/null 2>&1 && git status --porcelain --untracked-files=all 2>/dev/null | head -20 || true`,
+          15_000,
+          context?.signal,
+        );
+        const dirtyLines = dirtyCheck.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
+        if (dirtyLines.length > 0) {
+          const sample = dirtyLines.slice(0, 5).map((l) => l.replace(/^[A-Z?!]{1,2}\s+/, "")).join(", ");
+          return JSON.stringify({
+            ok: false,
+            error: `refused: ${task.cwd} has uncommitted changes (${sample}${dirtyLines.length > 5 ? `, +${dirtyLines.length - 5} more` : ""}); commit or sync them first, or dispatch with isolation: "clone"`,
+          });
+        }
       }
       // The script re-echoes the launch command with its own timeout, then
       // writes the final output into the state file on exit.
