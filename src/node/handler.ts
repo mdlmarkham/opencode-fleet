@@ -47,6 +47,7 @@ import {
   runScriptRows,
   selfStateLines,
   changesCaptureLines,
+  dirtyWorktreeSignal,
   createRunClone,
   removeRunClone,
   pruneRunClones,
@@ -430,7 +431,7 @@ OPS["run.status"] = async ({ task, io, context }: OpCtx) => {
       const statePath = runStatePath(runId);
       try {
         const raw = await (await import("node:fs/promises")).readFile(statePath, "utf8");
-        const st = JSON.parse(raw) as { pid?: number; state?: string; startedAt?: string; finishedAt?: string; exitCode?: number; verified?: boolean; verifyDetails?: VerifyDetails; scope?: { files: string[] }; cwd?: string; startHead?: string; changedFiles?: string[]; scopeViolations?: string[] | null; scopeError?: string };
+        const st = JSON.parse(raw) as { pid?: number; state?: string; startedAt?: string; finishedAt?: string; exitCode?: number; verified?: boolean; verifyDetails?: VerifyDetails; scope?: { files: string[] }; cwd?: string; startHead?: string; changedFiles?: string[]; scopeViolations?: string[] | null; scopeError?: string; dirtyWorktree?: boolean };
         // Merge worker completion record when present (issue #6). Issue #62:
         // the record may also carry the verify-gate outcome.
         try {
@@ -478,11 +479,19 @@ OPS["run.status"] = async ({ task, io, context }: OpCtx) => {
             const meta = st as typeof st & { harness?: string; piModel?: string };
             const logInfo = await capLogFile(paths.log, MAX_AUDIT_LOG_BYTES);
             const rawLog = await fsp.readFile(paths.log, "utf8").catch(() => "");
-            const changes = await fsp.readFile(paths.changes, "utf8").then(parseChanges, () => undefined);
+            const rawChanges = await fsp.readFile(paths.changes, "utf8").catch(() => "");
+            const changes = parseChanges(rawChanges);
+            // Issue #271: the run script appends a raw dirtyWorktree=1 tail when
+            // it captured file changes with an unmoved branch tip (work left
+            // uncommitted; nothing for fleet_sync to push). parseChanges picks
+            // the flag up into the manifest; the run record mirrors it so
+            // fleet_run_status never shows that run as a plain success.
+            if (dirtyWorktreeSignal(rawChanges)) changes.dirtyWorktree = true;
+            if (changes.dirtyWorktree) st.dirtyWorktree = true;
             manifest = buildManifest({
               runId, harness: meta.harness ?? "opencode", piModel: meta.piModel, cwd: st.cwd, startHead: st.startHead,
               startedAt: st.startedAt, finishedAt: st.finishedAt, exitCode: st.exitCode, verified: st.verified, verifyDetails: st.verifyDetails,
-              scope: st.scope, changes, events: extractEvents(rawLog, meta.harness ?? "opencode"), log: logInfo,
+              scope: st.scope, changes: rawChanges ? changes : undefined, events: extractEvents(rawLog, meta.harness ?? "opencode"), log: logInfo,
             });
             await writePrivate(paths.manifest, JSON.stringify(manifest)).catch(() => {});
           }
