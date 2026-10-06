@@ -1,6 +1,6 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { jsonResult } from "openclaw/plugin-sdk/core";
-import { type FleetConfig, payloadOf } from "./shared.js";
+import { type FleetConfig, payloadOf, internalMissionCalls } from "./shared.js";
 
 export function registerMissionTools(
   api: OpenClawPluginApi,
@@ -88,7 +88,7 @@ export function registerMissionTools(
         nodes: async () => { const l = await api.runtime.nodes.list(); const names = (l.nodes ?? []).filter((n) => n.connected !== false).map((n) => n.displayName ?? n.nodeId); const nodesCfg = (cfg as { nodes?: Record<string, unknown> }).nodes; const cfgd = nodesCfg ? Object.keys(nodesCfg) : []; return cfgd.length ? names.filter((n) => cfgd.includes(n)) : names; },
         limitFor: (n: string) => ((cfg as { nodes?: Record<string, { maxConcurrent?: number }> }).nodes)?.[n]?.maxConcurrent ?? cfg.capacity?.maxConcurrentPerNode,
         ledger: () => loadLedger(root),
-        dispatch: async (params: Record<string, unknown>) => decode(await dispatchTool.execute("mission", params as never, signal)),
+        dispatch: async (params: Record<string, unknown>) => { internalMissionCalls.add(params); return decode(await dispatchTool.execute("mission", params as never, signal)); },
         status: async (node: string, runId: string) => { await runStatusExecute("mission", { node, runId, includeOutput: false }, signal); },
         nowMs: () => Date.now(),
       };

@@ -92,3 +92,9 @@ export function payloadOf(inv: unknown): Record<string, unknown> {
   }
   return ((payload as Record<string, unknown> | undefined) ?? {});
 }
+
+/**
+ * Dispatch param objects created by fleet_mission_run. Only these may carry a `missionKey` into the
+ * ledger, so a direct fleet_dispatch caller cannot forge a key and have a mission adopt a foreign run.
+ */
+export const internalMissionCalls = new WeakSet<object>();

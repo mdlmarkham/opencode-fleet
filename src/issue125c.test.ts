@@ -131,4 +131,15 @@ describe("#125: fleet_mission_run (tool, over the real dispatch)", () => {
       expect((await t.call("fleet_mission_run", { missionId: "zzz" })).ok).toBe(false);
     } finally { t.dispose(); restore(); }
   });
+
+  it("a direct fleet_dispatch cannot forge a launch key (only the mission tool's own calls carry one)", async () => {
+    const restore = fakeSshMultiline(["FLEET_CWD=ok", "GITCLONE=yes", "BWRAP=no"]);
+    const t = loadPlugin((await loadEntry())!, { nodes: [{ nodeId: "n1", displayName: "dev2", connected: true, invocableCommands: ["opencode.run"] }], config: { nodes: { dev2: { roles: ["worker"], ssh: false } } }, invoke: () => nodeReply({ ok: true, detached: true, runId: "run-f", pid: 1 }) });
+    try {
+      await t.call("fleet_dispatch", { cwd: "/w/p", node: "dev2", prompt: "x", missionKey: "m1:a:1" });
+      const led = await loadLedger(t.rootDir);
+      expect(led.length).toBeGreaterThan(0);
+      expect(led.some((e) => e.missionKey !== undefined)).toBe(false);
+    } finally { t.dispose(); restore(); }
+  });
 });
