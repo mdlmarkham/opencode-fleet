@@ -450,14 +450,24 @@ export function registerDispatchTools(api: OpenClawPluginApi, cfg: FleetConfig):
       // Refusal would stack a second enforce-path onto `project.gate: "enforce"` before the rubric
       // has a calibration corpus — the ladder exists precisely to stop that. Promote to a refusal
       // later, per-point, once the shadow data says the baseline (or S1) earns it.
+      //
+      // Issue #308 (prompt path): the SAME rubric judges every prompt sent to a code agent, not
+      // only spec-path dispatches. A prompt-only dispatch is the MORE dangerous case (no verify,
+      // no scope) and used to bypass this entirely. The triviality exemption means probes and
+      // self-checks ('reply with OK') are not judged — a gate that nags on harmless prompts gets
+      // ignored, so the rubric only applies to SUBSTANTIVE prompts.
       let readiness: { ready: boolean; guidance: import("../readiness.js").Guidance[] } | undefined;
-      if (specCheck.spec && gateMode !== "off") {
-        const { readinessOf } = await import("../readiness.js");
-        readiness = readinessOf(specCheck.spec);
+      if (gateMode !== "off") {
+        const { readinessOf, readinessOfPrompt } = await import("../readiness.js");
+        readiness = specCheck.spec ? readinessOf(specCheck.spec) : readinessOfPrompt(p.prompt);
         // Shadow: fire the S1 point (never blocks, never throws). Fire-and-forget so a slow or
-        // unavailable S1 never delays a dispatch.
-        const { shadowPoint } = await import("../builtin-points.js");
-        void shadowPoint(cfg.s1, "readiness.dispatch", { text: JSON.stringify({ goal: specCheck.spec.goal, acceptance: specCheck.spec.acceptance ?? [], verify: specCheck.spec.verify ?? null, scope: specCheck.spec.scope ?? null }) }, readiness.ready, rootDir);
+        // unavailable S1 never delays a dispatch. A trivial prompt has no verdict to log.
+        if (readiness) {
+          const { shadowPoint } = await import("../builtin-points.js");
+          void shadowPoint(cfg.s1, "readiness.dispatch", { text: JSON.stringify(specCheck.spec
+            ? { goal: specCheck.spec.goal, acceptance: specCheck.spec.acceptance ?? [], verify: specCheck.spec.verify ?? null, scope: specCheck.spec.scope ?? null }
+            : { prompt: p.prompt }) }, readiness.ready, rootDir);
+        }
       }
       const dispatchWarnings: string[] = [];
       if (p.timeoutMs !== undefined && p.timeoutMs < 600_000 && (specCheck.spec?.acceptance?.length ?? 0) >= 2) {

@@ -155,3 +155,44 @@ export function readinessSignals(spec: TaskSpec): ReadinessSignals {
 export function readinessOf(spec: TaskSpec): { ready: boolean; guidance: Guidance[] } {
   return readinessBaseline(readinessSignals(spec));
 }
+
+/**
+ * Issue #308: is a bare PROMPT substantive enough to judge — or is it a probe?
+ *
+ * A prompt-only dispatch has no spec, so `readinessSignals` cannot read acceptance/verify/scope.
+ * The risk of judging every prompt is nagging on harmless ones ("reply with exactly: OK", a
+ * self-check), which trains the caller to ignore the gate. So a prompt is judged ONLY when it
+ * looks like real work:
+ *   - it is more than a trivial length AND
+ *   - it is not a single imperative probe (say/print/reply/echo/run … with a short object),
+ * and it is judged against the criteria a prompt CAN satisfy: concrete change + named deliverable.
+ * A prompt has no acceptance/verify/scope unless its author wrote them inline, so those criteria
+ * are only applied when the prompt actually carries a checkable clause.
+ */
+export function isSubstantivePrompt(prompt: string): boolean {
+  const t = String(prompt ?? "").trim();
+  if (t.length < 40) return false; // a short prompt is a probe, not a task
+  const lines = t.split(/\n/).filter((l) => l.trim() !== "");
+  if (lines.length === 1) {
+    // a one-liner that is a bare imperative probe ("reply with exactly: OK", "print hello")
+    const PROBE = /^(?:reply with|say|print|echo|output|run|execute|just reply|respond with)\b/i;
+    const probeWords = lines[0].trim().split(/\s+/).length;
+    if (PROBE.test(lines[0]) && probeWords <= 12) return false;
+  }
+  return true;
+}
+
+/** Readiness of a bare prompt. Returns `undefined` for a trivial/probe prompt (not judged). */
+export function readinessOfPrompt(prompt: string): { ready: boolean; guidance: Guidance[] } | undefined {
+  if (!isSubstantivePrompt(prompt)) return undefined;
+  const text = String(prompt ?? "");
+  const g: Guidance[] = [];
+  const add = (criterion: string) => {
+    const c = READINESS_CRITERIA.find((x) => x.id === criterion);
+    if (c) g.push({ criterion, what: c.what, fix: c.fix });
+  };
+  if (OPEN_ENDED.test(text.trim())) add("concrete-change");
+  const namedDeliverable = /\b[\w.-]+\/(?:[\w.-]+\/)*[\w.-]+\.\w{1,4}\b|\b\w+\(\)|\bexport\s+(?:function|const|class)\b/.test(text);
+  if (!namedDeliverable) add("deliverable-named");
+  return { ready: g.length === 0, guidance: g };
+}
