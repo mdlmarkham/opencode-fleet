@@ -70,8 +70,29 @@ export function registerMissionTools(
       if (!loaded.ok) return jsonResult({ ok: false, error: loaded.error });
       if (p.approve === true) {
         if (loaded.record.phase === "designing") { const a = await store.setPhase(root, p.missionId, "awaiting-approval", "plan submitted"); if (!a.ok) return jsonResult({ ok: false, error: a.error }); }
+        // Issue #249: materialize the design as reviewable artifact FILES at
+        // approval (plan.md + tasks.md in the project checkout) and pin their
+        // sha256 in the mission journal, so the approved revision is recorded
+        // and later drift is detectable. Best-effort: a materialization failure
+        // (e.g. a non-writable checkout) does NOT block approval, but is journaled.
+        const repoDir = loaded.record.target?.cwd;
+        let designArtifacts: { written: string[]; planSha: string; tasksSha: string } | undefined;
+        if (typeof repoDir === "string") {
+          const mat = await store.materializeDesign(repoDir, p.missionId);
+          if (mat.ok) {
+            designArtifacts = mat;
+            await store.appendJournal(root, p.missionId, { type: "design-materialized", why: "design written to files at approval", evidence: `plan=${mat.planSha.slice(0, 12)} tasks=${mat.tasksSha.slice(0, 12)}` });
+          } else {
+            await store.appendJournal(root, p.missionId, { type: "design-materialize-failed", why: mat.error, evidence: repoDir });
+          }
+        }
         const b = await store.setPhase(root, p.missionId, "executing", "approved by the caller (human go-ahead)");
         if (!b.ok) return jsonResult({ ok: false, error: b.error });
+        if (designArtifacts) {
+          const n = Math.min(5, Math.max(1, Math.floor(typeof p.ticks === "number" ? p.ticks : 1)));
+          void n;
+          return jsonResult({ ok: true, phase: "executing", designArtifacts: { written: designArtifacts.written, planSha: designArtifacts.planSha, tasksSha: designArtifacts.tasksSha } });
+        }
       }
       const { tick } = await import("../mission-runner.js");
       const { nodeDeps } = await import("../mission-node.js");
