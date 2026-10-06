@@ -68,6 +68,10 @@ export interface LedgerEntry {
   scopeViolations?: string[] | null;
   /** Design-gate objections the caller acknowledged to dispatch anyway (issue #117), with their reasons. */
   gateAcknowledged?: Array<{ objectionId: string; reason: string }>;
+  /** The design gate's verdict and the objection ids that fired at dispatch (issue #166): ids only, never text. */
+  design?: { verdict: string; objectionIds: string[] };
+  /** How many files the run changed against its start commit, from the audit manifest at reconcile (issue #166). Absent: never captured. */
+  filesChanged?: number;
   /** What the run spent (issue #39: budget accounting), from its audit manifest when the manager reconciles the finished run: tokens summed, costUsd when the engine reports a cost. Absent for unfinished or pre-budget runs; a run is accounted to the UTC day it STARTED. */
   usage?: RunUsage;
   /** The per-dispatch caps the run was admitted under (issue #39): the dispatch override, absent when the config default applied or no budget is configured. */
