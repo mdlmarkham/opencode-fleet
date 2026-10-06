@@ -28,7 +28,11 @@ export interface World {
   nowMs(): number;
 }
 
-const TERMINAL = new Set(["completed", "failed", "failed-verification", "discarded"]);
+// Issue #244 review fix: `timed-out` is terminal for the mission loop (a wall-clocked run must
+// resolve, not be polled forever).
+const TERMINAL = new Set(["completed", "failed", "failed-verification", "discarded", "timed-out"]);
+/** Conservative bound before an acknowledged-but-unrecorded launch is declared presumed-lost. */
+export const LOST_AFTER_MS = 900_000;
 
 export function signalsOf(e: LedgerEntry): OutcomeSignals {
   const failedGate = e.state === "failed-verification" || e.verified === false;
@@ -36,7 +40,7 @@ export function signalsOf(e: LedgerEntry): OutcomeSignals {
     ok: e.state === "completed" || e.state === "failed-verification",
     verified: typeof e.verified === "boolean" ? e.verified : null,
     ...(e.handRaised ? { handRaised: true, ...(e.question ? { question: e.question } : {}) } : {}),
-    ...(failedGate ? { evidence: String(e.summary ?? "the verification gate failed").slice(0, 400) } : e.state === "failed" ? { error: String(e.summary ?? "the run failed").slice(0, 400) } : {}),
+    ...(failedGate ? { evidence: String(e.summary ?? "the verification gate failed").slice(0, 400) } : e.state === "failed" ? { error: String(e.summary ?? "the run failed").slice(0, 400) } : e.state === "timed-out" ? { evidence: String(e.summary ?? "the run hit its wall-clock limit").slice(0, 400) } : {}),
   };
 }
 
@@ -86,7 +90,19 @@ export function nodeDeps(root: string, record: MissionRecord, world: World, extr
       const out: Awaited<ReturnType<TickDeps["poll"]>> = {};
       for (const r of running) {
         const e0 = (await world.ledger()).find((e) => e.runId === r.runId);
-        if (!e0) continue;
+        if (!e0) {
+          // Issue #244 review fix: an acknowledged run whose ledger write was lost is NOT stranded.
+          // The run may be live on the node: probe via status (which reconciles the ledger as a side
+          // effect); only beyond the conservative bound declare the launch presumed lost.
+          if (!r.node) continue;
+          try { await world.status(r.node, r.runId); } catch { /* probe failed; the bound still applies */ }
+          const e1 = (await world.ledger()).find((x) => x.runId === r.runId);
+          if (e1 && TERMINAL.has(e1.state)) { out[r.specId] = { runId: r.runId, signals: signalsOf(e1) }; continue; }
+          if (e1) continue; // reconciled, still running
+          if (world.nowMs() - (r.startedAtMs ?? 0) <= LOST_AFTER_MS) continue;
+          out[r.specId] = { runId: r.runId, lost: `the launch is presumed lost: no ledger entry appeared for run ${r.runId} after ${LOST_AFTER_MS}ms (a status probe was made); a bounded re-attempt may follow` };
+          continue;
+        }
         if (!TERMINAL.has(e0.state)) { try { await world.status(e0.node, r.runId); } catch { continue; } }
         const e = (await world.ledger()).find((x) => x.runId === r.runId);
         if (e && TERMINAL.has(e.state)) out[r.specId] = { runId: r.runId, signals: signalsOf(e) };

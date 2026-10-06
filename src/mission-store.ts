@@ -189,11 +189,19 @@ export function resolveAssumption(root: string, id: string, assumptionId: string
 
 // ---- journal ---------------------------------------------------------------------------------------
 
-export interface MissionJournalEntry { seq: number; ts: string; type: string; why: string; evidence?: string; runId?: string }
+export interface MissionJournalEntry { seq: number; ts: string; type: string; why: string; evidence?: string; runId?: string   /** Issue #244 review fix: machine-readable launch discrimination. */
+  specId?: string;
+  key?: string;
+}
 const JOURNAL_MAX_BYTES = 1024 * 1024;
 
 /** Append one entry; rotates to journal.1.jsonl past 1 MB so the log stays bounded. */
-export async function appendJournal(root: string, id: string, e: { type: string; why: string; evidence?: string; runId?: string }): Promise<MissionJournalEntry | undefined> {
+export async function appendJournal(
+  root: string,
+  id: string,
+  e: { type: string; why: string; evidence?: string; runId?: string; /** Issue #244 review fix: machine-readable launch discrimination (specId/key) so a reconcile can tell an ambiguous launch from a crash before launch. */
+  specId?: string; key?: string },
+): Promise<MissionJournalEntry | undefined> {
   const dir = dirOf(root, id);
   try {
     await mkdir(dir, { recursive: true, mode: 0o700 });
@@ -201,7 +209,7 @@ export async function appendJournal(root: string, id: string, e: { type: string;
     const file = join(dir, "journal.jsonl");
     try { if ((await stat(file)).size > JOURNAL_MAX_BYTES) await rename(file, join(dir, "journal.1.jsonl")); } catch { /* none yet */ }
     const entries = await readJournal(root, id);
-    const entry: MissionJournalEntry = { seq: (entries[entries.length - 1]?.seq ?? 0) + 1, ts: now(), type: clip(e.type, 60), why: clip(e.why), ...(e.evidence ? { evidence: clip(e.evidence, 300) } : {}), ...(e.runId ? { runId: clip(e.runId, 80) } : {}) };
+    const entry: MissionJournalEntry = { seq: (entries[entries.length - 1]?.seq ?? 0) + 1, ts: now(), type: clip(e.type, 60), why: clip(e.why), ...(e.evidence ? { evidence: clip(e.evidence, 300) } : {}), ...(e.runId ? { runId: clip(e.runId, 80) } : {}), ...(e.specId ? { specId: clip(e.specId, 40) } : {}), ...(e.key ? { key: clip(e.key, 80) } : {}) };
     await appendFile(file, `${JSON.stringify(entry)}\n`, { mode: 0o600 });
     return entry;
     }, "journal.lock");
