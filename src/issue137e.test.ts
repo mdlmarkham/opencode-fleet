@@ -16,6 +16,10 @@ describe("#137: Pi minimum version", () => {
     expect(checkPiVersion("", "0.73.1")).toMatchObject({ ok: false, error: expect.stringContaining("could not read") });
     expect(checkPiVersion("bash: pi: command not found", "0.73.1").ok).toBe(false);
     expect(checkPiVersion("0.74.0", "banana").ok).toBe(false);
+    // Noise lines are never read as Pi's version (an old Pi must not pass on a warning's number).
+    expect(checkPiVersion("(node:1) Warning: update to 22.9.9\npi 0.70.0", "0.73.1").ok).toBe(false);
+    expect(checkPiVersion("Update available: 9.9.9\npi 0.74.0", "0.73.1")).toEqual({ ok: true, version: "0.74.0" });
+    expect(checkPiVersion("Update available: 9.9.9", "0.73.1").ok).toBe(false);
   });
 });
 
