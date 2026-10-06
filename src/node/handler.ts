@@ -131,6 +131,15 @@ OPS["state.prune"] = async ({ task }: OpCtx) => {
   return JSON.stringify({ ok: true, olderThanDays: d, ...res, ...cloneReport });
 };
 
+OPS["project.read"] = async ({ task }: OpCtx) => {
+  // Issue #158: raw text of the known .fleet/ files, read with the same caps and symlink refusal as
+  // the gateway's own loader. cwd was already confined to FLEET_ALLOWED_ROOTS by the guard. The node
+  // does NOT parse or validate: the gateway re-validates everything, so this reply is only ever data.
+  const { readProjectFiles } = await import("../project-load.js");
+  const r = await readProjectFiles(task.cwd);
+  return JSON.stringify({ ok: true, ...r });
+};
+
 OPS["diff"] = async ({ task, io, context }: OpCtx) => {
   void io; void context;
       // Show the working-tree diff in the checkout (real diff).

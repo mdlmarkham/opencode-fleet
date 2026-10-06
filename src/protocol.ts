@@ -18,12 +18,14 @@
  *               checkout, silently dropping the isolation the caller asked for
  *   protocol 5  adds Pi `piTools`/`piOffline`; a node below 5 would run Pi with every tool
  *               and the network, silently dropping the restriction the caller asked for
+ *   protocol 6  adds the `project.read` op (raw `.fleet/` text for the gateway to re-validate); an older
+ *               node would take its sentinel for an ordinary task prompt
  */
 
-export const PROTOCOL_VERSION = 5;
+export const PROTOCOL_VERSION = 6;
 
 /** Ops that only a node of at least this protocol understands (absent = any node). */
-export const OP_MIN_PROTOCOL: Readonly<Record<string, number>> = { "state.prune": 3 };
+export const OP_MIN_PROTOCOL: Readonly<Record<string, number>> = { "state.prune": 3, "project.read": 6 };
 
 /** Minimum node protocol an op itself needs, with a label for refusal messages. */
 export function requiredProtocolForOp(op: string): { version: number; feature?: string } {
@@ -76,6 +78,7 @@ export const SENTINEL_OPS = {
   __RUN_STATUS__: "run.status",
   __RUN_RESULT__: "run.result",
   __PRUNE__: "state.prune",
+  __PROJECT_READ__: "project.read",
 } as const;
 
 export type SentinelPrompt = keyof typeof SENTINEL_OPS;
