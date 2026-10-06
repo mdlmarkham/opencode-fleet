@@ -43,6 +43,7 @@ import type {
   ShadowRecordDeps,
 } from "./s1-shadow.js";
 import type { DecideInput, FleetAnswer } from "./decision.js";
+import { gatewaySrc } from "./testkit/src.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -745,7 +746,7 @@ describe("issue #79b e2e: fleet_dispatch with s1 configured (shadow records-only
 // ---------------------------------------------------------------------------
 
 describe("issue #79b wiring contract", () => {
-  const dispatchSrc = readFileSync(join(here, "index.ts"), "utf8");
+  const dispatchSrc = gatewaySrc();
   const shadowSrc = readFileSync(join(here, "s1-shadow.ts"), "utf8");
 
   it("the shadow module loads lazily: exactly ONE dynamic import, inside the s1 guard, no static import", () => {

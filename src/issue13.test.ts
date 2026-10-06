@@ -2,10 +2,11 @@ import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { gatewaySrc } from "./testkit/src.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const provision = readFileSync(join(here, "provision.ts"), "utf8");
-const index = readFileSync(join(here, "index.ts"), "utf8");
+const index = gatewaySrc();
 
 /**
  * Issue #13 (layer 3) regression guards: fleet_sync must publish the worker's

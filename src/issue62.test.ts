@@ -23,6 +23,7 @@ import {
 import { doneMarkerLine, runScriptPath, verifyGateScript } from "./node/runtime.js";
 import { handleOpencodeRun } from "./node/handler.js";
 import { runPaths } from "./paths.js";
+import { gatewaySrc } from "./testkit/src.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -474,7 +475,7 @@ describe("issue #62: node handler — the synchronous (op 'run') path verifies t
 
 describe("issue #62: gateway wiring", () => {
   it("fleet_dispatch validates + threads expect; fleet_run_status surfaces the gate", () => {
-    const src = readFileSync(join(here, "index.ts"), "utf8");
+    const src = gatewaySrc();
     expect(src).toContain("Post-run verification gate.");
     expect(src).toContain("parseExpectSpec(p.expect)");
     expect(src).toContain("expect: expectSpec.expect,");

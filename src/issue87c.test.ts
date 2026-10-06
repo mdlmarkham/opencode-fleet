@@ -31,6 +31,7 @@ import {
 } from "./s1-wire.js";
 import { loadLedger } from "./ledger.js";
 import type { DecideInput, FleetAnswer } from "./decision.js";
+import { gatewaySrc } from "./testkit/src.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -881,7 +882,7 @@ describe("issue #87c e2e: fleet_dispatch `autoTriage` (opt-in)", () => {
 // ---------------------------------------------------------------------------
 
 describe("issue #87c wiring contract (index.ts)", () => {
-  const dispatchSrc = readFileSync(join(here, "index.ts"), "utf8");
+  const dispatchSrc = gatewaySrc();
 
   it("the dispatch schema declares both opt-in flags with default-off semantics", () => {
     expect(dispatchSrc).toMatch(/route: \{\n\s+type: "object",\n\s+additionalProperties: false,\n\s+description: "Opt-in S1 engine routing/);

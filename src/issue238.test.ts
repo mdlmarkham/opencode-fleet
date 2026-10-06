@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { deployPlugin, validatePluginDir } from "./deploy.js";
+import { gatewaySrc } from "./testkit/src.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -77,7 +78,7 @@ describe("#238: deployPlugin refuses a non-repo pluginDir before build", () => {
   });
 
   it("the remedy is wired: the tool honors deploy.pluginDir config and the manifest allows it", () => {
-    const src = readFileSync(join(here, "index.ts"), "utf8");
+    const src = gatewaySrc();
     expect(src).toContain("cfg.deploy?.pluginDir");
     const manifest = JSON.parse(readFileSync(join(here, "..", "openclaw.plugin.json"), "utf8")) as {
       configSchema: { properties: Record<string, { properties?: Record<string, { type?: string }> }> };
