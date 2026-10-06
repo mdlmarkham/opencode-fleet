@@ -132,7 +132,7 @@ export function discoverySignal(spec: { goal: string }): { phrases: string[]; so
   // clause/subject, not by `and`/a noun-compound. We require the verb followed by a
   // determiner/wh-word/pronoun (the, a, an, why, how, whether, what, this, it) or by the
   // end of the phrase — the shape of a real instruction.
-  const IMPERATIVE_TAIL = /\s+(?:the|a|an|why|how|whether|what|which|if|this|that|it|these|those)\b/;
+  const IMPERATIVE_TAIL = /^\s+(?:the|a|an|why|how|whether|what|which|if|this|that|it|these|those)\b/;
   const strong = (m: RegExpMatchArray | null): string | undefined => {
     if (!m) return undefined;
     const whole = m[0];

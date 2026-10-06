@@ -75,6 +75,11 @@ describe("#288: an open-ended investigation is needs-design, not a dispatch", ()
       "Add a design section to the README explaining the gate",
       "Rename why-not-retry to explain-retry",
       "Diagnose output should be redacted: add redaction to the diagnose helper",
+      // Re-review finding: IMPERATIVE_TAIL must be ANCHORED to the text right after the verb,
+      // else a later `a`/`the` satisfies it — `troubleshoot` + "... a section" was a false block.
+      "Troubleshoot guide: add a section for dispatch failures",
+      "Debug logging should include the run id",
+      "Use the debug flag",
     ]) {
       expect(ids(goal), goal).not.toContain("spec.needs-design");
       expect(gate({ ...GOOD, goal }).verdict, goal).not.toBe("needs-design");
