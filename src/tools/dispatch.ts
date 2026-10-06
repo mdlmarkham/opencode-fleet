@@ -399,6 +399,9 @@ export function registerDispatchTools(api: OpenClawPluginApi, cfg: FleetConfig):
           reason: "gateway-not-connected",
           error: `no dispatchable node: ${staleNodes.join(", ")} ${staleNodes.length === 1 ? "is" : "are"} not connected to the gateway, so ${staleNodes.length === 1 ? "its" : "their"} command list cannot be refreshed. This is a GATEWAY admission fault (the node may have advertised opencode.run and still be unable to re-register), not "not an opencode node". Restore gateway connectivity and retry.`,
           staleNodes,
+          // Issue #288: a genuinely non-opencode node in the SAME fan-out is
+          // still skipped; dropping it here hides it.
+          skippedNodes,
         });
       }
       // Issue #117: deterministic design gate. Only a structured spec is gated; a prompt-only
@@ -444,6 +447,10 @@ export function registerDispatchTools(api: OpenClawPluginApi, cfg: FleetConfig):
       }
       const results: Record<string, unknown> = {};
       if (skippedNodes.length) results.skipped = skippedNodes;
+      // Issue #288: in a mixed fan-out the stale node was collected here but
+      // only surfaced in the all-stale early return — it vanished from the
+      // result entirely. Report it alongside the dispatchable targets.
+      if (staleNodes.length) results.staleNodes = staleNodes;
       if (design && design.verdict !== "accept") results.design = design;
       if (noGate && gateMode !== "off") results.verification = { gate: "none", note: "no verify gate: success is just the process exit code and is unchecked. Pass a `spec` with `verify` (or `expect`) so a run that exits 0 but did nothing is caught." };
       if (dispatchWarnings.length) results.warnings = dispatchWarnings;
