@@ -58,7 +58,8 @@ export function parseChanges(text: string): Changes {
 export interface Commands {
   /** True when the engine's stream reports tool calls at all. False means "unknown", never "none". */
   commandsRecorded: boolean;
-  commands: Array<{ tool: string; input: string }>;
+  /** `exitCode` is recorded only when the engine's event carried a numeric one; absent = unknown, never 0. */
+  commands: Array<{ tool: string; input: string; exitCode?: number }>;
   eventCount: number;
   usage?: { inputTokens: number; outputTokens: number; reasoningTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number; costUsd?: number };
 }
@@ -75,6 +76,7 @@ function extractPiEvents(raw: string): Commands {
   const commands: Commands["commands"] = [];
   const u = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costUsd: 0 };
   let sawUsage = false;
+  const callIndex = new Map<string, number>();
   for (const e of events) {
     if (e.type === "tool_execution_start" && typeof e.toolName === "string") {
       const a = e.args;
@@ -82,6 +84,11 @@ function extractPiEvents(raw: string): Commands {
       const rec = isObj ? (a as Record<string, unknown>) : {};
       const text = typeof rec.command === "string" ? rec.command : typeof rec.path === "string" ? rec.path : a !== undefined ? JSON.stringify(a) : "";
       commands.push({ tool: e.toolName, input: text.slice(0, 2000) });
+      if (typeof e.toolCallId === "string") callIndex.set(e.toolCallId, commands.length - 1);
+    } else if (e.type === "tool_execution_end" && typeof e.toolCallId === "string" && callIndex.has(e.toolCallId)) {
+      const r = e.result as { exitCode?: unknown; details?: { exitCode?: unknown } } | null | undefined;
+      const code = r?.exitCode ?? r?.details?.exitCode;
+      if (typeof code === "number" && Number.isInteger(code)) commands[callIndex.get(e.toolCallId)!]!.exitCode = code;
     } else if (e.type === "message_end") {
       const m = e.message as { role?: unknown; usage?: unknown } | null | undefined;
       const usage = m && m.role === "assistant" && typeof m.usage === "object" && m.usage !== null ? (m.usage as Record<string, unknown>) : undefined;
@@ -124,7 +131,8 @@ export function extractEvents(raw: string, harness: string): Commands {
     if (evt.type === "tool_use" && typeof evt.part?.tool === "string") {
       const input = evt.part.state?.input;
       const text = typeof input?.command === "string" ? input.command : typeof input?.filePath === "string" ? input.filePath : input !== undefined ? JSON.stringify(input) : "";
-      commands.push({ tool: evt.part.tool, input: text.slice(0, 2000) });
+      const exit = evt.part.state?.metadata?.exit;
+      commands.push({ tool: evt.part.tool, input: text.slice(0, 2000), ...(typeof exit === "number" && Number.isInteger(exit) ? { exitCode: exit } : {}) });
     }
     if (evt.type === "step_finish" && evt.part && typeof evt.part === "object") {
       const t = evt.part.tokens;
