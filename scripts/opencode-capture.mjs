@@ -48,8 +48,7 @@ const fsFacts = Object.fromEntries([
   ["~/.claude/skills", join(home, ".claude", "skills")],
 ].map(([k, p]) => [k, list(p)]));
 
-const helpText = `${probes.runHelp.stdout}\n${probes.runHelp.stderr}`;
-const modelRun = run(["run", "--format", "json", ...(helpText.includes("--auto") ? [] : []), "Use your shell tool to run `echo fleet-oc-probe`, then reply with the single word: done"], dir, "", 180_000);
+const modelRun = run(["run", "--format", "json", "Use your shell tool to run `echo fleet-oc-probe`, then reply with the single word: done"], dir, "", 180_000);
 rmSync(dir, { recursive: true, force: true });
 
 process.stdout.write(JSON.stringify({ capturedAt: new Date().toISOString(), probes, fsFacts, modelRun }, null, 2) + "\n");
