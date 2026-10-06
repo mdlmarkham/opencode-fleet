@@ -46,6 +46,8 @@ import type { S1RouteDecision, S1RouteHarnessResult } from "./s1-wire.js";
  */
 
 interface FleetConfig {
+  /** Issue #238: where the plugin REPO checkout (package.json) lives on this host, used as fleet_deploy's default pluginDir when the installed plugin dir is not the repo. */
+  deploy?: { pluginDir?: string };
   defaultTransport?: "http" | "acp";
   nodePrefixes?: string[];
   defaultTimeoutMs?: number;
@@ -1830,7 +1832,7 @@ export default definePluginEntry({
           return jsonResult({ ok: true, nonce, prompt, next: [`provision a checkout at ${head} on a node that is NOT the author's worker (fleet_provision with commit)`, "run the prompt there with fleet_dispatch (harness of your choice), then fleet_await it", `then call fleet_review {action:"collect", node, runId}`], note: "The nonce is single-use and expires in 24 hours." });
         }
         if (p.action === "collect") {
-          const { peekPending, takePending, parseReviewerOutput, unexecutedClaims, headBinding } = await import("./review-spawn.js");
+          const { peekPending, takePending, parseReviewerOutput, unexecutedClaims, contradictedClaims, headBinding } = await import("./review-spawn.js");
           const { loadLedger } = await import("./ledger.js");
           const entry = (await loadLedger(rootDir)).find((r) => r.runId === p.runId);
           if (!entry) return jsonResult({ ok: false, error: "unknown runId: not in the ledger" });
@@ -1854,6 +1856,8 @@ export default definePluginEntry({
           if (String(report.verdict).toUpperCase() === "PASS") {
             const bind = headBinding(report, pending.headSha, manifest);
             if (!bind.ok) return jsonResult({ ok: false, error: bind.error });
+            const contradicted = contradictedClaims(report.commands ?? [], manifest as Array<{ input?: string; exitCode?: number }>);
+            if (contradicted.length) return jsonResult({ ok: false, error: `the reviewer reports exit 0 for commands the run's own manifest recorded as failing: ${contradicted.join("; ")}` });
             const missing = unexecutedClaims(claimed, manifest);
             if (missing.length) return jsonResult({ ok: false, error: `the reviewer claims commands that are not in the run's executed-command manifest: ${missing.map((m) => m.slice(0, 80)).join(" | ")}` });
           }
@@ -3131,7 +3135,7 @@ export default definePluginEntry({
           if (svc) nodeUsers[host] = svc;
           if (n.member?.user) nodeLoginUsers[host] = n.member.user;
         }
-        const pluginDir = p.pluginDir ?? join(api.rootDir ?? process.cwd(), "..");
+        const pluginDir = p.pluginDir ?? (cfg.deploy?.pluginDir || join(api.rootDir ?? process.cwd(), ".."));
         const r = await deployPlugin({
           pluginDir,
           nodes: hosts,

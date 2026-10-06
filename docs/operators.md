@@ -91,6 +91,7 @@ without editing this section fails the build. Config lives at
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
+| `deploy` | `{pluginDir?}` | _(none)_ | Issue #238: where the plugin **repo** checkout (the dir containing `package.json`) lives on this host, when the installed plugin location (`~/.openclaw/extensions/...`) is not the repo. `fleet_deploy` uses it as the default `pluginDir` instead of the derived installed-parent default — without it (or an explicit `pluginDir` param) a deploy from an installed plugin refuses precisely instead of failing with a bare npm ENOENT. |
 | `defaultTransport` | `"http" \| "acp"` | `http` | Default OpenCode transport. `http` (`opencode run`) supports per-task `--model`; `acp` (`opencode acp`) is the full-featured path (MCP, AGENTS.md rules) with config-scoped model. |
 | `nodePrefixes` | `string[]` | `[]` | Legacy fallback: display-name prefixes treated as fleet members when the `nodes` map is not configured. No prefixes by default — membership is explicit (`src/membership.ts`). |
 | `defaultTimeoutMs` | `number` | `1800000` (30 min) | Default wall-clock limit for a dispatched run; the run reports `endedBy: "wall-clock"` when it hits it. The idle watchdog (`maxIdleMs` per dispatch, default 120000) is the primary hung-run guard. |
