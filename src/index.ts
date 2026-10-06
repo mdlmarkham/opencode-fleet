@@ -70,7 +70,7 @@ interface FleetConfig {
   isolation?: "none" | "clone";
   /** Deterministic design gate for spec dispatches (issue #117): off | advise (default) | enforce, plus size bounds. */
   /** Concurrency slots (issue #39). */
-  capacity?: { maxConcurrentPerNode?: number; staleAfterMs?: number };
+  capacity?: { maxConcurrentPerNode?: number; staleAfterMs?: number; minFreeDiskGb?: number };
   /** Spend caps (issue #39): per-UTC-day totals from ledger usage + per-dispatch caps. Validated by parseBudgetConfig. */
   budget?: { dailyCostUsd?: number; dailyTokens?: number; perDispatchCostUsd?: number; perDispatchTokens?: number };
   project?: { gate?: "off" | "advise" | "enforce"; maxScopePatterns?: number; maxAcceptanceItems?: number; roots?: string[]; rules?: unknown[]; requireCharterFields?: string[]; allowRepoBlocking?: boolean; screenOutput?: "off" | "shadow" | "fence" | "withhold" };
@@ -170,6 +170,7 @@ export default definePluginEntry({
         description: "Concurrency slots. Slots are counted from the gateway's run ledger; see fleet_capacity.",
         properties: {
           maxConcurrentPerNode: { type: "integer", minimum: 1, maximum: 64, description: "Default max concurrent runs per node. Unset means unlimited." },
+          minFreeDiskGb: { type: "integer", minimum: 1, maximum: 10000, description: "Isolated (clone) runs copy the object store: a node with less free disk than this refuses another, with a retryable no-disk result. Unset means no check." },
           staleAfterMs: { type: "integer", minimum: 60000, default: 21600000, description: "A run still `running` in the ledger after this long without an update stops holding a slot and is reported as suspected stale." },
         },
       },
@@ -842,6 +843,12 @@ export default definePluginEntry({
               };
               continue;
             }
+          }
+          // Issue #105: an isolated run copies the object store; refuse (retryably) when the node is short of disk.
+          if (isolationMode === "clone" && (cfg.capacity?.minFreeDiskGb ?? 0) > 0) {
+            const { diskFreeCommand, parseFreeKb, diskHeadroom } = await import("./capacity.js");
+            const room = diskHeadroom(nodeName, parseFreeKb(await sshProbe(sshHost, diskFreeCommand(shq(p.cwd)))), cfg.capacity!.minFreeDiskGb!);
+            if (!room.ok) { results[nodeKey] = room; continue; }
           }
           if (routed.harness !== "pi" && (p.piTools !== undefined || p.piOffline !== undefined || p.piJson !== undefined)) {
             results[nodeKey] = { ok: false, error: "piTools/piOffline/piJson apply to harness=pi only; refusing so the restriction is not silently ignored" };

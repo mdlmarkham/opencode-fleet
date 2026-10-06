@@ -122,3 +122,30 @@ export function noCapacity(node: string, limit: number, running: LedgerEntry[]):
     running: running.map((r) => r.runId),
   };
 }
+
+// ---------------------------------------------------------------------------
+// Disk headroom for isolated runs (issue #105)
+// ---------------------------------------------------------------------------
+
+/** One-line probe: available KB on the filesystem holding `quotedCwd` (already shell-quoted). */
+export const diskFreeCommand = (quotedCwd: string): string => `df -Pk -- ${quotedCwd} 2>/dev/null | awk 'NR==2{print "FREE_KB=" $4}'`;
+
+/** Parse the probe's output; null when it did not report a number (never "plenty"). */
+export function parseFreeKb(out: string): number | null {
+  const m = /FREE_KB=(\d+)/.exec(out);
+  return m ? Number(m[1]) : null;
+}
+
+export interface NoDisk { ok: false; retryable: true; reason: "no-disk"; error: string; node: string; freeGb: number | null; floorGb: number }
+
+/**
+ * An isolated run copies the object store, so a node without headroom must not start another one.
+ * Fails CLOSED: a probe that could not measure free space is a refusal with that reason, not a pass.
+ */
+export function diskHeadroom(node: string, freeKb: number | null, floorGb: number): { ok: true } | NoDisk {
+  if (!(floorGb > 0)) return { ok: true };
+  if (freeKb === null) return { ok: false, retryable: true, reason: "no-disk", node, freeGb: null, floorGb, error: `node ${node}: could not measure free disk space, and capacity.minFreeDiskGb (${floorGb} GB) is set; refusing to start another isolated run` };
+  const freeGb = Math.floor((freeKb / 1024 / 1024) * 10) / 10;
+  if (freeGb < floorGb) return { ok: false, retryable: true, reason: "no-disk", node, freeGb, floorGb, error: `node ${node} has ${freeGb} GB free, below capacity.minFreeDiskGb (${floorGb} GB); retry when space is freed (fleet_cleanup) or use another node` };
+  return { ok: true };
+}

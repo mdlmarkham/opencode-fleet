@@ -97,7 +97,7 @@ without editing this section fails the build. Config lives at
 | `nodes` | `map<string, NodeConfig>` | _(none)_ | Explicit fleet membership. Per-node keys: `roles[]`, `ssh` (bool; `false` → node-channel provisioning/sync, see checklist item 5), `platform`, `tags[]`, `user` (SSH login user), `serviceUser` (principal the node service runs as when different), `maxConcurrent` (int 1–64; per-node slot limit overriding `capacity.maxConcurrentPerNode`, issue #39). |
 | `workerGitIdentity` | `{name?, email?}` | _(unset; opt-in)_ | Issue #189: `fleet_provision` sets this git identity in each provisioned checkout's **local** config (only keys the checkout lacks; never global) so worker-authored commits are recognisable. Defaults `fleet-worker` / `fleet-worker@<node>.invalid`. SSH-provisioned nodes only. |
 | `dispatch` | `{defaultTarget?: "all"}` | _(defaultTarget unset)_ | Issue #168: without a default, a `fleet_dispatch` that names no target is **refused** with the node list and free slots; fan-out is explicit (`nodes: "all"`), `pick: "any"` picks one free node. `defaultTarget: "all"` restores fleet-wide fan-out for an unnamed target. |
-| `capacity` | `{maxConcurrentPerNode?, staleAfterMs?}` | both unset (unlimited slots), `staleAfterMs` default `21600000` (6 h) | Issue #39 concurrency slots, counted gateway-side from the run ledger. `maxConcurrentPerNode` (int 1–64) bounds runs per node; `staleAfterMs` (min 60000) releases the slot of a run still `running` without updates past that age (reported `suspectedStale`). |
+| `capacity` | `{maxConcurrentPerNode?, staleAfterMs?, minFreeDiskGb?}` | both unset (unlimited slots), `staleAfterMs` default `21600000` (6 h) | Issue #39 concurrency slots, counted gateway-side from the run ledger. `maxConcurrentPerNode` (int 1–64) bounds runs per node; `staleAfterMs` (min 60000) releases the slot of a run still `running` without updates past that age (reported `suspectedStale`). `minFreeDiskGb` (issue #105): an isolated (`clone`) run copies the object store, so a node with less free disk than this refuses another with a retryable `no-disk` result (fail closed: a probe that cannot measure space is also a refusal). Unset = no check. |
 | `allowAutoApprove` | `boolean` | `true` | Whether `fleet_dispatch` may pass `autoApprove` (`opencode run --auto`, auto-approves every non-denied permission). Set `false` to forbid it fleet-wide. The per-dispatch flag itself still defaults to **false**. |
 | `allowSetupCommands` | `boolean` | `false` | Whether `fleet_provision setup` (and the same-shaped `expect.command`) may be an **arbitrary** shell command. Default: repo-relative script path with plain arguments only (the path must contain `/`). See `src/policy.ts` `checkSetup()` — enforced at the gateway policy chokepoint, not only in the tool schema. |
 | `env` | `{allowOnly?[], extraDeny?[]}` | _(both unset)_ | Dispatch env policy refinement. Built-in denials (`BASH_ENV`, `NODE_OPTIONS`, `LD_*`, `GIT_SSH*`, `OPENCODE_CONFIG*`, …) always apply and cannot be lifted; `allowOnly` turns injection allowlist-only, `extraDeny` adds names. |
@@ -163,6 +163,18 @@ deny-based, nothing publishes without evidence, and the fleet cannot overrun.
   on denies, and `fleet_dispatch` with `autoApprove: true` **warns** on a node
   where `fleet_capabilities` reports `denyBaseline: false`. It is not a sandbox:
   oblique variants are not enumerated; depth comes from the other layers.
+- **Unattended companion settings (issue #105)** — if you allow `autoApprove`,
+  set these together; each covers what the others do not:
+  1. `isolation: "clone"` (concurrency and hook/config safety, per run).
+  2. The deny baseline installed on every node (`fleet_capabilities` shows
+     `denyBaseline`): the permission floor `autoApprove` relies on.
+  3. `capacity.maxConcurrentPerNode` and `capacity.minFreeDiskGb`, so a runaway
+     fan-out cannot fill the disk with clones.
+  4. A `budget` block, and `sync.requireVerified: true` so nothing lands from a
+     gateless run.
+  A filesystem sandbox (`bwrap`) is **not** available yet; when it lands it will
+  give filesystem isolation only, **not** an egress allowlist (that needs a
+  network namespace and an allowlisting proxy), so do not treat it as one.
 - **`sync.requireVerified: true`** — buys "nothing lands from a gateless run":
   `fleet_sync` refuses work from a node+checkout whose latest run has **no**
   verification result (dispatch with `expect`/`spec.verify`), each with a reason
