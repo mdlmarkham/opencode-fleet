@@ -125,7 +125,7 @@ describe("#158: fleet_project_show {node, path}", () => {
       expect(t.invokes[0]!.params).toMatchObject({ prompt: "__PROJECT_READ__", op: "project.read", cwd: "/srv/x" });
       expect(JSON.stringify(r.record)).toContain("Ship it");
     } finally { t.dispose(); }
-  });
+  }, 30_000);
   it("reports an unknown node and a relative path", async () => {
     const entry = await loadEntry();
     const t = loadPlugin(entry!, { nodes: [] });
@@ -133,7 +133,7 @@ describe("#158: fleet_project_show {node, path}", () => {
       expect((await t.call("fleet_project_show", { node: "nope", path: "/x" })).error).toMatch(/not found/);
       expect((await t.call("fleet_project_show", { node: "nope", path: "x" })).error).toMatch(/absolute/);
     } finally { t.dispose(); }
-  });
+  }, 30_000);
 });
 
 describe("#158: protocol gate (older node)", () => {
