@@ -1301,6 +1301,34 @@ export default definePluginEntry({
     });
 
     api.registerTool({
+      name: "fleet_mission_abort",
+      label: "Fleet Mission Abort",
+      description:
+        "Kill switch for a mission: stop new dispatch, abort its live runs (confirmed termination, as fleet_abort) and record why. Idempotent: repeating it re-checks runs and reports alreadyAborted. A run whose termination is not confirmed is reported, never assumed dead.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: { missionId: { type: "string", description: "Mission id." }, reason: { type: "string", description: "Why (journaled)." } },
+        required: ["missionId", "reason"],
+      },
+      execute: async (_toolCallId, params, signal) => {
+        const p = params as { missionId: string; reason: string };
+        const root = api.rootDir ?? process.cwd();
+        const { abortMission } = await import("./mission-autonomy.js");
+        const list = await api.runtime.nodes.list();
+        const r = await abortMission(root, p.missionId, String(p.reason ?? "").slice(0, 300), {
+          abortRun: async ({ node: nodeName, runId }) => {
+            const node = (list.nodes ?? []).find((n) => n.displayName === nodeName || n.nodeId === nodeName);
+            if (!node) return { confirmed: false, note: `node ${nodeName ?? "?"} not found` };
+            const reply = payloadOf(await api.runtime.nodes.invoke({ nodeId: node.nodeId, command: "opencode.run", params: { prompt: "__ABORT__", cwd: "/", transport: "http", runId }, timeoutMs: 15_000, signal }));
+            return { confirmed: reply.ok === true && (reply.confirmed === true || reply.alreadyFinished === true), ...(typeof reply.error === "string" ? { note: reply.error.slice(0, 200) } : {}) };
+          },
+        });
+        return jsonResult(r);
+      },
+    });
+
+    api.registerTool({
       name: "fleet_mission_show",
       label: "Fleet Mission Show",
       description:
