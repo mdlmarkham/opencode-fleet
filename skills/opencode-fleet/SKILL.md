@@ -86,7 +86,7 @@ If the operator set `sync.requireVerified` / `blockOnScopeViolation` / `requireR
 | Recover / stop | `fleet_resume`, `fleet_abort` |
 | Fleet state | `fleet_status`, `fleet_capabilities`, `fleet_capacity`, `fleet_models` |
 | Set up nodes | `fleet_provision`, `fleet_provision_config`, `fleet_cleanup` |
-| Gates and review | `fleet_design_check`, `fleet_review`, `fleet_sync`, `fleet_project_show`, `fleet_project_start`, `fleet_project_upkeep` |
+| Gates, review, projects | `fleet_design_check`, `fleet_review`, `fleet_sync`, `fleet_project_start`, `fleet_project_show`, `fleet_project_upkeep` |
 | Recipes | `fleet_recipe_recommend`, `fleet_recipe_record`, `fleet_recipe_list` |
 | Operator only | `fleet_deploy` (build and install the plugin; apply with a gateway restart, not a reload) |
 
