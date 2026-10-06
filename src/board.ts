@@ -117,9 +117,18 @@ export function renderBoard(entries: LedgerEntry[], opts: BoardOptions = {}): { 
     if (r.taskState === "claimed" && r.bucket === "failed") return " task=claimed but run failed";
     return "";
   };
+  // Terminal history (issue #295): the ledger keeps last-200 finished runs, but
+  // the board only showed the current snapshot. Sum the terminal states from the
+  // SAME entries renderBoard already received — no new ledger read, no node call.
+  // A landed run (state=completed) counts as completed; failed and
+  // failed-verification are counted by their own state, visible regardless of
+  // whether the bucket rows are shown.
+  const history = (state: string): number => entries.filter((e) => e.state === state).length;
   const lines: string[] = [
     `fleet board — ${counts["in-flight"]} in-flight, ${counts["needs-you"]} need-you, ` +
       `${counts.stale} stale, ${counts.failed} failed, ${counts.landed} landed` +
+      ` · history: ${history("completed")} completed, ${history("failed")} failed, ` +
+      `${history("failed-verification")} failed-verification` +
       (tasks.length ? ` · graph: ${tasks.filter((t) => t.state === "pending").length} pending, ` +
         `${tasks.filter((t) => t.state === "claimed").length} claimed` : ""),
     "",
