@@ -520,7 +520,7 @@ const TASK = "do the thing";
 
 /** The exact per-node + ledger shapes today's detached happy path produces. */
 const TODAY_NODE_KEYS = ["ackPending", "detached", "note", "pid", "runId"];
-const TODAY_LEDGER_KEYS = ["cwd", "node", "pid", "prompt", "runId", "startedAt", "state", "transport", "updatedAt"];
+const TODAY_LEDGER_KEYS = ["cwd", "node", "nodeId", "pid", "prompt", "runId", "startedAt", "state", "transport", "updatedAt"];
 
 function expectUnchangedDispatchShape(details: Record<string, unknown>): void {
   expect(Object.keys(details)).toEqual(["dev2"]);
