@@ -8,6 +8,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { shq } from "../shell.js";
 import {
@@ -22,8 +23,8 @@ import type { VerifyDetails } from "../verify.js";
 import { evaluateExpect, parseExpectSpec } from "../verify.js";
 import { B64_MARKER, MAX_TRANSFER_B64, parseBundleOutput, parseStatusOutput, statusCommand } from "../outputs.js";
 import { acceptChunk, assembleChunks, isCanonicalBase64 } from "../xfer.js";
-import { guardCwd, taskUsesCwd, validateTaskIds } from "../guard.js";
-import { ensureStateDir, runPaths, xferPaths, writePrivate } from "../paths.js";
+import { guardCwd, taskUsesCwd, validateTaskIds, allowedRoots, getDefaultNodeEnvConfig } from "../guard.js";
+import { ensureStateDir, fleetStateDir, runPaths, xferPaths, writePrivate } from "../paths.js";
 import { UNSET_ORIGIN_PLACEHOLDER, stableOriginCommand } from "../provision.js";
 import { resolveOp, stampProtocol, type Op } from "../protocol.js";
 import { parseScope, scopeViolations } from "../scope.js";
@@ -121,7 +122,9 @@ OPS["state.prune"] = async ({ task }: OpCtx) => {
   } catch (e) {
     return JSON.stringify({ ok: false, error: `cannot list processes, not pruning: ${(e as Error).message}` });
   }
-  const stateDir = ensureStateDir();
+  // Issue #103 group c: the state dir honors the plugin config (stateDir)
+  // captured at register time; an explicit FLEET_STATE_DIR env value still overrides.
+  const stateDir = ensureStateDir(fleetStateDir(process.env, getDefaultNodeEnvConfig()));
   // Issue #41: finished runs' clones first. Unsynced work is kept (and listed) unless the
   // operator passes discardUnsyncedClones; a kept run's state pointer is protected from the sweep.
   const clones = await pruneRunClones(stateDir, d * 86_400_000, alive, { discardUnsynced: (task as { discardUnsyncedClones?: unknown }).discardUnsyncedClones === true });
@@ -745,7 +748,9 @@ export async function handleOpencodeRun(
   const piErr = validatePiOptions(task);
   if (piErr) return stampProtocol(JSON.stringify({ ok: false, error: piErr }));
   if (taskUsesCwd(task.prompt)) {
-    const cwdCheck = await guardCwd(task.cwd);
+    // Issue #103 group c: roots honor the plugin config (allowedRoots) captured
+    // at register time; an explicit FLEET_ALLOWED_ROOTS env value still overrides.
+    const cwdCheck = await guardCwd(task.cwd, allowedRoots(process.env, homedir(), getDefaultNodeEnvConfig()));
     if (!cwdCheck.ok) return stampProtocol(JSON.stringify({ ok: false, error: `refused: ${cwdCheck.error}` }));
   }
 
