@@ -28,6 +28,15 @@
         "type": "number",
         "default": 1800000
       },
+      "allowedRoots": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Workspace roots the node will operate in (issue #103 group c): absolute paths, e.g. [\"/srv/work\", \"/home/u\"]. Config twin of the node's FLEET_ALLOWED_ROOTS env var; an explicit FLEET_ALLOWED_ROOTS env value still overrides this. Default: the shared fleet root plus the service user's home."
+      },
+      "stateDir": {
+        "type": "string",
+        "description": "Node-side private state directory (issue #103 group c), absolute path. Config twin of the node's FLEET_STATE_DIR env var; an explicit FLEET_STATE_DIR env value still overrides this. Default: ~/.openclaw/fleet/state under the service user's home."
+      },
       "nodes": {
         "type": "object",
         "additionalProperties": {
@@ -92,6 +101,7 @@
         "description": "Concurrency slots (issue #39). Slots are counted from the gateway's run ledger; see fleet_capacity.",
         "properties": {
           "maxConcurrentPerNode": { "type": "integer", "minimum": 1, "maximum": 64, "description": "Default max concurrent runs per node. Unset means unlimited." },
+          "minFreeDiskGb": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "Isolated (clone) runs copy the object store: a node with less free disk than this refuses another, with a retryable no-disk result. Unset means no check." },
           "staleAfterMs": { "type": "integer", "minimum": 60000, "default": 21600000, "description": "A run still `running` in the ledger after this long without an update stops holding a slot and is reported as suspected stale." }
         }
       },
@@ -141,6 +151,7 @@
         "description": "Design gate for spec dispatches (issue #117). A deterministic check (no model call) of the spec before dispatch: missing acceptance/verify/scope, a spec too large for one task, overlap with in-flight runs on the same checkout. `advise` (default) attaches the verdict as `design` when it is not a plain accept; `enforce` also refuses dispatch while an unacknowledged blocking objection remains; `off` skips it. A prompt-only dispatch is never gated.",
         "properties": {
           "gate": { "type": "string", "enum": ["off", "advise", "enforce"], "default": "advise" },
+          "screenOutput": { "type": "string", "enum": ["off", "shadow", "fence", "withhold"], "default": "shadow", "description": "Instruction-pattern screening of worker output before the agent reads it: shadow logs flagged output, fence quotes it as data, withhold replaces it." },
           "maxScopePatterns": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20, "description": "A spec with more scope patterns is `decompose`." },
           "maxAcceptanceItems": { "type": "integer", "minimum": 1, "maximum": 50, "default": 15, "description": "A spec with more acceptance items is `decompose`." },
           "roots": { "type": "array", "items": { "type": "string" }, "description": "Directories on the gateway host under which fleet_project_show may read a checkout's .fleet/ record (issue #114). Default: the gateway's working directory and root dir." },
@@ -353,6 +364,7 @@
       "fleet_project_show",
       "fleet_mission_show",
       "fleet_project_start",
+      "fleet_project_upkeep",
       "fleet_mission_abort",
       "fleet_board"
     ]
