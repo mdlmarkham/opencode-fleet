@@ -1,7 +1,7 @@
 {
   "id": "opencode-fleet",
-  "name": "OpenCode Fleet",
-  "description": "Orchestrate OpenCode across multiple remote OpenClaw nodes (dev2, dev3, ...). Dispatch coding tasks, check fleet status, abort runaway sessions, and pull diffs over the authenticated node channel.",
+  "name": "CodeClaw",
+  "description": "CodeClaw (plugin id: opencode-fleet) — agentic coding across remote OpenClaw nodes. Define a spec, dispatch one or more code agents (OpenCode, Pi, ...), run gated loops against a rubric, and deliver reviewed work over the authenticated node channel.",
   "version": "0.1.0",
   "kind": "plugin",
   "configSchema": {

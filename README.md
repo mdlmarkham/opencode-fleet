@@ -1,8 +1,16 @@
-# opencode-fleet
+# CodeClaw
 
-Orchestrate **OpenCode** across multiple remote OpenClaw nodes (dev2, dev3, ...) over the authenticated node channel.
+**CodeClaw** (the OpenClaw plugin `opencode-fleet` — see [decision 0004](.fleet/decisions/0004-product-name-codeclaw.md))
+does agentic coding: define a spec by conversation, dispatch one or more code agents across remote OpenClaw nodes
+(dev2, dev3, ...), run gated loops against a rubric, and deliver reviewed work — over the authenticated node channel.
 
-The **manager** (Main/Metis) holds GitHub credentials and model routing. **Workers** (dev2/dev3) stay credential-free — they receive repos via git bundles and never touch GitHub or hold PATs.
+Today the engines are **OpenCode** and **Pi**; the harness seam is engine-agnostic (issue #45) so further CLI coding
+agents can be added. The **manager** (Main/Metis) holds GitHub credentials and model routing. **Workers** (dev2/dev3)
+stay credential-free — they receive repos via git bundles and never touch GitHub or hold PATs.
+
+> **Name vs id.** The product is **CodeClaw**; the plugin id remains `opencode-fleet` (config key, install path and
+> fleet-wide identity) until a gated migration lands. Anywhere a config key or path appears, it is still
+> `opencode-fleet` / `.opencode-fleet`. See decision 0004.
 
 ## Features
 
