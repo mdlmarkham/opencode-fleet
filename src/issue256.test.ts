@@ -35,7 +35,8 @@ describe.skipIf(!loaded)("#256: one bounded retry of the post-restart publicatio
     p = loadPlugin(loaded!, {
       nodes: NODES,
       config: CFG,
-      invoke: () =>
+      invoke: (c) =>
+        c.params.prompt === "__RUN_STATUS__" ? nodeReply({ ok: false, status: "never-started" }) :
         first
           ? (first = false, nodeReply({ ok: false, error: TRANSIENT }))
           : nodeReply({ ok: true, detached: true, runId: "r", pid: 4321 }),
@@ -69,7 +70,7 @@ describe.skipIf(!loaded)("#256: one bounded retry of the post-restart publicatio
     p = loadPlugin(loaded!, {
       nodes: NODES,
       config: CFG,
-      invoke: () => nodeReply({ ok: false, error: TRANSIENT }),
+      invoke: (c) => c.params.prompt === "__RUN_STATUS__" ? nodeReply({ ok: false, status: "never-started" }) : nodeReply({ ok: false, error: TRANSIENT }),
     });
     const r = await p.call("fleet_dispatch", { node: "dev2", cwd: "/w/proj", prompt: "x" }) as Record<string, any>;
     expect(p.invokes.filter((c) => c.params.prompt === "__RUN_START__")).toHaveLength(2);
@@ -93,7 +94,8 @@ describe.skipIf(!loaded)("#256: one bounded retry of the post-restart publicatio
     p = loadPlugin(loaded!, {
       nodes: NODES,
       config: CFG,
-      invoke: () =>
+      invoke: (c) =>
+        c.params.prompt === "__RUN_STATUS__" ? nodeReply({ ok: false, status: "never-started" }) :
         first
           ? (first = false, nodeReply({ ok: false, error: "device pairing authority requires a CURRENT Worker Publication" }))
           : nodeReply({ ok: true, detached: true, runId: "r", pid: 7 }),
@@ -101,6 +103,70 @@ describe.skipIf(!loaded)("#256: one bounded retry of the post-restart publicatio
     const r = await p.call("fleet_dispatch", { node: "dev2", cwd: "/w/proj", prompt: "x" }) as Record<string, any>;
     expect(p.invokes.filter((c) => c.params.prompt === "__RUN_START__")).toHaveLength(2);
     expect(r.dev2).toMatchObject({ detached: true, pid: 7 });
+  });
+});
+
+describe.skipIf(!loaded)("#312: both error channels, and no blind resend", () => {
+  let p: Loaded | undefined;
+  let restore: (() => void) | undefined;
+  beforeEach(() => { restore = fakeSsh("FLEET_CWD=ok"); });
+  afterEach(() => { p?.dispose(); p = undefined; restore?.(); });
+  const starts = () => p!.invokes.filter((c) => c.params.prompt === "__RUN_START__");
+  const probes = () => p!.invokes.filter((c) => c.params.prompt === "__RUN_STATUS__");
+  const absent = () => nodeReply({ ok: false, status: "never-started" });
+
+  it("a REJECTED invoke carrying the phrase (the relay channel) is recognised, probed, and retried once", async () => {
+    let first = true;
+    p = loadPlugin(loaded!, { nodes: NODES, config: CFG, invoke: (c) => {
+      if (c.params.prompt === "__RUN_STATUS__") return absent();
+      if (first) { first = false; throw new Error(TRANSIENT); }
+      return nodeReply({ ok: true, detached: true, runId: "r", pid: 11 });
+    } });
+    const r = await p.call("fleet_dispatch", { node: "dev2", cwd: "/w/proj", prompt: "x" }) as Record<string, any>;
+    expect(starts()).toHaveLength(2);
+    expect(probes()).toHaveLength(1);
+    expect(r.dev2).toMatchObject({ detached: true, pid: 11 });
+  });
+
+  it("the run already exists (the error was spurious): it is ADOPTED, with no second launch", async () => {
+    let first = true;
+    p = loadPlugin(loaded!, { nodes: NODES, config: CFG, invoke: (c) => {
+      if (c.params.prompt === "__RUN_STATUS__") return nodeReply({ ok: true, state: "running", pid: 4242, alive: true });
+      if (first) { first = false; return nodeReply({ ok: false, error: TRANSIENT }); }
+      throw new Error("a second __RUN_START__ must never be sent");
+    } });
+    const r = await p.call("fleet_dispatch", { node: "dev2", cwd: "/w/proj", prompt: "x" }) as Record<string, any>;
+    expect(starts()).toHaveLength(1);
+    expect(r.dev2).toMatchObject({ detached: true, pid: 4242, ackPending: false, recoveredFromPublicationTransient: true });
+    const ledger = await import("./ledger.js").then((m) => m.loadLedger(p!.rootDir));
+    expect(ledger).toHaveLength(1);
+    expect(ledger[0]).toMatchObject({ state: "running", pid: 4242 });
+  });
+
+  it("an inconclusive probe never resends: the launch is reported as unconfirmed, not failed and not duplicated", async () => {
+    p = loadPlugin(loaded!, { nodes: NODES, config: CFG, invoke: (c) => {
+      if (c.params.prompt === "__RUN_STATUS__") throw new Error("relay down");
+      return nodeReply({ ok: false, error: TRANSIENT });
+    } });
+    const r = await p.call("fleet_dispatch", { node: "dev2", cwd: "/w/proj", prompt: "x" }) as Record<string, any>;
+    expect(starts()).toHaveLength(1);
+    expect(JSON.stringify(r.dev2)).toMatch(/not (acknowledged|confirmed)|ackPending|inconclusive|unconfirmed/i);
+    expect(r.dev2.ok === true && r.dev2.runId === undefined).toBe(false);
+  });
+
+  it("probe absent, then a second transient: one resend, fails with the transient; no third launch", async () => {
+    p = loadPlugin(loaded!, { nodes: NODES, config: CFG, invoke: (c) => c.params.prompt === "__RUN_STATUS__" ? absent() : nodeReply({ ok: false, error: TRANSIENT }) });
+    const r = await p.call("fleet_dispatch", { node: "dev2", cwd: "/w/proj", prompt: "x" }) as Record<string, any>;
+    expect(starts()).toHaveLength(2);
+    expect(probes()).toHaveLength(1);
+    expect(r.dev2).toMatchObject({ ok: false, error: `launch failed: ${TRANSIENT}` });
+  });
+
+  it("an unrelated rejection is neither probed nor retried", async () => {
+    p = loadPlugin(loaded!, { nodes: NODES, config: CFG, invoke: () => { throw new Error("relay exploded"); } });
+    await p.call("fleet_dispatch", { node: "dev2", cwd: "/w/proj", prompt: "x" });
+    expect(starts()).toHaveLength(1);
+    expect(probes().length).toBeLessThanOrEqual(1); // only the existing ack-timeout probe, never the transient path
   });
 });
 

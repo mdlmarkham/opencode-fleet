@@ -28,6 +28,13 @@ export function isWorkerPublicationTransient(errText: unknown): boolean {
   return typeof errText === "string" && errText.toLowerCase().includes(PUBLICATION_TRANSIENT_PHRASE);
 }
 
+/** The transient's text from EITHER channel: a node reply (`payload.error`) or a rejected invoke (`message`). */
+export function publicationTransientIn(inv: unknown): boolean {
+  const viaPayload = (() => { try { return payloadOf(inv).error; } catch { return undefined; } })();
+  const viaReject = (inv as { invokeTimedOut?: boolean; message?: unknown } | undefined)?.invokeTimedOut === true ? (inv as { message?: unknown }).message : undefined;
+  return isWorkerPublicationTransient(viaPayload) || isWorkerPublicationTransient(viaReject);
+}
+
 const publicationRetryDelay = (ms: number, signal?: AbortSignal): Promise<void> =>
   new Promise((resolve, reject) => {
     const t = setTimeout(resolve, ms);
@@ -727,16 +734,33 @@ export function registerDispatchTools(api: OpenClawPluginApi, cfg: FleetConfig):
                 message: err.message,
               }));
           inv = await invokeDetach(launchParams);
-          // Issue #256: the FIRST launch right after a node service restart
-          // can be refused with "Device pairing authority requires a current
-          // worker publication" — transient, gone seconds later. Narrow EXACT
-          // phrase match, ONE bounded retry of the SAME launch, then fall
-          // through to the unchanged failure handling (a second failure is
-          // recorded against the ORIGINAL error below). Any other error text
-          // is never retried.
-          if (isWorkerPublicationTransient(payloadOf(inv).error) && !signal?.aborted) {
-            await publicationRetryDelay(PUBLICATION_RETRY_DELAY_MS, signal);
-            inv = await invokeDetach(launchParams);
+          // Issues #256/#312: the FIRST launch right after a node service restart can be refused with
+          // "Device pairing authority requires a current worker publication": transient, gone seconds later. But the
+          // refusal does NOT prove nothing launched (a run has been seen to start anyway), and the host may deliver it
+          // either as a node reply (`payload.error`) or as a rejected invoke (`message`). So: match the exact phrase on
+          // BOTH channels, then PROBE the run before resending, exactly like the ack-timeout path (#29/#30):
+          //   confirmed -> adopt the run (no second launch); absent -> resend ONCE; inconclusive -> do NOT resend,
+          //   hand the launch to the ambiguous-ack handling below. A second transient is recorded as a failure.
+          if (publicationTransientIn(inv) && !signal?.aborted) {
+            const probe = await probeAckRecovery((probeSignal) =>
+              api.runtime.nodes.invoke({
+                nodeId: node.nodeId,
+                command: "opencode.run",
+                params: { prompt: "__RUN_STATUS__", cwd: "/", transport: "http", runId },
+                timeoutMs: ACK_PROBE_TIMEOUT_MS,
+                signal: probeSignal,
+              }),
+            );
+            if (probe.kind === "confirmed") {
+              // The run exists: this is the ack we did not get. Adopt it; never launch a second copy.
+              inv = { payload: JSON.stringify({ ok: true, detached: true, runId, ...(probe.pid !== undefined ? { pid: probe.pid } : {}), recoveredFromPublicationTransient: true }) };
+            } else if (probe.kind === "absent") {
+              await publicationRetryDelay(PUBLICATION_RETRY_DELAY_MS, signal);
+              inv = await invokeDetach(launchParams);
+            } else {
+              // Unknown whether it launched: route through the ambiguous-ack handling instead of a blind resend.
+              inv = { invokeTimedOut: true as const, message: `launch refused with a worker-publication transient and the node could not confirm whether it started (${probe.verdict})` };
+            }
           }
         } else {
           inv = await api.runtime.nodes
@@ -870,6 +894,7 @@ export function registerDispatchTools(api: OpenClawPluginApi, cfg: FleetConfig):
                   ? { isolationNote: "isolation was requested but the node did not return a run clone" }
                   : {}),
               ackPending: false,
+              ...((launchPayload as { recoveredFromPublicationTransient?: boolean }).recoveredFromPublicationTransient ? { recoveredFromPublicationTransient: true } : {}),
               note: `Worker launched detached and survives relay timeouts. Wait with fleet_await({runIds:[runId]}) (not a fleet_run_status loop) or fleet_watch; fleet_resume finds it after interruptions. ${AWAIT_MISSING_NOTE}`,
               ...(autoApproveWarnings[nodeName] ? { warnings: autoApproveWarnings[nodeName] } : {}),
             };
