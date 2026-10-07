@@ -51,6 +51,10 @@ export interface LedgerEntry {
   verified?: boolean;
   /** The verify gate timed out (issue #309): unverified, not failed. */
   gateTimedOut?: true;
+  /** The verify gate could not run its toolchain (issue #324b, e.g. a missing tsc): unverified, not failed. */
+  gateUnavailable?: true;
+  /** Best-effort missing tool name (issue #324b), when the gate ended gate-unavailable. */
+  gateMissing?: string;
   /** The node's verify-gate details, persisted so a FAILED gate survives node state cleanup. */
   verifyDetails?: unknown;
   /** The isolated clone the run worked in (issue #41); pass it to fleet_sync. */
@@ -239,6 +243,14 @@ function verifyGate(entry: LedgerEntry | undefined, opts: { allowUnverified?: bo
       ? { allow: false, verified: null, runId: entry.runId, reason: `run ${entry.runId}: the verification gate TIMED OUT (it did not finish; the work is unverified, not failed) and sync.requireVerified is set. Re-run the gate on a quieter node or with a larger verify.timeoutMs, or pass allowUnverified` }
       : { allow: true, verified: null, runId: entry.runId, reason: `run ${entry.runId}: the verification gate timed out; the work is unverified (not failed)` };
   }
+  // Issue #324b: same discipline for a gate that could not RUN (missing toolchain). The message names the
+  // missing tool when known ("the gate could not run"), never "failed".
+  if (entry.gateUnavailable && entry.verified !== false && entry.state !== "failed-verification") {
+    const cause = entry.gateMissing ? `the gate could not run (tool missing: ${entry.gateMissing})` : "the gate could not run (a tool is missing)";
+    return opts.requireVerified && !opts.allowUnverified
+      ? { allow: false, verified: null, runId: entry.runId, reason: `run ${entry.runId}: ${cause}, so the work is UNVERIFIED, not failed, and sync.requireVerified is set. Bootstrap the checkout (see "Bootstrapping a clone" in docs/operators.md) or pass allowUnverified` }
+      : { allow: true, verified: null, runId: entry.runId, reason: `run ${entry.runId}: ${cause}; the work is unverified: gate environment unavailable` };
+  }
   const failed = entry.verified === false || entry.state === "failed-verification";
   if (failed) {
     return opts.allowUnverified
@@ -352,6 +364,10 @@ export interface DispatchOutcome {
     verified?: boolean;
     /** The gate timed out (issue #309): unverified, not failed. */
     gateTimedOut?: boolean;
+    /** The gate could not run its toolchain (issue #324b): unverified, not failed. */
+    gateUnavailable?: boolean;
+    /** Best-effort missing tool name (issue #324b) when gateUnavailable. */
+    gateMissing?: string;
     verifyDetails?: unknown;
   };
 }
@@ -391,6 +407,9 @@ export function outcomeEntry(base: LedgerEntry, o: DispatchOutcome, now: string 
     question: o.parsed.question,
     verified: o.parsed.verified ?? undefined,
     ...(o.parsed.gateTimedOut ? { gateTimedOut: true as const } : {}),
+    // Issue #324b: record the could-not-run cause the same way #309 records its timeout.
+    ...(o.parsed.gateUnavailable ? { gateUnavailable: true as const } : {}),
+    ...(o.parsed.gateUnavailable && o.parsed.gateMissing ? { gateMissing: o.parsed.gateMissing } : {}),
     verifyDetails: o.parsed.verifyDetails,
   };
 }

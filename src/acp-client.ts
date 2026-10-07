@@ -30,6 +30,10 @@ export interface AcpRunResult {
   verified?: boolean | null;
   /** Issue #309: the gate timed out (unverified, not failed). */
   gateTimedOut?: boolean;
+  /** Issue #324b: the gate could not start its toolchain (missing tool); unverified, not failed. */
+  gateUnavailable?: boolean;
+  /** Issue #324b: best-effort name of the missing tool when gateUnavailable. */
+  gateMissing?: string;
   verifyDetails?: VerifyDetails;
 }
 

@@ -147,6 +147,10 @@ export interface OpenCodeRunResult {
   verified?: boolean | null;
   /** Issue #309: the gate did not finish in time. `verified` stays null (unverified, never a pass, never "failed"). */
   gateTimedOut?: boolean;
+  /** Issue #324b: the gate could not start its toolchain (missing tool). `verified` stays null, same discipline as #309. */
+  gateUnavailable?: boolean;
+  /** Issue #324b: best-effort name of the missing tool when gateUnavailable. */
+  gateMissing?: string;
   verifyDetails?: VerifyDetails;
   /** Pi `--mode json` only (#137 Pi-1): tools the worker ran, in order. */
   toolCalls?: PiToolCall[];
