@@ -33,7 +33,11 @@ describe("#324 classifier", () => {
   });
   it("in-process gate: 127 is environment-unavailable, exit 1 is a plain failure", async () => {
     const env = await evaluateExpect({ command: "definitely-not-a-tool-xyz" }, dir);
-    expect(env.verified).toBe(false);
+    // Superseded by #324b: a could-not-start gate is UNVERIFIED (null, endedBy
+    // "gate-unavailable"), not failed — the kind tag remains unchanged.
+    expect(env.verified).toBeNull();
+    expect(env.endedBy).toBe("gate-unavailable");
+    expect(env.missing).toBe("definitely-not-a-tool-xyz");
     expect(JSON.stringify(env.verifyDetails)).toContain("environment-unavailable");
     const plain = await evaluateExpect({ command: "echo 'Cannot find module x' >&2; exit 1" }, dir);
     expect(JSON.stringify(plain.verifyDetails)).not.toContain("environment-unavailable");
@@ -48,9 +52,12 @@ describe("#324 classifier", () => {
 
 describe("#324 launcher (real bash)", () => {
   it("exit 127 and 126 carry kind; exit 3 does not; JSON is valid", async () => {
+    // Superseded by #324b: a could-not-start gate is UNVERIFIED (null, endedBy
+    // "gate-unavailable") in the launcher too — the kind tags stay the same.
     const a = await runLauncher({ command: "nope-tool-xyz" });
-    expect(a.verified).toBe(false);
-    expect(a.verifyDetails.command).toMatchObject({ exitCode: 127, kind: "environment-unavailable" });
+    expect(a.verified).toBeNull();
+    expect(a.endedBy).toBe("gate-unavailable");
+    expect(a.verifyDetails.command).toMatchObject({ exitCode: 127, kind: "environment-unavailable", missing: "nope-tool-xyz" });
     const b = await runLauncher({ command: "exit 3" });
     expect(b.verifyDetails.command.kind).toBeUndefined();
     const c = await runLauncher({ commands: ["exit 126", "true"] });

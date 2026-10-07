@@ -466,12 +466,12 @@ OPS["run.status"] = async ({ task, io, context }: OpCtx) => {
       const statePath = runStatePath(runId);
       try {
         const raw = await (await import("node:fs/promises")).readFile(statePath, "utf8");
-        const st = JSON.parse(raw) as { pid?: number; state?: string; startedAt?: string; finishedAt?: string; exitCode?: number; verified?: boolean; gateTimedOut?: boolean; verifyDetails?: VerifyDetails; scope?: { files: string[] }; cwd?: string; startHead?: string; changedFiles?: string[]; scopeViolations?: string[] | null; scopeError?: string; dirtyWorktree?: boolean };
+        const st = JSON.parse(raw) as { pid?: number; state?: string; startedAt?: string; finishedAt?: string; exitCode?: number; verified?: boolean; gateTimedOut?: boolean; gateUnavailable?: boolean; gateMissing?: string; verifyDetails?: VerifyDetails; scope?: { files: string[] }; cwd?: string; startHead?: string; changedFiles?: string[]; scopeViolations?: string[] | null; scopeError?: string; dirtyWorktree?: boolean };
         // Merge worker completion record when present (issue #6). Issue #62:
         // the record may also carry the verify-gate outcome.
         try {
           const doneRaw = await (await import("node:fs/promises")).readFile(runPaths(runId).done, "utf8");
-          const done = JSON.parse(doneRaw) as { exitCode?: number; finishedAt?: string; verified?: boolean | null; verifyDetails?: VerifyDetails; endedBy?: string };
+          const done = JSON.parse(doneRaw) as { exitCode?: number; finishedAt?: string; verified?: boolean | null; verifyDetails?: VerifyDetails; endedBy?: string; missing?: string };
           st.state = "finished";
           st.exitCode = done.exitCode;
           st.finishedAt = done.finishedAt;
@@ -481,6 +481,12 @@ OPS["run.status"] = async ({ task, io, context }: OpCtx) => {
           } else if (done.endedBy === "gate-timeout") {
             // Issue #309: the gate did not finish. Not a verdict (verified stays unset => null) and never a pass.
             st.gateTimedOut = true;
+            if (done.verifyDetails) st.verifyDetails = done.verifyDetails;
+          } else if (done.endedBy === "gate-unavailable") {
+            // Issue #324b: the gate could not run its toolchain (missing tool). Same discipline as #309:
+            // not a verdict (verified stays unset => null), never a pass; cause surfaced on the record.
+            st.gateUnavailable = true;
+            if (done.missing) st.gateMissing = done.missing;
             if (done.verifyDetails) st.verifyDetails = done.verifyDetails;
           }
         } catch { /* still running or not finished */ }
@@ -530,6 +536,7 @@ OPS["run.status"] = async ({ task, io, context }: OpCtx) => {
             manifest = buildManifest({
               runId, harness: meta.harness ?? "opencode", piModel: meta.piModel, cwd: st.cwd, startHead: st.startHead,
               startedAt: st.startedAt, finishedAt: st.finishedAt, exitCode: st.exitCode, verified: st.verified, verifyDetails: st.verifyDetails,
+              gateUnavailable: st.gateUnavailable === true, missing: st.gateMissing,
               scope: st.scope, changes: rawChanges ? changes : undefined, events: extractEvents(rawLog, meta.harness ?? "opencode"), log: logInfo,
             });
             await writePrivate(paths.manifest, JSON.stringify(manifest)).catch(() => {});
@@ -594,6 +601,9 @@ OPS["run.result"] = async ({ task, io, context }: OpCtx) => {
       // Issue #62: verify-gate outcome (from the launcher-written done record).
       let verified: boolean | null = null;
       let gateTimedOut = false;
+      // Issue #324b: a gate that could not START its toolchain is unverified too.
+      let gateUnavailable = false;
+      let missingTool: string | undefined;
       let vDetails: VerifyDetails | undefined;
       try {
         const raw = await (await import("node:fs/promises")).readFile(runStatePath(runId), "utf8");
@@ -602,9 +612,14 @@ OPS["run.result"] = async ({ task, io, context }: OpCtx) => {
       } catch { /* no state file */ }
       try {
         const doneRaw = await (await import("node:fs/promises")).readFile(runPaths(runId).done, "utf8");
-        const done = JSON.parse(doneRaw) as { exitCode?: number; verified?: boolean | null; verifyDetails?: VerifyDetails; endedBy?: string };
+        const done = JSON.parse(doneRaw) as { exitCode?: number; verified?: boolean | null; verifyDetails?: VerifyDetails; endedBy?: string; missing?: string };
         if (typeof done.exitCode === "number") exitCode = done.exitCode;
         if (done.verified === null && done.endedBy === "gate-timeout") gateTimedOut = true;
+        // Issue #324b: same reading for a gate that could not run its toolchain.
+        if (done.verified === null && done.endedBy === "gate-unavailable") {
+          gateUnavailable = true;
+          if (done.missing) missingTool = done.missing;
+        }
         // Issue #62: surface the verification gate outcome recorded by the
         // launcher. The parsed result below stays untouched; verified rides
         // alongside it (null when no gate was configured).
@@ -633,6 +648,11 @@ OPS["run.result"] = async ({ task, io, context }: OpCtx) => {
         if (vDetails) parsed.verifyDetails = vDetails;
       } else if (gateTimedOut) {
         parsed.gateTimedOut = true;
+        if (vDetails) parsed.verifyDetails = vDetails;
+      } else if (gateUnavailable) {
+        // Issue #324b: the gate could not run its toolchain — unverified, not failed, cause named.
+        parsed.gateUnavailable = true;
+        if (missingTool) parsed.gateMissing = missingTool;
         if (vDetails) parsed.verifyDetails = vDetails;
       }
       return JSON.stringify({
@@ -728,7 +748,11 @@ async function runTask({ task, io, context }: OpCtx): Promise<string> {
       if (expectSpec.expect) {
         const outcome = await evaluateExpect(expectSpec.expect, task.cwd);
         if (outcome.verified !== null) acpResult.verified = outcome.verified;
-        else acpResult.gateTimedOut = true;
+        // Issue #324b: name WHICH null it is — could not finish (#309) or could not start (#324b).
+        else if (outcome.endedBy === "gate-unavailable") {
+          acpResult.gateUnavailable = true;
+          if (outcome.missing) acpResult.gateMissing = outcome.missing;
+        } else acpResult.gateTimedOut = true;
         acpResult.verifyDetails = outcome.verifyDetails;
       }
       return JSON.stringify(acpResult);
@@ -770,7 +794,11 @@ async function runTask({ task, io, context }: OpCtx): Promise<string> {
     if (expectSpec.expect) {
       const outcome = await evaluateExpect(expectSpec.expect, task.cwd);
       if (outcome.verified !== null) parsed.verified = outcome.verified;
-      else parsed.gateTimedOut = true;
+      // Issue #324b: name WHICH null it is — could not finish (#309) or could not start (#324b).
+      else if (outcome.endedBy === "gate-unavailable") {
+        parsed.gateUnavailable = true;
+        if (outcome.missing) parsed.gateMissing = outcome.missing;
+      } else parsed.gateTimedOut = true;
       parsed.verifyDetails = outcome.verifyDetails;
     }
     return JSON.stringify(parsed);

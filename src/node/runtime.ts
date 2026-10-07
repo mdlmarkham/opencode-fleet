@@ -434,6 +434,18 @@ export interface VerifyGateOptions {
 }
 
 /**
+ * Issue #324b: best-effort name of the tool a gatecommand would have run,
+ * for the launcher's `missing` field. Purely lexical: the first word that
+ * looks like a path or bare name, or the empty string when there is none.
+ * The in-process gate gets the authoritative name from the captured stderr;
+ * here we only have the command text.
+ */
+export function notFoundName(cmd: string): string {
+  const first = cmd.trim().split(/\s+/)[0] ?? "";
+  return /^[\w.@/-]+$/.test(first) ? first : "";
+}
+
+/**
  * Issue #62: the bash fragment that evaluates the optional `expect` gate in
  * the run's cwd AFTER the worker exits, plus the done-marker write.
  *
@@ -471,8 +483,13 @@ export function verifyGateScript(
     "__V_ALL_OK=true",
     // Issue #309: a gate command killed by its own time bound (timeout exits 124, or 137 after the -k grace) did
     // not finish: that is "unverified", not "failed". HARD marks any real failure; TO marks a timeout.
+    // Issue #324b: UN marks an environment-unavailable command (exit 126/127, #326's kind) — the gate could
+    // not run its toolchain at all, so unavailable-only is "unverified" too. Missing tracks the FIRST
+    // unavailable entry's missing tool, surfaced on the outcome for consumers (best effort).
     "__V_HARD=false",
     "__V_TO=false",
+    "__V_UN=false",
+    "__V_MISSING=''",
     "__V_FILES_JSON=''",
     `if cd ${shq(opts.cwd)} 2>/dev/null; then __V_CDW=true; else __V_CDW=false; __V_ALL_OK=false; __V_HARD=true; fi`,
   ];
@@ -513,7 +530,17 @@ export function verifyGateScript(
       lines.push(
         `  if timeout -k 5 ${timeoutSec} bash -c ${shq(command)} >/dev/null 2>&1; then __V_CMD_OK=true; __V_CMD_EXIT=0; else __V_CMD_EXIT=$?; __V_CMD_OK=false; __V_ALL_OK=false; fi`,
       );
-      lines.push('  case "$__V_CMD_OK$__V_CMD_EXIT" in true0) ;; false124|false137) __V_TO=true;; false126|false127) __V_KIND=\',"kind":"environment-unavailable"\'; __V_HARD=true;; *) __V_HARD=true;; esac');
+      const name = notFoundName(command);
+      // Issue #324b: the unavailable branch also records WHICH tool was missing, two ways:
+      // the record JSON gets ,\"missing\":<json-name> spliced after kind (runtime concat, so bash
+      // only moves literals), and the __V_MISSING variable feeds the done line's top-level field.
+      lines.push(
+        "  case \"$__V_CMD_OK$__V_CMD_EXIT\" in true0) ;; false124|false137) __V_TO=true;; false126|false127) __V_UN=true; [ -z \"$__V_MISSING\" ] && __V_MISSING=" +
+          shq(name) +
+          "; __V_KIND=',\"kind\":\"environment-unavailable\",\"missing\":'; __V_KIND=\"$__V_KIND\"" +
+          shq(JSON.stringify(name)) +
+          ";; *) __V_HARD=true;; esac",
+      );
       lines.push('  __V_CMD_JSON="{\\\"cmd\\\":$__V_JCMD,\\\"exitCode\\\":$__V_CMD_EXIT,\\\"ok\\\":$__V_CMD_OK${__V_KIND}}"');
       lines.push("else");
       lines.push("  __V_CMD_OK=false; __V_ALL_OK=false; __V_HARD=true");
@@ -523,6 +550,8 @@ export function verifyGateScript(
     } else {
     lines.push(`__V_CMDS=( ${commands.map(shq).join(" ")} )`);
     lines.push(`__V_JCMDS=( ${commands.map((c) => shq(JSON.stringify(c))).join(" ")} )`);
+    lines.push(`__V_NAMES=( ${commands.map((c) => shq(notFoundName(c))).join(" ")} )`);
+    lines.push(`__V_NAMESJSON=( ${commands.map((c) => shq(JSON.stringify(notFoundName(c)))).join(" ")} )`);
     lines.push(`__V_TOOLS=( ${commands.map(() => String(Math.max(1, Math.round(sharedTimeout / 1000)))).join(" ")} )`);
     lines.push("__V_CMDS_JSON=''");
     lines.push("__V_SEP=''");
@@ -532,7 +561,7 @@ export function verifyGateScript(
     lines.push(
       `  if timeout -k 5 "\${__V_TOOLS[$__i]}" bash -c "\${__V_CMDS[$__i]}" >/dev/null 2>&1; then __V_CMD_OK=true; __V_CMD_EXIT=0; else __V_CMD_EXIT=$?; __V_CMD_OK=false; __V_ALL_OK=false; fi`,
     );
-    lines.push('  case "$__V_CMD_OK$__V_CMD_EXIT" in true0) ;; false124|false137) __V_TO=true;; false126|false127) __V_KIND=\',"kind":"environment-unavailable"\'; __V_HARD=true;; *) __V_HARD=true;; esac');
+    lines.push("  case \"$__V_CMD_OK$__V_CMD_EXIT\" in true0) ;; false124|false137) __V_TO=true;; false126|false127) __V_UN=true; [ -z \"$__V_MISSING\" ] && __V_MISSING=\"${__V_NAMES[$__i]}\"; __V_KIND=',\"kind\":\"environment-unavailable\",\"missing\":'; __V_KIND=\"$__V_KIND\"\"${__V_NAMESJSON[$__i]}\";; *) __V_HARD=true;; esac");
     lines.push('  __V_CMD_JSON="{\\\"cmd\\\":${__V_JCMDS[$__i]},\\\"exitCode\\\":$__V_CMD_EXIT,\\\"ok\\\":$__V_CMD_OK${__V_KIND}}"');
     lines.push("else");
     lines.push("  __V_CMD_OK=false; __V_ALL_OK=false; __V_HARD=true");
@@ -549,8 +578,10 @@ export function verifyGateScript(
   } else {
     lines.push('__V_DETAILS="{\\\"files\\\":[$__V_FILES_JSON]}"');
   }
-  // verified: true when everything passed; null (+ endedBy gate-timeout) when the ONLY failures were timeouts; else false.
-  lines.push('if [ "$__V_ALL_OK" = true ]; then __V_VERIFIED=true; __V_ENDED=\'\'; elif [ "$__V_HARD" = false ] && [ "$__V_TO" = true ]; then __V_VERIFIED=null; __V_ENDED=\',"endedBy":"gate-timeout"\'; else __V_VERIFIED=false; __V_ENDED=\'\'; fi');
+  // verified: true when everything passed; null (+ endedBy gate-timeout) when the ONLY failures were timeouts (#309);
+  // null (+ endedBy gate-unavailable) when the only failures could not start their toolchain at all (#324b:
+  // unavailable-only, strict — no mixing with timeouts; a hard failure or a failed file check still wins false).
+  lines.push('if [ "$__V_ALL_OK" = true ]; then __V_VERIFIED=true; __V_ENDED=\'\'; elif [ "$__V_HARD" = false ] && [ "$__V_TO" = true ] && [ "$__V_UN" = false ]; then __V_VERIFIED=null; __V_ENDED=\',"endedBy":"gate-timeout"\'; elif [ "$__V_HARD" = false ] && [ "$__V_UN" = true ] && [ "$__V_TO" = false ]; then __V_VERIFIED=null; __V_ENDED=",\\"endedBy\\":\\"gate-unavailable\\",\\"missing\\":\\"$__V_MISSING\\""; else __V_VERIFIED=false; __V_ENDED=\'\'; fi');
   const doneLine =
     `printf '{"done":1,"exitCode":%s,"finishedAt":"%s","verified":%s,"verifyDetails":%s%s}\\n' "$EC" "$(date -u +%FT%TZ)" "$__V_VERIFIED" "$__V_DETAILS" "$__V_ENDED" > ${shq(donePath)}`;
   return { verifyLines: lines, doneLine };

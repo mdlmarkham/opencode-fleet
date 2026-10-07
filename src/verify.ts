@@ -102,11 +102,17 @@ export interface VerifyDetails {
 
 /** Outcome recorded on the run result (issue #62). */
 export interface ExpectOutcome {
-  /** true: the gate ran and passed. false: it ran and failed. null: it did not finish in time (`endedBy: "gate-timeout"`), a property of the check and the node's load, not of the work (issue #309). Never a pass. */
+  /** true: the gate ran and passed. false: it ran and failed. null: it did not finish in time (`endedBy: "gate-timeout"`, issue #309) or could not start its toolchain (`endedBy: "gate-unavailable"`, issue #324b) — a property of the check and the node's environment, not of the work. Never a pass. */
   verified: boolean | null;
   verifyDetails: VerifyDetails;
-  /** Set exactly when `verified` is null because a gate command timed out. */
-  endedBy?: "gate-timeout";
+  /** Set exactly when `verified` is null: `"gate-timeout"` (a bound killed it, issue #309) or `"gate-unavailable"` (a missing toolchain, issue #324b). */
+  endedBy?: "gate-timeout" | "gate-unavailable";
+  /**
+   * Issue #324b (best effort): when `endedBy` is "gate-unavailable", the first
+   * environment-unavailable command's missing tool (e.g. "tsc"), so consumers
+   * do not have to dig into verifyDetails.
+   */
+  missing?: string;
 }
 
 /** Default wall-clock bound for `expect.command` so a hanging check cannot wedge a run record. */
@@ -260,8 +266,20 @@ export async function evaluateExpect(
   // Issue #309: a gate that did not finish is not a failed gate. Only when every failure is a timeout (no file
   // check failed, no command failed outright) is the outcome "unverified" (null); any real failure still wins.
   const timeoutOnly = !passed && files.every((f) => f.ok) && commands.every((c) => c.ok || c.timedOut === true);
-  const verified: boolean | null = passed ? true : timeoutOnly ? null : false;
-  const ended = timeoutOnly ? { endedBy: "gate-timeout" as const } : {};
+  // Issue #324b: the outcome half. #326 already tags a command that could not START its toolchain
+  // (exit 126/127) as kind:"environment-unavailable"; treat those the same way as #309's timeouts —
+  // the gate never stood a chance, so the result says "unverified" (null), not "failed". Fail-closed
+  // per the owner: a command failing WITHOUT timedOut/kind, or a failed file check, still wins false.
+  // Mixed edge (one timed-out + one unavailable command): neither timeout-only nor unavailable-only
+  // holds, so conservative false — pinned deliberately, like #309's strict shape.
+  const unavailableOnly = !passed && files.every((f) => f.ok) && commands.every((c) => c.ok || c.kind === "environment-unavailable");
+  const firstMissing = commands.find((c) => c.kind === "environment-unavailable" && c.missing)?.missing;
+  const verified: boolean | null = passed ? true : timeoutOnly ? null : unavailableOnly ? null : false;
+  const ended = unavailableOnly
+    ? { endedBy: "gate-unavailable" as const, ...(firstMissing ? { missing: firstMissing } : {}) }
+    : timeoutOnly
+      ? { endedBy: "gate-timeout" as const }
+      : {};
   if (commands.length === 0) return { verified, verifyDetails: { files } };
   // Issue #104: the ledger shape follows the WIRE shape — a singular `command`
   // records the exact legacy `{files, command}` details (byte-identical, so

@@ -131,6 +131,8 @@ export function registerRunsTools(api: OpenClawPluginApi, cfg: FleetConfig): { r
           ...(typeof st.exitCode === "number" ? { exitCode: st.exitCode } : {}),
           ...(reconcileVerified !== null ? { verified: reconcileVerified } : {}),
           ...(st.gateTimedOut === true && reconcileVerified === null ? { gateTimedOut: true as const } : {}),
+          // Issue #324b: a could-not-run gate is recorded like #309's timeout (unverified, not failed).
+          ...(st.gateUnavailable === true && reconcileVerified === null ? { gateUnavailable: true as const, gateMissing: typeof st.gateMissing === "string" && st.gateMissing ? st.gateMissing : undefined } : {}),
           ...(st.verifyDetails != null ? { verifyDetails: st.verifyDetails } : {}),
           // Issue #104: persist what the node reported so fleet_sync can apply the scope policy.
           ...(entry?.spec?.scope && st.finishedAt ? { scopeViolations: Array.isArray(st.scopeViolations) ? (st.scopeViolations as string[]) : null } : {}),
@@ -199,6 +201,13 @@ export function registerRunsTools(api: OpenClawPluginApi, cfg: FleetConfig): { r
           ? {
               gateTimedOut: true,
               verifiedNote: "VERIFICATION GATE TIMED OUT (issue #309): the gate command did not finish within its bound, so the work is UNVERIFIED, not failed. Re-run the gate by hand or on a quieter node (or raise verify.timeoutMs); do not report it as verified.",
+            }
+          : {}),
+        ...(st.gateUnavailable === true
+          ? {
+              // Issue #324b: the gate never ran its toolchain — name the cause, never "failed".
+              gateUnavailable: true,
+              verifiedNote: `VERIFICATION GATE UNAVAILABLE (issue #324b): ${st.gateMissing ? `the gate could not run (tool missing: ${st.gateMissing})` : "the gate could not run (a tool is missing on the node)"}, so the work is UNVERIFIED, not failed. Bootstrap the checkout (see "Bootstrapping a clone" in docs/operators.md) and re-run; do not report it as verified.`,
             }
           : {}),
         ...(st.verified === false

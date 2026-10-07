@@ -168,6 +168,9 @@ export interface ManifestInput {
   exitCode?: number;
   verified?: boolean | null;
   verifyDetails?: unknown;
+  /** Issue #324b: the gate could not run its toolchain (missing tool); unverified, not failed. */
+  gateUnavailable?: boolean;
+  missing?: string;
   scope?: { files: string[] };
   changes?: Changes;
   events: Commands;
@@ -190,6 +193,10 @@ export function buildManifest(i: ManifestInput) {
     durationMs: Number.isFinite(started) && Number.isFinite(finished) ? Math.max(0, finished - started) : null,
     exitCode: typeof i.exitCode === "number" ? i.exitCode : null,
     verified: typeof i.verified === "boolean" ? i.verified : null,
+    // Issue #324b: name the could-not-run outcome (null ≠ pass ≠ fail) and, best effort, the missing
+    // tool, so the audit manifest explains itself without a trip through verifyDetails.
+    ...(i.gateUnavailable ? { gateUnavailable: true } : {}),
+    ...(i.missing ? { missing: i.missing } : {}),
     ...(i.verifyDetails != null ? { verifyDetails: i.verifyDetails } : {}),
     startHead: i.startHead ?? null,
     endHead: i.changes?.endHead ?? null,
