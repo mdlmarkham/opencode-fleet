@@ -508,12 +508,13 @@ export function verifyGateScript(
     if (!plural) {
       const command = commands[0];
       lines.push("__V_JCMD=" + shq(JSON.stringify(command)));
+      lines.push("__V_KIND=''");
       lines.push('if [ "$__V_CDW" = true ]; then');
       lines.push(
         `  if timeout -k 5 ${timeoutSec} bash -c ${shq(command)} >/dev/null 2>&1; then __V_CMD_OK=true; __V_CMD_EXIT=0; else __V_CMD_EXIT=$?; __V_CMD_OK=false; __V_ALL_OK=false; fi`,
       );
-      lines.push('  case "$__V_CMD_OK$__V_CMD_EXIT" in true0) ;; false124|false137) __V_TO=true;; *) __V_HARD=true;; esac');
-      lines.push('  __V_CMD_JSON="{\\\"cmd\\\":$__V_JCMD,\\\"exitCode\\\":$__V_CMD_EXIT,\\\"ok\\\":$__V_CMD_OK}"');
+      lines.push('  case "$__V_CMD_OK$__V_CMD_EXIT" in true0) ;; false124|false137) __V_TO=true;; false126|false127) __V_KIND=\',"kind":"environment-unavailable"\'; __V_HARD=true;; *) __V_HARD=true;; esac');
+      lines.push('  __V_CMD_JSON="{\\\"cmd\\\":$__V_JCMD,\\\"exitCode\\\":$__V_CMD_EXIT,\\\"ok\\\":$__V_CMD_OK${__V_KIND}}"');
       lines.push("else");
       lines.push("  __V_CMD_OK=false; __V_ALL_OK=false; __V_HARD=true");
       lines.push('  __V_CMD_JSON="{\\\"cmd\\\":$__V_JCMD,\\\"exitCode\\\":null,\\\"ok\\\":false}"');
@@ -526,12 +527,13 @@ export function verifyGateScript(
     lines.push("__V_CMDS_JSON=''");
     lines.push("__V_SEP=''");
     lines.push('for __i in "${!__V_CMDS[@]}"; do');
+    lines.push("__V_KIND=''");
     lines.push('if [ "$__V_CDW" = true ]; then');
     lines.push(
       `  if timeout -k 5 "\${__V_TOOLS[$__i]}" bash -c "\${__V_CMDS[$__i]}" >/dev/null 2>&1; then __V_CMD_OK=true; __V_CMD_EXIT=0; else __V_CMD_EXIT=$?; __V_CMD_OK=false; __V_ALL_OK=false; fi`,
     );
-    lines.push('  case "$__V_CMD_OK$__V_CMD_EXIT" in true0) ;; false124|false137) __V_TO=true;; *) __V_HARD=true;; esac');
-    lines.push('  __V_CMD_JSON="{\\\"cmd\\\":${__V_JCMDS[$__i]},\\\"exitCode\\\":$__V_CMD_EXIT,\\\"ok\\\":$__V_CMD_OK}"');
+    lines.push('  case "$__V_CMD_OK$__V_CMD_EXIT" in true0) ;; false124|false137) __V_TO=true;; false126|false127) __V_KIND=\',"kind":"environment-unavailable"\'; __V_HARD=true;; *) __V_HARD=true;; esac');
+    lines.push('  __V_CMD_JSON="{\\\"cmd\\\":${__V_JCMDS[$__i]},\\\"exitCode\\\":$__V_CMD_EXIT,\\\"ok\\\":$__V_CMD_OK${__V_KIND}}"');
     lines.push("else");
     lines.push("  __V_CMD_OK=false; __V_ALL_OK=false; __V_HARD=true");
     lines.push('  __V_CMD_JSON="{\\\"cmd\\\":${__V_JCMDS[$__i]},\\\"exitCode\\\":null,\\\"ok\\\":false}"');

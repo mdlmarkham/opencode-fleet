@@ -46,14 +46,16 @@ describe("issue #13 layer 3: fleet_sync destination branch", () => {
 
   it("clones the clone base, never the worker branch, on both paths", () => {
     // Clone base must be `branch` so `--branch` always resolves on origin.
+    // Issue #323: the sync clone base resolves the branch (`cloneBase` = the named base if origin has it, else the
+    // repo's default), so the SSH/from-base64 sync sites clone `cloneBase`; provision still clones `branch`.
     const clones = provision.match(/git", \["clone", "--branch", ([^,]+),/g) ?? [];
     expect(clones.length).toBeGreaterThanOrEqual(2);
-    for (const c of clones) expect(c).toContain('"clone", "--branch", branch,');
+    for (const c of clones) expect(c).toMatch(/"clone", "--branch", (branch|r\.base),/);
   });
 
   it("passes a pinned destination only when the caller explicitly named one", () => {
     // SSH path: 6th arg is `p.branch` (undefined when defaulted).
-    expect(index).toContain("syncFromNode(host, p.cwd, p.repo, p.branch ?? \"main\", undefined, p.branch, cfg.sync, expectedHead)");
+    expect(index).toContain("syncFromNode(host, p.cwd, p.repo, p.branch ?? \"main\", undefined, p.branch, cfg.sync, { ...(expectedHead ?? {}), baseExplicit: p.branch !== undefined })");
     // Channel path: destBranch carries the raw (possibly undefined) caller value.
     expect(index).toContain("destBranch: p.branch,");
   });

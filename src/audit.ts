@@ -201,6 +201,11 @@ export function buildManifest(i: ManifestInput) {
     // null = the capture is missing (not a git repo, or the run died before the tail), never "no changes".
     filesChanged: i.changes ? i.changes.files : null,
     diffStat: i.changes ? i.changes.diffStat : null,
+    // Issue #325: a run that changed NOTHING against its start commit is named explicitly, so a silent
+    // no-op is not indistinguishable from a run that did the job. Derived, not asserted: `false` only
+    // when the capture is present AND empty (a missing capture is `null` filesChanged = unknown, and
+    // stays unknown). Distinct from `verified` — this is about whether work HAPPENED, not whether it passed.
+    ...(i.changes ? { producedChanges: i.changes.files.length > 0 } : {}),
     ...(i.scope ? { scope: i.scope } : {}),
     commandsRecorded: i.events.commandsRecorded,
     commands: i.events.commands,
