@@ -218,3 +218,34 @@ export function pointReport(p: DecisionPoint, log: object[], minN = DEFAULT_MIN_
     why,
   };
 }
+
+export interface ReadinessCoverage {
+  /** Rows of kind `readiness.dispatch` in the log. */
+  judged: number;
+  /** Rows where S1 itself answered (`source: "s1"`). */
+  answeredByS1: number;
+  /** Rows where the deterministic baseline answered because S1 could not. */
+  fellBack: number;
+  /** Fallbacks bucketed by the #311 stable prefixes (longest first); unknown reasons keep their raw string. */
+  byReason: Record<string, number>;
+}
+
+/** #311's stable fallbackReason prefixes, longest first so "S1 rejected the request" wins over a hypothetical shorter one. */
+const FALLBACK_PREFIXES: readonly string[] = ["S1 rejected the request", "S1 request failed", "S1 unreachable", "S1 timed out"];
+
+/** Summarize the readiness rows of a shadow log (issue #322): how often S1 actually answered vs fell back, and why. Pure. */
+export function readinessCoverage(log: object[]): ReadinessCoverage {
+  const rows = (log as Array<{ kind?: string; source?: string; fallbackReason?: string }>).filter((e) => e.kind === "readiness.dispatch");
+  const byReason: Record<string, number> = {};
+  for (const e of rows) {
+    if (e.source !== "baseline" || e.fallbackReason === undefined) continue;
+    const prefix = FALLBACK_PREFIXES.find((p) => e.fallbackReason!.startsWith(p)) ?? e.fallbackReason;
+    byReason[prefix] = (byReason[prefix] ?? 0) + 1;
+  }
+  return {
+    judged: rows.length,
+    answeredByS1: rows.filter((e) => e.source === "s1").length,
+    fellBack: rows.filter((e) => e.source === "baseline").length,
+    byReason,
+  };
+}
