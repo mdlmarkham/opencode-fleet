@@ -73,6 +73,49 @@ export function normalizeRepo(repo: string): string {
 }
 
 /**
+ * Issue #323: the branch to CLONE for a sync (a branch that exists on origin).
+ *
+ * The caller's base defaults to "main", but not every repo uses it (`master`, `trunk`, …).
+ * Using a name origin does not have fails at clone with "Remote branch main not found in
+ * upstream origin", and that surfaced only *after* an unverified-work refusal — two
+ * unrelated failures in sequence, so the real cause was easy to misdiagnose.
+ *
+ * Resolution order:
+ *   1. the named base, if origin has it (`git ls-remote --heads <repo> <branch>`);
+ *   2. otherwise the repo's real default branch (its symref HEAD, e.g. `ref: refs/heads/master`);
+ *   3. if neither can be resolved (offline, unreadable repo), the named base unchanged —
+ *      the clone then fails with git's own message, which the caller can read.
+ *
+ * Pure resolution against the remote; the caller receives the branch it should clone.
+ */
+export function parseDefaultBranch(lsRemoteSymrefOut: string): string | undefined {
+  // `git ls-remote --symref <repo> HEAD` prints a line like `ref: refs/heads/master\tHEAD`.
+  const m = /^ref:\s+refs\/heads\/(\S+)\s+HEAD\s*$/m.exec(lsRemoteSymrefOut);
+  return m ? m[1] : undefined;
+}
+
+export async function resolveCloneBase(repo: string, branch: string): Promise<string> {
+  const url = normalizeRepo(repo);
+  const has = async (name: string): Promise<boolean> => {
+    try {
+      const { stdout } = await execFileP("git", ["ls-remote", "--heads", "--", url, name], { timeout: 60_000 });
+      return stdout.includes(`refs/heads/${name}`);
+    } catch {
+      return false;
+    }
+  };
+  if (await has(branch)) return branch;
+  try {
+    const { stdout } = await execFileP("git", ["ls-remote", "--symref", "--", url, "HEAD"], { timeout: 60_000 });
+    const def = parseDefaultBranch(stdout);
+    if (def && (await has(def))) return def;
+  } catch {
+    /* fall through to the named base */
+  }
+  return branch;
+}
+
+/**
  * Issue #152: the placeholder remote left on a node checkout when NO stable
  * repo URL is known. It names the situation plainly (a bundle-provisioned
  * checkout with no persistent upstream) and lives under an invalid scheme so
@@ -1138,11 +1181,13 @@ export async function syncFromNode(
 
     // Apply the bundle to a fresh clone and push with manager creds.
     const cloneDir = join(work, "repo");
-    // Clone a branch that EXISTS on origin (the destination branch). The
-    // worker's own branch usually does NOT exist remotely yet — creating it is
-    // the purpose of sync — so `--branch <worker-branch>` fails. Clone the
-    // destination branch, then fetch the worker's refs from the bundle.
-    await execFileP("git", ["clone", "--branch", branch, "--", normalizeRepo(repo), cloneDir], { timeout: 120_000 });
+    // Issue #323: the CLONE base must exist on origin. The caller's `branch` (default
+    // "main") used to be used verbatim, so a repo whose default is `master` failed at
+    // clone with "Remote branch main not found in upstream origin" — surfaced, confusingly,
+    // only AFTER an unverified-work refusal. Resolve the branch we will actually clone:
+    // the named base if origin has it, else the repo's real default (its symref HEAD).
+    const cloneBase = await resolveCloneBase(repo, branch);
+    await execFileP("git", ["clone", "--branch", cloneBase, "--", normalizeRepo(repo), cloneDir], { timeout: 120_000 });
     // Detect the worker's checked-out branch (its work often lives on a feature
     // branch, not `main`); fall back to the destination branch when HEAD is
     // detached or unavailable.

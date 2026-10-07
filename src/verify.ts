@@ -79,6 +79,16 @@ export interface ExpectCommandCheck {
   ok: boolean;
   /** The command was killed by the gate's own time bound: it did not finish, so it is not a verdict on the work (issue #309). */
   timedOut?: true;
+  /**
+   * Issue #324: WHY a non-zero exit happened. `environment-unavailable` = the command could not START the
+   * toolchain (a missing binary, exit 127 / "not found") — the gate never stood a chance, so a `verified:false`
+   * here says nothing about the work. Omitted for a plain failure (`ok:false`, `exitCode`) — "the command ran
+   * and failed" is already what `ok:false` means, so a `kind` there would be noise (and would churn the
+   * recorded shape for ordinary failures).
+   */
+  kind?: "environment-unavailable";
+  /** When kind is environment-unavailable: the command/binary that was missing (best effort, e.g. "tsc"). */
+  missing?: string;
 }
 
 /** Full result of evaluating an `expect` spec. */
@@ -314,11 +324,25 @@ export function killProcessTree(pid: number | undefined, direct: (() => void) | 
 /** Run the expect command (bash -c, cwd, own process group) and capture its exit status. */
 async function runExpectCommand(cmd: string, cwd: string, timeoutMs: number): Promise<ExpectCommandCheck> {
   const { spawn } = await import("node:child_process");
+  const fsp = await import("node:fs/promises");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  // Issue #324: capture stderr to a FILE, not a pipe. A pipe keeps the process group's lifetime
+  // open, so a detached background job outlives the gate's group kill (#67 caught that regression).
+  // A file descriptor does not: the group is reaped as before, and the tail is read after close.
+  // The capture is best-effort — any failure here must not change the gate's verdict.
+  let errDir: string | undefined;
+  let errFile: string | undefined;
+  try {
+    errDir = await fsp.mkdtemp(path.join(os.tmpdir(), "fleet-gate-err-"));
+    errFile = path.join(errDir, "stderr.txt");
+  } catch { /* no capture; the classifier simply sees no stderr */ }
+  const redir = errFile ? ` 2>${JSON.stringify(errFile)}` : "";
   return new Promise<ExpectCommandCheck>((resolveDone) => {
     let settled = false;
     // detached (POSIX) => its own process group, so a timeout (or exit) can take
     // down forked descendants and background jobs, not just the bash child.
-    const child = spawn("bash", ["-c", cmd], {
+    const child = spawn("bash", ["-c", redir ? `${cmd}${redir}` : cmd], {
       cwd,
       stdio: ["ignore", "ignore", "ignore"],
       detached: process.platform !== "win32",
@@ -332,7 +356,19 @@ async function runExpectCommand(cmd: string, cwd: string, timeoutMs: number): Pr
       clearTimeout(timer);
       // A gate must not leave stragglers mutating the workspace after it returned.
       killTree();
-      resolveDone({ cmd, exitCode, ok: exitCode === 0, ...(timedOut ? { timedOut: true as const } : {}) });
+      const base = { cmd, exitCode, ok: exitCode === 0, ...(timedOut ? { timedOut: true as const } : {}) };
+      // Issue #324: classify a non-zero exit as environmental (a missing toolchain) vs a real
+      // failure, from the captured stderr tail. Read it, then clean up, both best-effort.
+      const classifyAndFinish = (errTail: string) => {
+        const env = timedOut || exitCode === 0 || exitCode === null ? undefined : classifyEnvironmentFailure(cmd, exitCode, errTail);
+        resolveDone({ ...base, ...(env ? { kind: "environment-unavailable" as const, ...(env.missing ? { missing: env.missing } : {}) } : {}) });
+        if (errDir) void fsp.rm(errDir, { recursive: true, force: true }).catch(() => {});
+      };
+      if (!errFile || exitCode === 0 || exitCode === null || timedOut) return classifyAndFinish("");
+      void fsp
+        .readFile(errFile, "utf8")
+        .then((s) => classifyAndFinish(s.slice(-2000)))
+        .catch(() => classifyAndFinish(""));
     };
     const timer = setTimeout(() => {
       // A hanging gate must not hang the run record; it is recorded as TIMED OUT (not failed, issue #309).
@@ -343,6 +379,32 @@ async function runExpectCommand(cmd: string, cwd: string, timeoutMs: number): Pr
     child.on("error", () => finish(null));
     child.on("close", (code) => finish(typeof code === "number" ? code : null));
   });
+}
+
+/**
+ * Issue #324: is a non-zero gate exit an ENVIRONMENT failure or a TEST failure?
+ *
+ * Exit 127 is the POSIX shell's "command not found"; a Node/TS repo whose clone has no `node_modules`
+ * fails exactly here (`sh: 1: tsc: not found`) and used to read as `verified: false` — a verdict on the
+ * work for something that never had a chance to run. Other known signatures of a missing/damaged
+ * toolchain are matched too. Everything else is a genuine test failure.
+ *
+ * Returns the missing tool when it can be named (best effort), else an empty object. Pure.
+ */
+export function classifyEnvironmentFailure(cmd: string, exitCode: number, stderrTail: string): { missing?: string } | undefined {
+  const t = String(stderrTail ?? "");
+  // `sh: 1: tsc: not found` / `bash: line 1: vitest: command not found`
+  const notFound = /(?:^|\n)\s*(?:\S+:\s*)?(?:line \d+:\s*)?([\w.@/-]+):\s*(?:command )?not found\b/.exec(t);
+  if (exitCode === 127) return { ...(notFound?.[1] ? { missing: notFound[1] } : {}) };
+  if (notFound?.[1]) return { missing: notFound[1] };
+  // Module/deps absent rather than a failing test: `Cannot find module 'x'`, `MODULE_NOT_FOUND`.
+  const noModule = /Cannot find module '([^']+)'|MODULE_NOT_FOUND/.exec(t);
+  if (noModule) return { ...(noModule[1] ? { missing: noModule[1] } : {}) };
+  // A missing interpreter/tool named directly.
+  const noSuch = /No such file or directory: '([^']+)'|([\w.@/-]+): No such file or directory/.exec(t);
+  if (noSuch) return { ...((noSuch[1] ?? noSuch[2]) ? { missing: noSuch[1] ?? noSuch[2] } : {}) };
+  void cmd;
+  return undefined;
 }
 
 /**
