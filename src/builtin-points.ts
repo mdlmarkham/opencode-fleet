@@ -16,7 +16,7 @@
  */
 
 import { parsePoints, runPoint, linkOutcome, type DecisionPoint, type PointDecision } from "./decision-points.js";
-import { buildShadowDecider, shadowFileSink, trackShadow, type DeciderLike } from "./s1-shadow.js";
+import { buildShadowDecider, shadowFileSink, trackShadow, SHADOW_RECORD_MAX_CHARS, type DeciderLike } from "./s1-shadow.js";
 import { quoteUntrusted } from "./untrusted.js";
 
 const BAND = { lowBelow: 0.2, highAbove: 0.8 };
@@ -124,9 +124,14 @@ export function readinessDecider(cfgS1: unknown, rootDir?: string): DeciderLike 
   return buildShadowDecider(cfgS1, { ...(rootDir ? { rootDir } : {}), sink: () => Promise.resolve() });
 }
 
-/** One bounded record per judged dispatch: the model's per-criterion probabilities next to the baseline's verdict, for pointReport. Never throws. */
-export async function logReadinessJudgement(rootDir: string | undefined, entry: { source: string; ready: boolean; baselineReady: boolean; probabilities?: Record<string, number>; uncertain: string[] }): Promise<void> {
+/** One bounded record per judged dispatch: the model's per-criterion probabilities next to the baseline's verdict, for pointReport. Never throws. Issue #322: a fallback row carries its `fallbackReason`. */
+export async function logReadinessJudgement(rootDir: string | undefined, entry: { source: string; ready: boolean; baselineReady: boolean; probabilities?: Record<string, number>; fallbackReason?: string; uncertain: string[] }): Promise<void> {
   try { await shadowFileSink(rootDir)({ kind: "readiness.dispatch", ts: new Date().toISOString(), ...entry }); } catch { /* evidence only */ }
+}
+
+/** Issue #322: a failed shadowPoint is logged, not silent: one shadow record naming the point and its failure. Never throws. */
+export async function logShadowPointFailure(rootDir: string | undefined, pointId: string, failure: string): Promise<void> {
+  try { await shadowFileSink(rootDir)({ kind: "s1-shadow", ts: new Date().toISOString(), questionId: pointId, ok: false, error: failure.slice(0, SHADOW_RECORD_MAX_CHARS) }); } catch { /* evidence only */ }
 }
 
 export { linkOutcome };
