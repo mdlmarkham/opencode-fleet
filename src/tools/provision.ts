@@ -270,12 +270,12 @@ export function registerProvisionTools(api: OpenClawPluginApi, cfg: FleetConfig)
           // feature-branch worker publishes its own commits instead of the base.
           workerBranch: typeof bundlePl.branch === "string" ? bundlePl.branch : undefined,
           destBranch: p.branch,
-        }, undefined, cfg.sync, expectedHead);
+        }, undefined, cfg.sync, { ...(expectedHead ?? {}), baseExplicit: p.branch !== undefined });
         return jsonResult({ ...r, ...gateNote, ...reviewNote, viaChannel: true });
       }
 
       const { syncFromNode } = await import("../provision.js");
-      const r = await syncFromNode(host, p.cwd, p.repo, p.branch ?? "main", undefined, p.branch, cfg.sync, expectedHead);
+      const r = await syncFromNode(host, p.cwd, p.repo, p.branch ?? "main", undefined, p.branch, cfg.sync, { ...(expectedHead ?? {}), baseExplicit: p.branch !== undefined });
       return jsonResult({ ...r, ...gateNote, ...reviewNote });
     },
   });

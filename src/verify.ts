@@ -337,12 +337,13 @@ async function runExpectCommand(cmd: string, cwd: string, timeoutMs: number): Pr
     errDir = await fsp.mkdtemp(path.join(os.tmpdir(), "fleet-gate-err-"));
     errFile = path.join(errDir, "stderr.txt");
   } catch { /* no capture; the classifier simply sees no stderr */ }
-  const redir = errFile ? ` 2>${JSON.stringify(errFile)}` : "";
+  // `exec 2>FILE` first, so the whole command (`a && b`, `;`, comments, `&`) is captured.
+  const prefix = errFile ? `exec 2>'${errFile.replace(/'/g, "'\\''")}'\n` : "";
   return new Promise<ExpectCommandCheck>((resolveDone) => {
     let settled = false;
     // detached (POSIX) => its own process group, so a timeout (or exit) can take
     // down forked descendants and background jobs, not just the bash child.
-    const child = spawn("bash", ["-c", redir ? `${cmd}${redir}` : cmd], {
+    const child = spawn("bash", ["-c", prefix ? `${prefix}${cmd}` : cmd], {
       cwd,
       stdio: ["ignore", "ignore", "ignore"],
       detached: process.platform !== "win32",
@@ -393,18 +394,12 @@ async function runExpectCommand(cmd: string, cwd: string, timeoutMs: number): Pr
  */
 export function classifyEnvironmentFailure(cmd: string, exitCode: number, stderrTail: string): { missing?: string } | undefined {
   const t = String(stderrTail ?? "");
-  // `sh: 1: tsc: not found` / `bash: line 1: vitest: command not found`
-  const notFound = /(?:^|\n)\s*(?:\S+:\s*)?(?:line \d+:\s*)?([\w.@/-]+):\s*(?:command )?not found\b/.exec(t);
-  if (exitCode === 127) return { ...(notFound?.[1] ? { missing: notFound[1] } : {}) };
-  if (notFound?.[1]) return { missing: notFound[1] };
-  // Module/deps absent rather than a failing test: `Cannot find module 'x'`, `MODULE_NOT_FOUND`.
-  const noModule = /Cannot find module '([^']+)'|MODULE_NOT_FOUND/.exec(t);
-  if (noModule) return { ...(noModule[1] ? { missing: noModule[1] } : {}) };
-  // A missing interpreter/tool named directly.
-  const noSuch = /No such file or directory: '([^']+)'|([\w.@/-]+): No such file or directory/.exec(t);
-  if (noSuch) return { ...((noSuch[1] ?? noSuch[2]) ? { missing: noSuch[1] ?? noSuch[2] } : {}) };
+  // Only the shell's own "cannot execute" (126) / "not found" (127) are environmental; a test that
+  // exits 1 printing "Cannot find module" is a genuine failure of the work.
+  if (exitCode !== 126 && exitCode !== 127) return undefined;
+  const notFound = /([\w.@/-]+):\s*(?:command )?not found\b/.exec(t);
   void cmd;
-  return undefined;
+  return { ...(notFound?.[1] ? { missing: notFound[1] } : {}) };
 }
 
 /**
