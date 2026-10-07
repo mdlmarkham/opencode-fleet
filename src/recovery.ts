@@ -39,6 +39,39 @@ export const ACK_ABSENT_NOTE =
 export const ACK_INCONCLUSIVE_NOTE =
   "Launch was not confirmed: probe inconclusive — verify with fleet_run_status before re-dispatching.";
 
+/**
+ * Issue #256: the exact post-restart transient error, as the node/relay emits it. Narrow on
+ * purpose — the retry must fire only for this specific condition, never a general error.
+ */
+export const PUBLICATION_TRANSIENT_PHRASE = "current worker publication";
+
+/** Bounded pause before the single retry: long enough for the publication, short enough not to stall. */
+export const PUBLICATION_RETRY_DELAY_MS = 2_000;
+
+/**
+ * Narrow match: does this error text mention the exact transient phrase (case-insensitive)?
+ * Pure; the caller checks BOTH channels (a node-returned error string AND a relay-throw message).
+ */
+export function isWorkerPublicationTransient(errText: unknown): boolean {
+  return typeof errText === "string" && errText.toLowerCase().includes(PUBLICATION_TRANSIENT_PHRASE);
+}
+
+/** Abortable bounded delay for the single retry (never leaves a pending timer on abort). */
+export function publicationRetryDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(resolve, ms);
+    (t as { unref?: () => void }).unref?.();
+    signal?.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(t);
+        reject(signal.reason ?? new Error("aborted"));
+      },
+      { once: true },
+    );
+  });
+}
+
 /** Extract the parsed payload object from a node invoke result. */
 function payloadOf(inv: unknown): Record<string, unknown> {
   const payload = (inv as { payload?: unknown }).payload;

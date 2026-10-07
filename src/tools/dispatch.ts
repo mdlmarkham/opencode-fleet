@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { shq } from "../shell.js";
 import { AWAIT_MISSING_NOTE } from "../await.js";
 import { DEFAULT_RUN_TIMEOUT_MS, validateHarnessTransport, validatePiOptions, type OpenCodeTask } from "../opencode.js";
-import { probeAckRecovery, ACK_ABSENT_NOTE, ACK_PROBE_TIMEOUT_MS, type AckRecoveryOutcome } from "../recovery.js";
+import { probeAckRecovery, ACK_ABSENT_NOTE, ACK_PROBE_TIMEOUT_MS, PUBLICATION_RETRY_DELAY_MS, isWorkerPublicationTransient, publicationRetryDelay, type AckRecoveryOutcome } from "../recovery.js";
 import { SSH_ARGS, sshPrefix } from "../ssh.js";
 import { checkSetup, partitionEnv } from "../policy.js";
 import { isSentinelPrompt } from "../protocol.js";
@@ -662,18 +662,65 @@ export function registerDispatchTools(api: OpenClawPluginApi, cfg: FleetConfig):
           // is lost before the command is built — which is exactly how
           // fleet_dispatch ran empty sessions and still reported success.
           const launchParams = { ...task, prompt: "__RUN_START__", realPrompt: p.prompt, runId };
-          inv = await api.runtime.nodes
-            .invoke({
-              nodeId: node.nodeId,
-              command: "opencode.run",
-              params: launchParams,
-              timeoutMs: 30_000,
-              signal,
-            })
-            .catch((err: Error) => ({
-              invokeTimedOut: true as const,
-              message: err.message,
-            }));
+          const invokeDetach = (params: typeof launchParams) =>
+            api.runtime.nodes
+              .invoke({
+                nodeId: node.nodeId,
+                command: "opencode.run",
+                params,
+                timeoutMs: 30_000,
+                signal,
+              })
+              .catch((err: Error) => ({
+                invokeTimedOut: true as const,
+                message: err.message,
+              }));
+          inv = await invokeDetach(launchParams);
+          // Issue #256: the FIRST detached launch right after a node service restart can be
+          // refused with "Device pairing authority requires a current worker publication" —
+          // transient, gone seconds later. This is DETACHED-ONLY (the synchronous path below is
+          // unchanged). Review-fixed (independent review):
+          //   (1) the phrase can arrive on EITHER channel — a node-returned {ok:false,error}, OR
+          //       (more often) a relay THROW that `.catch` turned into {invokeTimedOut,message}
+          //       (payload then {}). Match BOTH, or the retry is inert in the real case.
+          //   (2) the transient does NOT prove nothing launched (this PR's own provenance: the run
+          //       started anyway). Before a second `__RUN_START__`, PROBE the runId with the
+          //       #29/#30 machinery: `confirmed` ADOPTS the live run (no double-launch, no
+          //       createRunClone clash); only `absent` retries; `inconclusive` never relaunches.
+          // The phrase match is NARROW (the exact phrase, case-insensitive) so no other error is
+          // ever retried.
+          const transient = isWorkerPublicationTransient(payloadOf(inv).error) || isWorkerPublicationTransient((inv as { message?: string }).message);
+          if (transient && !signal?.aborted) {
+            const pre = await probeAckRecovery((probeSignal) =>
+              api.runtime.nodes.invoke({
+                nodeId: node.nodeId,
+                command: "opencode.run",
+                params: { prompt: "__RUN_STATUS__", cwd: "/", transport: "http", runId },
+                timeoutMs: ACK_PROBE_TIMEOUT_MS,
+                signal: probeSignal,
+              }),
+            );
+            if (pre.kind === "confirmed") {
+              await upsertRun(rootDir, { ...ledgerEntry, ...(pre.pid ? { pid: pre.pid } : {}), updatedAt: new Date().toISOString(), state: "running" });
+              results[node.displayName ?? node.nodeId] = {
+                runId,
+                detached: true,
+                ok: true,
+                ackPending: false,
+                ...(pre.pid ? { pid: pre.pid } : {}),
+                recoveredFromTransient: true,
+                probe: pre.verdict,
+                note: "the post-restart publication transient was followed by a live run; adopted without a second launch",
+                ...(autoApproveWarnings[nodeName] ? { warnings: autoApproveWarnings[nodeName] } : {}),
+              };
+              continue;
+            }
+            if (pre.verdict === "absent") {
+              await publicationRetryDelay(PUBLICATION_RETRY_DELAY_MS, signal);
+              inv = await invokeDetach(launchParams);
+            }
+            // inconclusive: leave it — never relaunch when a run may be live.
+          }
         } else {
           inv = await api.runtime.nodes
             .invoke({
