@@ -486,7 +486,10 @@ export function registerDispatchTools(api: OpenClawPluginApi, cfg: FleetConfig):
           bp = await import("../builtin-points.js");
           ask = bp.readinessDecider(cfg.s1, rootDir) as import("../readiness-judge.js").AskS1 | undefined;
         }
-        readiness = await judgeReadiness(specCheck.spec ? { spec: specCheck.spec } : { prompt: p.prompt }, ask);
+        // The judge's own race must outlast the decider's bound (s1.timeoutMs, default 10s), or the two tie and the
+        // decider's precise error ("S1 timed out after Nms", "S1 rejected the request: ...") loses to a generic one (#311).
+        const s1Bound = typeof (cfg.s1 as { timeoutMs?: unknown } | null | undefined)?.timeoutMs === "number" ? (cfg.s1 as { timeoutMs: number }).timeoutMs : 10_000;
+        readiness = await judgeReadiness(specCheck.spec ? { spec: specCheck.spec } : { prompt: p.prompt }, ask, { timeoutMs: s1Bound + 2_000 });
         if (readiness && bp && readiness.source === "s1") {
           const { readinessOf, readinessOfPrompt } = await import("../readiness.js");
           const base = specCheck.spec ? readinessOf(specCheck.spec) : readinessOfPrompt(p.prompt);

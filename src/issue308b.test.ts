@@ -90,7 +90,7 @@ describe("#308: wiring in fleet_dispatch", () => {
     const src = gatewaySrc();
     expect(src).toContain("if (cfg.s1 != null) {");
     expect(src).toMatch(/if \(cfg\.s1 != null\) \{\s*bp = await import\("\.\/builtin-points\.js"\);/);
-    expect(src).toContain("judgeReadiness(specCheck.spec ? { spec: specCheck.spec } : { prompt: p.prompt }, ask)");
+    expect(src).toContain("judgeReadiness(specCheck.spec ? { spec: specCheck.spec } : { prompt: p.prompt }, ask, { timeoutMs: s1Bound + 2_000 })");
   });
 
   let restore: (() => void) | undefined;
