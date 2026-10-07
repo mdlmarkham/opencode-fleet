@@ -77,6 +77,8 @@ export interface ExpectCommandCheck {
   cmd: string;
   exitCode: number | null;
   ok: boolean;
+  /** The command was killed by the gate's own time bound: it did not finish, so it is not a verdict on the work (issue #309). */
+  timedOut?: true;
 }
 
 /** Full result of evaluating an `expect` spec. */
@@ -90,8 +92,11 @@ export interface VerifyDetails {
 
 /** Outcome recorded on the run result (issue #62). */
 export interface ExpectOutcome {
-  verified: boolean;
+  /** true: the gate ran and passed. false: it ran and failed. null: it did not finish in time (`endedBy: "gate-timeout"`), a property of the check and the node's load, not of the work (issue #309). Never a pass. */
+  verified: boolean | null;
   verifyDetails: VerifyDetails;
+  /** Set exactly when `verified` is null because a gate command timed out. */
+  endedBy?: "gate-timeout";
 }
 
 /** Default wall-clock bound for `expect.command` so a hanging check cannot wedge a run record. */
@@ -241,8 +246,12 @@ export async function evaluateExpect(
     );
   }
 
-  const verified =
-    files.every((f) => f.ok) && commands.every((c) => c.ok);
+  const passed = files.every((f) => f.ok) && commands.every((c) => c.ok);
+  // Issue #309: a gate that did not finish is not a failed gate. Only when every failure is a timeout (no file
+  // check failed, no command failed outright) is the outcome "unverified" (null); any real failure still wins.
+  const timeoutOnly = !passed && files.every((f) => f.ok) && commands.every((c) => c.ok || c.timedOut === true);
+  const verified: boolean | null = passed ? true : timeoutOnly ? null : false;
+  const ended = timeoutOnly ? { endedBy: "gate-timeout" as const } : {};
   if (commands.length === 0) return { verified, verifyDetails: { files } };
   // Issue #104: the ledger shape follows the WIRE shape — a singular `command`
   // records the exact legacy `{files, command}` details (byte-identical, so
@@ -250,11 +259,12 @@ export async function evaluateExpect(
   // adds the `commands` array (the legacy `command` key stays on the FIRST
   // entry there for the same reason).
   if (expect.commands === undefined) {
-    return { verified, verifyDetails: { files, command: commands[0] } };
+    return { verified, verifyDetails: { files, command: commands[0] }, ...ended };
   }
   return {
     verified,
     verifyDetails: { files, commands, command: commands[0] },
+    ...ended,
   };
 }
 
@@ -315,16 +325,18 @@ async function runExpectCommand(cmd: string, cwd: string, timeoutMs: number): Pr
       windowsHide: true,
     });
     const killTree = () => killProcessTree(child.pid, () => void child.kill("SIGKILL"));
+    let timedOut = false;
     const finish = (exitCode: number | null) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       // A gate must not leave stragglers mutating the workspace after it returned.
       killTree();
-      resolveDone({ cmd, exitCode, ok: exitCode === 0 });
+      resolveDone({ cmd, exitCode, ok: exitCode === 0, ...(timedOut ? { timedOut: true as const } : {}) });
     };
     const timer = setTimeout(() => {
-      // A hanging gate must fail, not hang the run record.
+      // A hanging gate must not hang the run record; it is recorded as TIMED OUT (not failed, issue #309).
+      timedOut = true;
       killTree();
       setTimeout(() => finish(null), GROUP_REAP_MS).unref();
     }, timeoutMs);

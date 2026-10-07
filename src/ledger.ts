@@ -49,6 +49,8 @@ export interface LedgerEntry {
   /** The run's verification-gate outcome (issue #62): false = the `expect` gate FAILED.
    *  Absent = no gate was configured or the outcome is unknown (backward compatible). */
   verified?: boolean;
+  /** The verify gate timed out (issue #309): unverified, not failed. */
+  gateTimedOut?: true;
   /** The node's verify-gate details, persisted so a FAILED gate survives node state cleanup. */
   verifyDetails?: unknown;
   /** The isolated clone the run worked in (issue #41); pass it to fleet_sync. */
@@ -230,6 +232,13 @@ function verifyGate(entry: LedgerEntry | undefined, opts: { allowUnverified?: bo
       ? { allow: false, verified: null, reason: "sync.requireVerified is set and no fleet run is recorded for this node and checkout, so there is no verification to rely on (pass allowUnverified to override)" }
       : { allow: true, verified: null, reason: "no fleet run is recorded for this node and checkout; the work is unverified" };
   }
+  // Issue #309: a gate that TIMED OUT is not a failed gate. The work is unverified (never a pass), and the message
+  // must say so, or a slow node pushes operators toward allowUnverified, which erodes what the gate protects.
+  if (entry.gateTimedOut && entry.verified !== false && entry.state !== "failed-verification") {
+    return opts.requireVerified && !opts.allowUnverified
+      ? { allow: false, verified: null, runId: entry.runId, reason: `run ${entry.runId}: the verification gate TIMED OUT (it did not finish; the work is unverified, not failed) and sync.requireVerified is set. Re-run the gate on a quieter node or with a larger verify.timeoutMs, or pass allowUnverified` }
+      : { allow: true, verified: null, runId: entry.runId, reason: `run ${entry.runId}: the verification gate timed out; the work is unverified (not failed)` };
+  }
   const failed = entry.verified === false || entry.state === "failed-verification";
   if (failed) {
     return opts.allowUnverified
@@ -341,6 +350,8 @@ export interface DispatchOutcome {
     question?: string;
     /** The node's verification-gate outcome (issue #62), when a gate was configured. */
     verified?: boolean;
+    /** The gate timed out (issue #309): unverified, not failed. */
+    gateTimedOut?: boolean;
     verifyDetails?: unknown;
   };
 }
@@ -379,6 +390,7 @@ export function outcomeEntry(base: LedgerEntry, o: DispatchOutcome, now: string 
     handRaised: o.parsed.handRaised,
     question: o.parsed.question,
     verified: o.parsed.verified ?? undefined,
+    ...(o.parsed.gateTimedOut ? { gateTimedOut: true as const } : {}),
     verifyDetails: o.parsed.verifyDetails,
   };
 }

@@ -145,6 +145,8 @@ export interface OpenCodeRunResult {
    * by the node after the worker finished. null/absent = no gate was given.
    */
   verified?: boolean | null;
+  /** Issue #309: the gate did not finish in time. `verified` stays null (unverified, never a pass, never "failed"). */
+  gateTimedOut?: boolean;
   verifyDetails?: VerifyDetails;
   /** Pi `--mode json` only (#137 Pi-1): tools the worker ran, in order. */
   toolCalls?: PiToolCall[];

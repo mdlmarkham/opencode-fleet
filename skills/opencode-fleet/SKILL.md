@@ -78,7 +78,7 @@ fleet_sync(node, cwd, repo, branch?, head?)            # publish to fleet/<name>
 If the operator set `sync.requireVerified` / `blockOnScopeViolation` / `requireReview`, `fleet_sync` refuses unverified work, out-of-scope changes, or a head with no review PASS; the refusal says why. It never pushes straight to a protected branch.
 
 ### 6. Tidy (periodic)
-`fleet_cleanup(nodes, cwd)` runs git GC, reports disk use and, with `cwd`, any checkout paths the worker user does not own. `fleet_board` is one read of the whole fleet's state (in-flight, needs-a-human, stale, failed); use it instead of polling.
+`fleet_cleanup(nodes, cwd)` runs git GC, reports disk use and, with `cwd`, any checkout paths the worker user does not own. `fleet_board` is one read of the whole fleet's state (in-flight, needs-a-human, stale, failed); use it instead of polling. Run ids in its text lines are abbreviated (`…`); take full ids from the structured `runs`.
 
 ## Tools at a glance
 

@@ -28,6 +28,13 @@ export function isWorkerPublicationTransient(errText: unknown): boolean {
   return typeof errText === "string" && errText.toLowerCase().includes(PUBLICATION_TRANSIENT_PHRASE);
 }
 
+/** The transient's text from EITHER channel: a node reply (`payload.error`) or a rejected invoke (`message`). */
+export function publicationTransientIn(inv: unknown): boolean {
+  const viaPayload = (() => { try { return payloadOf(inv).error; } catch { return undefined; } })();
+  const viaReject = (inv as { invokeTimedOut?: boolean; message?: unknown } | undefined)?.invokeTimedOut === true ? (inv as { message?: unknown }).message : undefined;
+  return isWorkerPublicationTransient(viaPayload) || isWorkerPublicationTransient(viaReject);
+}
+
 const publicationRetryDelay = (ms: number, signal?: AbortSignal): Promise<void> =>
   new Promise((resolve, reject) => {
     const t = setTimeout(resolve, ms);
@@ -486,7 +493,10 @@ export function registerDispatchTools(api: OpenClawPluginApi, cfg: FleetConfig):
           bp = await import("../builtin-points.js");
           ask = bp.readinessDecider(cfg.s1, rootDir) as import("../readiness-judge.js").AskS1 | undefined;
         }
-        readiness = await judgeReadiness(specCheck.spec ? { spec: specCheck.spec } : { prompt: p.prompt }, ask);
+        // The judge's own race must outlast the decider's bound (s1.timeoutMs, default 10s), or the two tie and the
+        // decider's precise error ("S1 timed out after Nms", "S1 rejected the request: ...") loses to a generic one (#311).
+        const s1Bound = typeof (cfg.s1 as { timeoutMs?: unknown } | null | undefined)?.timeoutMs === "number" ? (cfg.s1 as { timeoutMs: number }).timeoutMs : 10_000;
+        readiness = await judgeReadiness(specCheck.spec ? { spec: specCheck.spec } : { prompt: p.prompt }, ask, { timeoutMs: s1Bound + 2_000 });
         // Issue #259 slice 2: SHADOW ONLY. Ask S1 whether this spec needs the heavy model class and log it next to the
         // deterministic classifier's answer; nothing here changes routing. Fire-and-forget: it never delays or blocks.
         if (bp && specCheck.spec) {
@@ -734,16 +744,33 @@ export function registerDispatchTools(api: OpenClawPluginApi, cfg: FleetConfig):
                 message: err.message,
               }));
           inv = await invokeDetach(launchParams);
-          // Issue #256: the FIRST launch right after a node service restart
-          // can be refused with "Device pairing authority requires a current
-          // worker publication" — transient, gone seconds later. Narrow EXACT
-          // phrase match, ONE bounded retry of the SAME launch, then fall
-          // through to the unchanged failure handling (a second failure is
-          // recorded against the ORIGINAL error below). Any other error text
-          // is never retried.
-          if (isWorkerPublicationTransient(payloadOf(inv).error) && !signal?.aborted) {
-            await publicationRetryDelay(PUBLICATION_RETRY_DELAY_MS, signal);
-            inv = await invokeDetach(launchParams);
+          // Issues #256/#312: the FIRST launch right after a node service restart can be refused with
+          // "Device pairing authority requires a current worker publication": transient, gone seconds later. But the
+          // refusal does NOT prove nothing launched (a run has been seen to start anyway), and the host may deliver it
+          // either as a node reply (`payload.error`) or as a rejected invoke (`message`). So: match the exact phrase on
+          // BOTH channels, then PROBE the run before resending, exactly like the ack-timeout path (#29/#30):
+          //   confirmed -> adopt the run (no second launch); absent -> resend ONCE; inconclusive -> do NOT resend,
+          //   hand the launch to the ambiguous-ack handling below. A second transient is recorded as a failure.
+          if (publicationTransientIn(inv) && !signal?.aborted) {
+            const probe = await probeAckRecovery((probeSignal) =>
+              api.runtime.nodes.invoke({
+                nodeId: node.nodeId,
+                command: "opencode.run",
+                params: { prompt: "__RUN_STATUS__", cwd: "/", transport: "http", runId },
+                timeoutMs: ACK_PROBE_TIMEOUT_MS,
+                signal: probeSignal,
+              }),
+            );
+            if (probe.kind === "confirmed") {
+              // The run exists: this is the ack we did not get. Adopt it; never launch a second copy.
+              inv = { payload: JSON.stringify({ ok: true, detached: true, runId, ...(probe.pid !== undefined ? { pid: probe.pid } : {}), recoveredFromPublicationTransient: true }) };
+            } else if (probe.kind === "absent") {
+              await publicationRetryDelay(PUBLICATION_RETRY_DELAY_MS, signal);
+              inv = await invokeDetach(launchParams);
+            } else {
+              // Unknown whether it launched: route through the ambiguous-ack handling instead of a blind resend.
+              inv = { invokeTimedOut: true as const, message: `launch refused with a worker-publication transient and the node could not confirm whether it started (${probe.verdict})` };
+            }
           }
         } else {
           inv = await api.runtime.nodes
@@ -877,6 +904,7 @@ export function registerDispatchTools(api: OpenClawPluginApi, cfg: FleetConfig):
                   ? { isolationNote: "isolation was requested but the node did not return a run clone" }
                   : {}),
               ackPending: false,
+              ...((launchPayload as { recoveredFromPublicationTransient?: boolean }).recoveredFromPublicationTransient ? { recoveredFromPublicationTransient: true } : {}),
               note: `Worker launched detached and survives relay timeouts. Wait with fleet_await({runIds:[runId]}) (not a fleet_run_status loop) or fleet_watch; fleet_resume finds it after interruptions. ${AWAIT_MISSING_NOTE}`,
               ...(autoApproveWarnings[nodeName] ? { warnings: autoApproveWarnings[nodeName] } : {}),
             };
@@ -972,8 +1000,8 @@ export function registerDispatchTools(api: OpenClawPluginApi, cfg: FleetConfig):
         const payload = (dispatchResult as { payload?: unknown }).payload;
         const parsedResult =
           typeof payload === "string"
-            ? (JSON.parse(payload) as { ok?: boolean; summary?: string; sessionId?: string; handRaised?: boolean; question?: string; verified?: boolean; verifyDetails?: unknown })
-            : ((payload as { ok?: boolean; summary?: string; sessionId?: string; handRaised?: boolean; question?: string; verified?: boolean; verifyDetails?: unknown } | undefined) ?? {});
+            ? (JSON.parse(payload) as { ok?: boolean; summary?: string; sessionId?: string; handRaised?: boolean; question?: string; verified?: boolean; gateTimedOut?: boolean; verifyDetails?: unknown })
+            : ((payload as { ok?: boolean; summary?: string; sessionId?: string; handRaised?: boolean; question?: string; verified?: boolean; gateTimedOut?: boolean; verifyDetails?: unknown } | undefined) ?? {});
         // Same run, new state (see outcomeEntry): keeps startedAt/engine/pid and a
         // silent-death failure recorded above. outcomeEntry consults
         // parsed.verified too: a FAILED gate must not be laundered into a
@@ -1017,6 +1045,9 @@ export function registerDispatchTools(api: OpenClawPluginApi, cfg: FleetConfig):
                   verifiedNote:
                     "VERIFICATION GATE FAILED (issue #62): the worker exited but did not satisfy `expect` (see verifyDetails). Treat this run as unverified — do not report it as successful work.",
                 }
+              : {}),
+            ...(parsedResult.gateTimedOut === true
+              ? { gateTimedOut: true, verifiedNote: "VERIFICATION GATE TIMED OUT (issue #309): the gate command did not finish within its bound, so the work is UNVERIFIED, not failed. Re-run the gate by hand or on a quieter node (or raise verify.timeoutMs); do not report it as verified." }
               : {}),
             ...(timedOut ? { dispatchTimedOut: true, mayStillBeRunning: true } : {}),
           },

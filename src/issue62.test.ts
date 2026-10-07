@@ -135,7 +135,7 @@ describe("issue #62: the pure evaluator (evaluateExpect)", () => {
   it("a hanging command fails the gate instead of hanging the run", async () => {
     const t0 = Date.now();
     const out = await evaluateExpect({ command: "sleep 5" }, dir, { commandTimeoutMs: 400 });
-    expect(out.verified).toBe(false);
+    expect(out.verified).toBeNull();
     expect(out.verifyDetails.command?.exitCode === null || out.verifyDetails.command?.exitCode === 124).toBe(true);
     expect(Date.now() - t0).toBeLessThan(4_000);
   });
@@ -267,7 +267,7 @@ describe("issue #62: the launcher gate fragment (verifyGateScript)", () => {
     const { promisify } = await import("node:util");
     await promisify(execFile)("/bin/bash", [join(dir, "launcher3.sh")]);
     const done = JSON.parse(readFileSync(donePath, "utf8")) as Record<string, unknown>;
-    expect(done.verified).toBe(false);
+    expect(done.verified).toBeNull();
     expect((done.verifyDetails as { command: { exitCode: number } }).command.exitCode).toBe(124);
   });
 

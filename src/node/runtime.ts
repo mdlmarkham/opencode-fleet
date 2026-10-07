@@ -469,8 +469,12 @@ export function verifyGateScript(
   const lines: string[] = [
     "# Issue #62: post-run verification gate, evaluated in the run's cwd after the worker exits.",
     "__V_ALL_OK=true",
+    // Issue #309: a gate command killed by its own time bound (timeout exits 124, or 137 after the -k grace) did
+    // not finish: that is "unverified", not "failed". HARD marks any real failure; TO marks a timeout.
+    "__V_HARD=false",
+    "__V_TO=false",
     "__V_FILES_JSON=''",
-    `if cd ${shq(opts.cwd)} 2>/dev/null; then __V_CDW=true; else __V_CDW=false; __V_ALL_OK=false; fi`,
+    `if cd ${shq(opts.cwd)} 2>/dev/null; then __V_CDW=true; else __V_CDW=false; __V_ALL_OK=false; __V_HARD=true; fi`,
   ];
   if (files.length) {
     // Paths are shell-quoted for the existence check; the recorded JSON path
@@ -487,7 +491,7 @@ export function verifyGateScript(
     lines.push('    __rp=$(realpath -e -- "${__V_PATHS[$__i]}" 2>/dev/null)');
     lines.push('    case "$__rp" in "$__V_ROOT"/*) __ok=true;; esac');
     lines.push('  fi');
-    lines.push('  if [ "$__ok" != true ]; then __V_ALL_OK=false; fi');
+    lines.push('  if [ "$__ok" != true ]; then __V_ALL_OK=false; __V_HARD=true; fi');
     lines.push('  __V_FILES_JSON="${__V_FILES_JSON}${__V_SEP}{\\\"path\\\":${__V_JPATHS[$__i]},\\\"ok\\\":$__ok}"');
     lines.push("__V_SEP=','");
     lines.push("done");
@@ -508,9 +512,10 @@ export function verifyGateScript(
       lines.push(
         `  if timeout -k 5 ${timeoutSec} bash -c ${shq(command)} >/dev/null 2>&1; then __V_CMD_OK=true; __V_CMD_EXIT=0; else __V_CMD_EXIT=$?; __V_CMD_OK=false; __V_ALL_OK=false; fi`,
       );
+      lines.push('  case "$__V_CMD_OK$__V_CMD_EXIT" in true0) ;; false124|false137) __V_TO=true;; *) __V_HARD=true;; esac');
       lines.push('  __V_CMD_JSON="{\\\"cmd\\\":$__V_JCMD,\\\"exitCode\\\":$__V_CMD_EXIT,\\\"ok\\\":$__V_CMD_OK}"');
       lines.push("else");
-      lines.push("  __V_CMD_OK=false; __V_ALL_OK=false");
+      lines.push("  __V_CMD_OK=false; __V_ALL_OK=false; __V_HARD=true");
       lines.push('  __V_CMD_JSON="{\\\"cmd\\\":$__V_JCMD,\\\"exitCode\\\":null,\\\"ok\\\":false}"');
       lines.push("fi");
       lines.push('__V_DETAILS="{\\\"files\\\":[$__V_FILES_JSON],\\\"command\\":$__V_CMD_JSON}"');
@@ -525,9 +530,10 @@ export function verifyGateScript(
     lines.push(
       `  if timeout -k 5 "\${__V_TOOLS[$__i]}" bash -c "\${__V_CMDS[$__i]}" >/dev/null 2>&1; then __V_CMD_OK=true; __V_CMD_EXIT=0; else __V_CMD_EXIT=$?; __V_CMD_OK=false; __V_ALL_OK=false; fi`,
     );
+    lines.push('  case "$__V_CMD_OK$__V_CMD_EXIT" in true0) ;; false124|false137) __V_TO=true;; *) __V_HARD=true;; esac');
     lines.push('  __V_CMD_JSON="{\\\"cmd\\\":${__V_JCMDS[$__i]},\\\"exitCode\\\":$__V_CMD_EXIT,\\\"ok\\\":$__V_CMD_OK}"');
     lines.push("else");
-    lines.push("  __V_CMD_OK=false; __V_ALL_OK=false");
+    lines.push("  __V_CMD_OK=false; __V_ALL_OK=false; __V_HARD=true");
     lines.push('  __V_CMD_JSON="{\\\"cmd\\\":${__V_JCMDS[$__i]},\\\"exitCode\\\":null,\\\"ok\\\":false}"');
     lines.push("fi");
     lines.push('  __V_CMDS_JSON="${__V_CMDS_JSON}${__V_SEP}$__V_CMD_JSON"');
@@ -541,8 +547,10 @@ export function verifyGateScript(
   } else {
     lines.push('__V_DETAILS="{\\\"files\\\":[$__V_FILES_JSON]}"');
   }
+  // verified: true when everything passed; null (+ endedBy gate-timeout) when the ONLY failures were timeouts; else false.
+  lines.push('if [ "$__V_ALL_OK" = true ]; then __V_VERIFIED=true; __V_ENDED=\'\'; elif [ "$__V_HARD" = false ] && [ "$__V_TO" = true ]; then __V_VERIFIED=null; __V_ENDED=\',"endedBy":"gate-timeout"\'; else __V_VERIFIED=false; __V_ENDED=\'\'; fi');
   const doneLine =
-    `printf '{"done":1,"exitCode":%s,"finishedAt":"%s","verified":%s,"verifyDetails":%s}\\n' "$EC" "$(date -u +%FT%TZ)" "$__V_ALL_OK" "$__V_DETAILS" > ${shq(donePath)}`;
+    `printf '{"done":1,"exitCode":%s,"finishedAt":"%s","verified":%s,"verifyDetails":%s%s}\\n' "$EC" "$(date -u +%FT%TZ)" "$__V_VERIFIED" "$__V_DETAILS" "$__V_ENDED" > ${shq(donePath)}`;
   return { verifyLines: lines, doneLine };
 }
 
