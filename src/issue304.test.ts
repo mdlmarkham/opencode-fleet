@@ -61,9 +61,9 @@ describe("#304: readinessBaseline — the deterministic, guided verdict", () => 
   it("quality-adjective-only acceptance is uncheckable; a concrete one is not", () => {
     expect(readinessSignals({ ...GOOD, acceptance: ["the design is clean"] }).acceptanceUncheckable).toBe(true);
     expect(readinessSignals({ ...GOOD, acceptance: ["f() returns 42"] }).acceptanceUncheckable).toBe(false);
-    // "the tests pass" carries no assertable token, so the conservative heuristic flags it —
-    // it wants something concrete. "scripts/verify.sh exits 0" names an exit, so it clears.
-    expect(readinessSignals({ ...GOOD, acceptance: ["the tests pass"] }).acceptanceUncheckable).toBe(true);
+    // The fallback flags only what it is sure of: empty or adjective-only acceptance. "the tests pass" is
+    // assertable, so it clears (the S1 judge, not this heuristic, decides the finer cases).
+    expect(readinessSignals({ ...GOOD, acceptance: ["the tests pass"] }).acceptanceUncheckable).toBe(false);
     expect(readinessSignals({ ...GOOD, acceptance: ["scripts/verify.sh exits 0"] }).acceptanceUncheckable).toBe(false);
   });
 
@@ -108,3 +108,25 @@ describe("#304: the readiness.dispatch decision point", () => {
     expect(BUILTIN_POINTS.map((p) => p.id)).toContain("readiness.dispatch");
   });
 });
+
+describe("#304 review fix: the baseline agrees with the design gate and does not flag good specs", () => {
+  const spec = (goal: string, acceptance: string[]) => ({ goal, acceptance, verify: { command: "npm test" }, scope: { files: ["src/a.ts"] } });
+  it("prose acceptance that states an outcome is checkable", () => {
+    const r = readinessOf(spec("Make fleet_capacity report unlimited in src/tools/nodes.ts", ["Reports unlimited when no limit is configured", "Numeric values are unchanged when a limit is configured"]) as never);
+    expect(r).toMatchObject({ ready: true, guidance: [] });
+  });
+  it("only empty or adjective-only acceptance is flagged", () => {
+    expect(readinessOf(spec("Add `f` to src/a.ts", ["The code is clean", "It is well structured and maintainable"]) as never).guidance.map((g) => g.criterion)).toContain("acceptance-checkable");
+    expect(readinessOf(spec("Add `f` to src/a.ts", []) as never).guidance.map((g) => g.criterion)).toContain("acceptance-checkable");
+    expect(readinessOf(spec("Add `f` to src/a.ts", ["f() returns 42", "The code is clean"]) as never).guidance.map((g) => g.criterion)).not.toContain("acceptance-checkable");
+  });
+  it("uses the design gate's discovery check: nouns and change-led goals are not open-ended, imperatives are", () => {
+    for (const g of ["Debug logging should include the run id in src/ledger.ts", "Investigate and fix the flaky timeout in src/x.ts", "Troubleshoot guide: add a section to docs/operators.md"]) {
+      expect(readinessOf(spec(g, ["f() returns 42"]) as never).guidance.map((x) => x.criterion), g).not.toContain("concrete-change");
+    }
+    for (const g of ["Determine why a restart orphans the run-checkout link", "Figure out why fleet_sync reports unverified"]) {
+      expect(readinessOf(spec(g, ["f() returns 42"]) as never).guidance.map((x) => x.criterion), g).toContain("concrete-change");
+    }
+  });
+});
+

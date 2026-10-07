@@ -46,12 +46,11 @@ describe("#308: the prompt path catches the same failures as the spec path", () 
     expect(r!.guidance.find((g) => g.criterion === "concrete-change")!.fix).toMatch(/diagnosis|state the change/i);
   });
 
-  it("a substantive prompt naming no deliverable is flagged, with a fix", () => {
+  it("whether a prompt names its deliverable is the S1 judge's call, not the fallback's (see issue308b)", () => {
     const p = "Improve the error handling in the codebase so that failures are reported more clearly to the user.";
     const r = readinessOfPrompt(p);
     expect(r).toBeDefined();
-    expect(r!.guidance.map((g) => g.criterion)).toContain("deliverable-named");
-    expect(r!.guidance.find((g) => g.criterion === "deliverable-named")!.fix.length).toBeGreaterThan(0);
+    expect(r!.guidance.map((g) => g.criterion)).not.toContain("deliverable-named");
   });
 
   it("a substantive, well-formed prompt is ready with no guidance", () => {
@@ -77,3 +76,19 @@ describe("#308: the prompt path catches the same failures as the spec path", () 
     }
   });
 });
+
+describe("#308 review fix: ordinary work is not flagged (false positives are worse than misses)", () => {
+  const READY_PROMPTS = [
+    "Refactor the retry logic in the ledger module to use exponential backoff with jitter, keeping the public API unchanged",
+    "Add a --json flag to the status command so scripts can parse the output, and document it in the README",
+    "Debug logging should include the run id on every ledger write so we can trace runs",
+    "Investigate and fix the flaky timeout in the issue30 test by raising the bound where it is too tight",
+  ];
+  for (const p of READY_PROMPTS) it(`stays ready: ${p.slice(0, 48)}…`, () => {
+    expect(readinessOfPrompt(p), p).toMatchObject({ ready: true, guidance: [] });
+  });
+  it("the discovery prompts are still caught (same check as the design gate)", () => {
+    expect(readinessOfPrompt("Figure out why fleet_sync reports unverified runs after a restart, and tell me.")!.guidance.map((g) => g.criterion)).toContain("concrete-change");
+  });
+});
+

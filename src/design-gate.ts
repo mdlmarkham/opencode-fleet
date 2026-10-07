@@ -113,6 +113,10 @@ const bounds = (c: GateContext): GateBounds => ({ ...DEFAULT_GATE_BOUNDS, ...c.b
  *   - the noun use of "design/plan/architect" is dropped; only the interrogative/
  *     imperative construction `design (an|the) … for` counts, and only with no change verb.
  */
+/** Does the goal LEAD with a concrete change verb ("Add…", "Refactor…")? Such a goal is a change, never a discovery (shared with the readiness rubric). */
+const CHANGE_VERB_LEADING = /^\s*(?:please\s+)?(?:add|fix|rename|implement|remove|update|refactor|move|delete|bump|migrate|wire|hook up|introduce|extract|inline|split|merge|replace|use|make|create|write|port|upgrade|pin|trim|document)\b/;
+export const hasLeadingChangeVerb = (goal: string): boolean => CHANGE_VERB_LEADING.test(String(goal ?? "").toLowerCase());
+
 export function discoverySignal(spec: { goal: string }): { phrases: string[]; soft: string[] } {
   const goal = String(spec.goal ?? "").toLowerCase().trim();
   const hit = (res: RegExp[]): string[] => {
@@ -129,8 +133,7 @@ export function discoverySignal(spec: { goal: string }): { phrases: string[]; so
   // happens to say `fix`, and exempting it would drop the very case this check exists for
   // (the reviewer's own counterexample). So we require the change verb at the START
   // (optionally after an article/pronoun), not anywhere in the string.
-  const CHANGE_VERB_LEADING = /^\s*(?:please\s+)?(?:add|fix|rename|implement|remove|update|refactor|move|delete|bump|migrate|wire|hook up|introduce|extract|inline|split|merge|replace|use|make|create|write|port|upgrade|pin|trim|document)\b/;
-  if (CHANGE_VERB_LEADING.test(goal)) return { phrases: [], soft: hit(SOFT_ONLY) };
+  if (hasLeadingChangeVerb(goal)) return { phrases: [], soft: hit(SOFT_ONLY) };
   // Strong: an IMPERATIVE ask (start of goal / start of a sentence) to find a cause.
   // A bare word is not enough: `Diagnose output should be redacted` and `Investigate and fix
   // the timeout` LEAD with diagnose/investigate but use them as NOUNS (a titled phrase), not

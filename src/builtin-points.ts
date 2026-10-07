@@ -112,5 +112,18 @@ export function shadowPoint(cfgS1: unknown, pointId: string, state: unknown, bas
   })()) as Promise<PointDecision | undefined>;
 }
 
+/**
+ * The S1 decider for the readiness judge (issue #308), or undefined when S1 is off/invalid. Lives here so the
+ * gateway reaches S1 through this one lazily-loaded module (the dispatch path imports nothing from S1 by default).
+ */
+export function readinessDecider(cfgS1: unknown, rootDir?: string): DeciderLike | undefined {
+  return buildShadowDecider(cfgS1, { ...(rootDir ? { rootDir } : {}), sink: () => Promise.resolve() });
+}
+
+/** One bounded record per judged dispatch: the model's per-criterion probabilities next to the baseline's verdict, for pointReport. Never throws. */
+export async function logReadinessJudgement(rootDir: string | undefined, entry: { source: string; ready: boolean; baselineReady: boolean; probabilities?: Record<string, number>; uncertain: string[] }): Promise<void> {
+  try { await shadowFileSink(rootDir)({ kind: "readiness.dispatch", ts: new Date().toISOString(), ...entry }); } catch { /* evidence only */ }
+}
+
 export { linkOutcome };
 export const shadowSinkFor = shadowFileSink;

@@ -444,32 +444,28 @@ export function registerDispatchTools(api: OpenClawPluginApi, cfg: FleetConfig):
       if (noGate && gateMode === "enforce") {
         return jsonResult({ ok: false, error: "project.gate=enforce: this dispatch has no verification gate, so success would be just the process exit code. Pass a `spec` with `verify` (or `expect`), or set project.gate to advise/off." });
       }
-      // Issue #304: dispatch-readiness rubric. The DETERMINISTIC baseline runs for free (no model
-      // call on the cheap path) and ALWAYS returns actionable guidance when a criterion fails. The
-      // S1 `readiness.dispatch` point is additive evidence in shadow, logged alongside the baseline
-      // so `pointReport` can compare them before the point earns `enforce` (the #131/#234 ladder).
-      //
-      // This slice is ADVISORY ONLY: it reports `readiness` guidance and never refuses a dispatch.
-      // Refusal would stack a second enforce-path onto `project.gate: "enforce"` before the rubric
-      // has a calibration corpus — the ladder exists precisely to stop that. Promote to a refusal
-      // later, per-point, once the shadow data says the baseline (or S1) earns it.
-      //
-      // Issue #308 (prompt path): the SAME rubric judges every prompt sent to a code agent, not
-      // only spec-path dispatches. A prompt-only dispatch is the MORE dangerous case (no verify,
-      // no scope) and used to bypass this entirely. The triviality exemption means probes and
-      // self-checks ('reply with OK') are not judged — a gate that nags on harmless prompts gets
-      // ignored, so the rubric only applies to SUBSTANTIVE prompts.
-      let readiness: { ready: boolean; guidance: import("../readiness.js").Guidance[] } | undefined;
+      // Issues #304/#308: dispatch-readiness rubric. An S1 model evaluates the spec (or a substantive bare
+      // prompt) against explicit criteria and the guidance comes from ITS answers; the deterministic baseline is
+      // the fallback when S1 is off or cannot answer, so the gate is never blind. ADVISORY ONLY until the judge has
+      // a calibration record: it reports `readiness` guidance and never refuses a dispatch (the #131 ladder).
+      // Probes and self-checks ("reply with OK") are not judged: a gate that nags on harmless prompts gets ignored.
+      let readiness: import("../readiness-judge.js").Judged | undefined;
       if (gateMode !== "off") {
-        const { readinessOf, readinessOfPrompt } = await import("../readiness.js");
-        readiness = specCheck.spec ? readinessOf(specCheck.spec) : readinessOfPrompt(p.prompt);
-        // Shadow: fire the S1 point (never blocks, never throws). Fire-and-forget so a slow or
-        // unavailable S1 never delays a dispatch. A trivial prompt has no verdict to log.
-        if (readiness) {
-          const { shadowPoint } = await import("../builtin-points.js");
-          void shadowPoint(cfg.s1, "readiness.dispatch", { text: JSON.stringify(specCheck.spec
-            ? { goal: specCheck.spec.goal, acceptance: specCheck.spec.acceptance ?? [], verify: specCheck.spec.verify ?? null, scope: specCheck.spec.scope ?? null }
-            : { prompt: p.prompt }) }, readiness.ready, rootDir);
+        // The S1 model judges the spec/prompt against the rubric (readiness-judge.ts); the deterministic baseline answers
+        // only when S1 is unconfigured or cannot answer. Awaited with a bound (10s) so a slow judge never stalls a
+        // dispatch; advisory: it reports guidance and never refuses. Without `s1` config nothing from S1 is loaded.
+        const { judgeReadiness } = await import("../readiness-judge.js");
+        let ask: import("../readiness-judge.js").AskS1 | undefined;
+        let bp: typeof import("../builtin-points.js") | undefined;
+        if (cfg.s1 != null) {
+          bp = await import("../builtin-points.js");
+          ask = bp.readinessDecider(cfg.s1, rootDir) as import("../readiness-judge.js").AskS1 | undefined;
+        }
+        readiness = await judgeReadiness(specCheck.spec ? { spec: specCheck.spec } : { prompt: p.prompt }, ask);
+        if (readiness && bp && readiness.source === "s1") {
+          const { readinessOf, readinessOfPrompt } = await import("../readiness.js");
+          const base = specCheck.spec ? readinessOf(specCheck.spec) : readinessOfPrompt(p.prompt);
+          void bp.logReadinessJudgement(rootDir, { source: readiness.source, ready: readiness.ready, baselineReady: base?.ready ?? true, ...(readiness.probabilities ? { probabilities: readiness.probabilities } : {}), uncertain: readiness.uncertain });
         }
       }
       const dispatchWarnings: string[] = [];

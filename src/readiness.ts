@@ -28,6 +28,7 @@
  * `Guidance { what, why, fix }` entry the caller can act on immediately — not a bare "no".
  */
 
+import { discoverySignal } from "./design-gate.js";
 import type { TaskSpec } from "./spec.js";
 
 /** One rubric criterion: what it checks, and the remedy when it fails. */
@@ -126,7 +127,12 @@ export function readinessBaseline(s: ReadinessSignals): { ready: boolean; guidan
   return { ready: g.length === 0, guidance: g };
 }
 
-const OPEN_ENDED = /^\s*(?:determine|figure out|find out|work out|diagnose|investigate|troubleshoot|debug)\b/i;
+/**
+ * Open-ended investigation, decided by the design gate's own check (issue #288, review-fixed for precision) so the
+ * rubric and the gate can never disagree: a goal that leads with a concrete change verb is a change, and strong
+ * verbs count only as imperatives ("Determine why…"), never as nouns ("Debug logging should include…").
+ */
+const isOpenEnded = (goal: string): boolean => discoverySignal({ goal }).phrases.length > 0;
 
 /** Derive the signals from a spec, reusing the design gate's own bounds where they exist. */
 export function readinessSignals(spec: TaskSpec): ReadinessSignals {
@@ -135,15 +141,18 @@ export function readinessSignals(spec: TaskSpec): ReadinessSignals {
   const verify = spec.verify;
   const hasVerify = Boolean(verify && ((verify.commands && verify.commands.length) || verify.command || (verify.files && verify.files.length)));
   const scope = spec.scope?.files ?? [];
-  // A criterion is "checkable" when it names something assertable — a symbol, a value, an exit,
-  // a path — rather than only quality adjectives. Heuristic and deliberately simple.
-  const CHECKABLE = /\b(return|returns|equal|equals|==|===|exit|passes|fails|exists|contains|emits|prints|exports|has no|>|<|\d)\b/i;
-  const qualityOnly = acceptance.length === 0 || acceptance.every((a) => !CHECKABLE.test(a));
+  // Acceptance is "uncheckable" only when there is none, or every item is a bare quality adjective with nothing
+  // assertable in it. A false "uncheckable" on good acceptance is worse than a miss: this is guidance a caller
+  // will act on, so we flag what we are sure of and let the S1 point judge the rest.
+  const VAGUE = /\b(clean|good|nice|robust|proper(?:ly)?|well|maintainable|readable|elegant|better|improved?|high[- ]quality|reasonable|sensible|appropriate(?:ly)?|cleaner|nicer|solid)\b/i;
+  const ASSERTABLE = /\b(return|returns|equal|equals|exit|passes|fails|exists|contains|emits|prints|exports|reports?|shows?|includes?|accepts?|rejects?|refuses|throws?|writes?|reads?|adds?|removes?|unchanged|no longer|only|never|always|when|if|must|should|not)\b|[=<>]|\d/i;
+  const vagueItem = (a: string): boolean => VAGUE.test(a) && !ASSERTABLE.test(a);
+  const qualityOnly = acceptance.length === 0 || acceptance.every(vagueItem);
   // A deliverable is "named" when the goal or scope names a path/symbol-like token.
   const namedInGoal = /\b[\w.-]+\/(?:[\w.-]+\/)*[\w.-]+\.\w{1,4}\b|\b\w+\(\)|\bexport\s+(?:function|const|class)\b|`[a-z][\w.-]*`/.test(goal);
   const noDeliverable = !namedInGoal && scope.length === 0;
   return {
-    openEnded: OPEN_ENDED.test(goal),
+    openEnded: isOpenEnded(goal),
     acceptanceUncheckable: qualityOnly,
     noVerify: !hasVerify,
     tooBroad: scope.length > 20 || acceptance.length > 15,
@@ -191,8 +200,9 @@ export function readinessOfPrompt(prompt: string): { ready: boolean; guidance: G
     const c = READINESS_CRITERIA.find((x) => x.id === criterion);
     if (c) g.push({ criterion, what: c.what, fix: c.fix });
   };
-  if (OPEN_ENDED.test(text.trim())) add("concrete-change");
-  const namedDeliverable = /\b[\w.-]+\/(?:[\w.-]+\/)*[\w.-]+\.\w{1,4}\b|\b\w+\(\)|\bexport\s+(?:function|const|class)\b/.test(text);
-  if (!namedDeliverable) add("deliverable-named");
+  if (isOpenEnded(text.trim())) add("concrete-change");
+  // The deterministic FALLBACK for a bare prompt judges only what it can be sure of (open-ended investigation).
+  // Whether a prompt names its deliverable, or leaves a design decision to the worker, is for the S1 judge
+  // (readiness-judge.ts): real prompts name the thing in words ("the status command"), which no regex can read.
   return { ready: g.length === 0, guidance: g };
 }
