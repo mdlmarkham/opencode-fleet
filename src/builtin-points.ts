@@ -34,6 +34,10 @@ const parsed = parsePoints([
   // design decision the author has not made? High probabilityTrue = READY (safe to dispatch).
   // The safe default and uncertain action both push back with guidance, never silently dispatch:
   // a low/uncertain score means "ask the author for the detail", which is the point of the gate.
+  // Issue #259 slice 2: does THIS spec deserve the most capable (heavy) model class? High probabilityTrue = heavy.
+  // Baseline: the deterministic cost classifier (cost-class.ts). Safe default: keep the caller's model (an S1 outage never
+  // changes routing, and nothing here changes routing at all while in shadow).
+  cfg("dispatch.heavy", "Does this task need the most capable (heavy) model class rather than a cheaper one? It does when it touches a sensitive surface, spans many files, has many acceptance criteria, or leaves hard judgement calls; a small, well-specified, mechanical change does not.", "keep-requested-model", "keep-requested-model"),
   cfg("readiness.dispatch", "Is this task spec defined well enough for a worker to implement without making a design decision the author has not made? It is ready when the goal states a concrete change, the deliverable is named, every design decision is made, acceptance is checkable, the verify gate tests that acceptance, and the scope is one task.", "needs-clarification", "needs-clarification"),
 ]);
 if (!parsed.ok) throw new Error(`built-in decision points are invalid: ${parsed.error}`);

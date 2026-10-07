@@ -243,7 +243,9 @@ export function registerProjectTools(api: OpenClawPluginApi, cfg: FleetConfig): 
         const { suggestion, ...rest } = o;
         return { ...rest, ...(suggestion.trim() !== "" ? { suggestion } : {}) };
       });
-      return jsonResult({ ok: true, gate: cfg.project?.gate ?? "advise", overlapChecked: Boolean(p.node && p.cwd), ...gate.result, objections });
+      // Issue #259: the deterministic cost class (advisory; routing is not changed by it).
+      const { costClassOf } = await import("../cost-class.js");
+      return jsonResult({ ok: true, gate: cfg.project?.gate ?? "advise", overlapChecked: Boolean(p.node && p.cwd), costClass: costClassOf(specCheck.spec), ...gate.result, objections });
     },
   });
 

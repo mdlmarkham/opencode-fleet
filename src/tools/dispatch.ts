@@ -497,6 +497,13 @@ export function registerDispatchTools(api: OpenClawPluginApi, cfg: FleetConfig):
         // decider's precise error ("S1 timed out after Nms", "S1 rejected the request: ...") loses to a generic one (#311).
         const s1Bound = typeof (cfg.s1 as { timeoutMs?: unknown } | null | undefined)?.timeoutMs === "number" ? (cfg.s1 as { timeoutMs: number }).timeoutMs : 10_000;
         readiness = await judgeReadiness(specCheck.spec ? { spec: specCheck.spec } : { prompt: p.prompt }, ask, { timeoutMs: s1Bound + 2_000 });
+        // Issue #259 slice 2: SHADOW ONLY. Ask S1 whether this spec needs the heavy model class and log it next to the
+        // deterministic classifier's answer; nothing here changes routing. Fire-and-forget: it never delays or blocks.
+        if (bp && specCheck.spec) {
+          const { costClassOf } = await import("../cost-class.js");
+          const s = specCheck.spec;
+          void bp.shadowPoint(cfg.s1, "dispatch.heavy", { text: JSON.stringify({ goal: s.goal, acceptance: s.acceptance ?? [], scope: s.scope ?? null }) }, costClassOf(s) === "heavy", rootDir);
+        }
         if (readiness && bp && readiness.source === "s1") {
           const { readinessOf, readinessOfPrompt } = await import("../readiness.js");
           const base = specCheck.spec ? readinessOf(specCheck.spec) : readinessOfPrompt(p.prompt);
