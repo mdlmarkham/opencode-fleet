@@ -1,6 +1,6 @@
 ---
 name: opencode-fleet
-description: Orchestrate OpenCode across remote OpenClaw worker nodes (dev2, dev3, ...) as a credential-free fleet. Use for large refactors, parallel coding work, testing on real infra, or any task needing a clean repo checkout on a worker. The manager (main) holds GitHub credentials; workers get repos via git bundles and never touch GitHub.
+description: CodeClaw (plugin id: opencode-fleet) — agentic coding across remote OpenClaw worker nodes (dev2, dev3, ...) as a credential-free fleet. Define a spec, dispatch one or more code agents (OpenCode, Pi, ...), run gated loops against a rubric, and deliver reviewed work. Use for large refactors, parallel coding work, testing on real infra, or any task needing a clean repo checkout on a worker. The manager (main) holds GitHub credentials; workers get repos via git bundles and never touch GitHub.
 metadata:
   openclaw:
     requires:
