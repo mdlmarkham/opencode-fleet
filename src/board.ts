@@ -14,6 +14,16 @@
 import type { LedgerEntry } from "./ledger.js";
 import type { Task, TaskState } from "./tasks.js";
 
+/**
+ * A run id for the human line (issue #310). Ids longer than 20 chars are shown as prefix + "…" + 8-char suffix,
+ * so a shortened id is VISIBLY shortened (a bare prefix looked complete, and pasting it into fleet_run_status
+ * answered "never-started" for a live run) and two ids that share a prefix still differ. The full id is always in
+ * the structured `runs` the board returns; never act on the text line's id when it contains "…".
+ */
+export function shortRunId(id: string): string {
+  return id.length <= 20 ? id : `${id.slice(0, 16)}…${id.slice(-8)}`;
+}
+
 /** How a run is classified for the human glance. */
 export type BoardBucket = "in-flight" | "needs-you" | "landed" | "failed" | "stale";
 
@@ -90,7 +100,7 @@ export interface BoardOptions {
 }
 
 /** One bounded, human-readable board. Pure: takes rows, returns a string. */
-export function renderBoard(entries: LedgerEntry[], opts: BoardOptions = {}): { text: string; counts: Record<BoardBucket, number> } {
+export function renderBoard(entries: LedgerEntry[], opts: BoardOptions = {}): { text: string; counts: Record<BoardBucket, number>; runs: Array<{ runId: string; bucket: BoardBucket; node: string; engine: string; state: string; ageSeconds: number; verified: boolean | null; issue?: number; note?: string }> } {
   const now = opts.now ?? Date.now();
   const tasks = opts.tasks ?? [];
   const rows = entries.map((e) => {
@@ -138,11 +148,18 @@ export function renderBoard(entries: LedgerEntry[], opts: BoardOptions = {}): { 
   } else {
     for (const r of visible) {
       lines.push(
-        `[${r.bucket}] #${r.issue ?? "?"}${r.taskId ? ` task=${r.taskState}` : ""} ${r.runId.slice(0, 20)} ` +
+        `[${r.bucket}] #${r.issue ?? "?"}${r.taskId ? ` task=${r.taskState}` : ""} ${shortRunId(r.runId)} ` +
           `${r.engine} ${r.node} ${mins(r.ageMs)} state=${r.state} verified=${ver(r.verified)}` +
           `${mismatch(r)}${r.note ? ` — ${r.note}` : ""}`,
       );
     }
   }
-  return { text: lines.join("\n"), counts };
+  // The structured view carries the FULL ids: that is what an agent copies into the id-based follow-ups.
+  const runs = visible.slice(0, 200).map((r) => ({
+    runId: r.runId, bucket: r.bucket, node: r.node, engine: r.engine, state: r.state,
+    ageSeconds: Math.round(r.ageMs / 1000), verified: r.verified,
+    ...(r.issue !== undefined ? { issue: r.issue } : {}),
+    ...(r.note ? { note: r.note } : {}),
+  }));
+  return { text: lines.join("\n"), counts, runs };
 }

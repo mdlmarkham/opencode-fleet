@@ -200,8 +200,9 @@ export function registerNodesTools(api: OpenClawPluginApi, cfg: FleetConfig): vo
           /* no/unreadable journal: fall back to execution-only, never fail the board */
         }
       }
-      const { text, counts } = renderBoard(entries, opts);
-      return jsonResult({ board: text, counts });
+      const { text, counts, runs } = renderBoard(entries, opts);
+      // `runs` carries the full run ids; the text line shortens long ids (marked with "…").
+      return jsonResult({ board: text, counts, runs });
     },
   });
 
