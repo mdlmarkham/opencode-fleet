@@ -499,15 +499,12 @@ export function registerDispatchTools(api: OpenClawPluginApi, cfg: FleetConfig):
         readiness = await judgeReadiness(specCheck.spec ? { spec: specCheck.spec } : { prompt: p.prompt }, ask, { timeoutMs: s1Bound + 2_000 });
         // Issue #259 slice 2: SHADOW ONLY. Ask S1 whether this spec needs the heavy model class and log it next to the
         // deterministic classifier's answer; nothing here changes routing. Fire-and-forget: it never delays or blocks.
-        // Issue #322: a shadowPoint that fails (S1 rejects, times out, ...) no longer vanishes: the rejection is
-        // logged as a shadow record naming the point and its failure, and the dispatch is never delayed or thrown into.
+        // Issue #322 (review): a failing decider is logged inside shadowPoint itself (its promise NEVER rejects —
+        // runPoint reduces every failure to the safe default — so a .catch here was unreachable dead code).
         if (bp && specCheck.spec) {
           const { costClassOf } = await import("../cost-class.js");
           const s = specCheck.spec;
-          void bp.shadowPoint(cfg.s1, "dispatch.heavy", { text: JSON.stringify({ goal: s.goal, acceptance: s.acceptance ?? [], scope: s.scope ?? null }) }, costClassOf(s) === "heavy", rootDir).catch((e: unknown) => {
-            const failure = e instanceof Error ? e.message : String(e);
-            void bp.logShadowPointFailure(rootDir, "dispatch.heavy", failure);
-          });
+          void bp.shadowPoint(cfg.s1, "dispatch.heavy", { text: JSON.stringify({ goal: s.goal, acceptance: s.acceptance ?? [], scope: s.scope ?? null }) }, costClassOf(s) === "heavy", rootDir);
         }
         // Issue #322: EVERY judged dispatch is logged, not only the ones S1 answered — a fallback
         // (source "baseline") used to write nothing, so the shadow log overstated how often S1

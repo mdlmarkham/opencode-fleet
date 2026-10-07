@@ -96,7 +96,10 @@ export interface ShadowPointDeps {
   sink?: (entry: object) => void | Promise<void>;
 }
 
-/** Fire-and-forget: ask S1 the point's question and log one record with the baseline. Never throws; nothing is acted on. */
+/** Fire-and-forget: ask S1 the point's question and log one record with the baseline. A failing decider (it rejects or
+ * throws) is logged AT THE SOURCE — here in the `ask`, via `logShadowPointFailure` — because the returned promise never
+ * rejects (runPoint reduces every failure to the safe default and trackShadow guards the rest), so a `.catch` at a call
+ * site can never run. Never throws; nothing is acted on. */
 export function shadowPoint(cfgS1: unknown, pointId: string, state: unknown, baseline: boolean, rootDir?: string, deps: ShadowPointDeps = {}): Promise<PointDecision | undefined> {
   return trackShadow((async () => {
     const point = pointById(pointId);
@@ -107,10 +110,18 @@ export function shadowPoint(cfgS1: unknown, pointId: string, state: unknown, bas
       baseline,
       sink: deps.sink ?? shadowFileSink(rootDir),
       ask: async (p) => {
-        const r = (await decider({ state, questions: { [p.id]: { type: "boolean", instructions: p.question.wording } } })) as { ok?: boolean; answers?: Record<string, { probabilityTrue?: unknown }>; error?: unknown } | undefined;
-        if (!r || r.ok !== true) throw new Error(typeof r?.error === "string" ? r.error : "S1 unavailable");
-        const v = r.answers?.[p.id]?.probabilityTrue;
-        return typeof v === "number" ? v : undefined;
+        try {
+          const r = (await decider({ state, questions: { [p.id]: { type: "boolean", instructions: p.question.wording } } })) as { ok?: boolean; answers?: Record<string, { probabilityTrue?: unknown }>; error?: unknown } | undefined;
+          if (!r || r.ok !== true) throw new Error(typeof r?.error === "string" ? r.error : "S1 unavailable");
+          const v = r.answers?.[p.id]?.probabilityTrue;
+          return typeof v === "number" ? v : undefined;
+        } catch (e) {
+          // Issue #322 (review): the failure is logged where it happens, inside this swallow path — the decision-point
+          // row alone left a failed decider invisible in the s1-shadow log. The hook itself must never throw: this is
+          // the shadow path's swallow boundary.
+          void logShadowPointFailure(rootDir, p.id, e instanceof Error ? e.message : String(e));
+          throw e;
+        }
       },
     });
   })()) as Promise<PointDecision | undefined>;

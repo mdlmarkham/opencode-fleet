@@ -147,13 +147,13 @@ describe("#322: fallback readiness judgements land in the shadow log", () => {
 });
 
 describe("#322: readinessCoverage summarizes the log", () => {
-  it("counts judged / answeredByS1 / fellBack and buckets byReason by #311 prefixes", () => {
+  it("counts judged / answeredByS1 / fellBack and buckets byReason by #311 prefixes (real wire format, with the 'S1 error: ' wrapper)", () => {
     const log: object[] = [
       { kind: "readiness.dispatch", ts: "t1", source: "s1", ready: true, baselineReady: true, probabilities: { a: 0.9 }, uncertain: [] },
-      { kind: "readiness.dispatch", ts: "t2", source: "baseline", ready: false, baselineReady: false, uncertain: [], fallbackReason: "S1 timed out after 100ms (elapsed 101ms) at http://x" },
-      { kind: "readiness.dispatch", ts: "t3", source: "baseline", ready: true, baselineReady: true, uncertain: [], fallbackReason: "S1 unreachable at http://x (ECONNREFUSED)" },
-      { kind: "readiness.dispatch", ts: "t4", source: "baseline", ready: true, baselineReady: true, uncertain: [], fallbackReason: "S1 request failed: weird" },
-      { kind: "readiness.dispatch", ts: "t5", source: "baseline", ready: true, baselineReady: true, uncertain: [], fallbackReason: "S1 rejected the request: HTTP 422 bad" },
+      { kind: "readiness.dispatch", ts: "t2", source: "baseline", ready: false, baselineReady: false, uncertain: [], fallbackReason: "S1 error: S1 timed out after 100ms (elapsed 101ms) at http://x" },
+      { kind: "readiness.dispatch", ts: "t3", source: "baseline", ready: true, baselineReady: true, uncertain: [], fallbackReason: "S1 error: S1 unreachable at http://x (ECONNREFUSED)" },
+      { kind: "readiness.dispatch", ts: "t4", source: "baseline", ready: true, baselineReady: true, uncertain: [], fallbackReason: "S1 error: S1 request failed: weird" },
+      { kind: "readiness.dispatch", ts: "t5", source: "baseline", ready: true, baselineReady: true, uncertain: [], fallbackReason: "S1 error: S1 rejected the request: HTTP 422 bad" },
       { kind: "readiness.dispatch", ts: "t6", source: "baseline", ready: false, baselineReady: false, uncertain: [], fallbackReason: "S1 answers were unusable" },
       { kind: "decision-point", decisionId: "dp-1" },
     ];
@@ -170,6 +170,17 @@ describe("#322: readinessCoverage summarizes the log", () => {
     });
   });
 
+  it("a real wrapped reason (the judge's 'S1 error: ' + the decider's timeout text) buckets under the stable 'S1 timed out' prefix", () => {
+    // The live shape from the probe: judgeReadiness emits `S1 error: ${r.error}` and the decider (#311) names the
+    // condition with per-row ms/origin — without stripping the wrapper every row buckets under its unique raw string.
+    const cov = readinessCoverage([
+      { kind: "readiness.dispatch", ts: "t1", source: "baseline", ready: false, baselineReady: false, uncertain: [], fallbackReason: "S1 error: S1 timed out after 15000ms" },
+      { kind: "readiness.dispatch", ts: "t2", source: "baseline", ready: false, baselineReady: false, uncertain: [], fallbackReason: "S1 error: S1 timed out after 9876ms (elapsed 9912ms) at http://127.0.0.1:8009" },
+    ]);
+    expect(cov.fellBack).toBe(2);
+    expect(cov.byReason).toMatchObject({ "S1 timed out": 2 });
+  });
+
   it("empty and non-readiness logs give zeros", () => {
     expect(readinessCoverage([{ kind: "decision-point" }, { kind: "decision-outcome" }])).toMatchObject({ judged: 0, answeredByS1: 0, fellBack: 0 });
     expect(readinessCoverage([]).byReason).toEqual({});
@@ -177,18 +188,49 @@ describe("#322: readinessCoverage summarizes the log", () => {
 });
 
 describe("#322: a failed dispatch.heavy shadowPoint is logged, never silent", () => {
-  it("S1 rejects the point question -> its failure is logged (a decision-point row with the fallback), not silent", async () => {
+  it("S1 rejects the point question -> an s1-shadow failure record names the point and the bounded error", async () => {
     const rejecting: S1Fetch = async () => ({ ok: false, status: 422, json: async () => ({ detail: "unknown type" }) });
     const ctx = await dispatchFixture("REJECT-S1", { s1: { mode: "shadow", timeoutMs: 1000 } }, rejecting);
     try {
       const r = nodeResult(await dispatchDone(ctx));
       expect(r.runId).toBeDefined();
-      // Failed shadowPoint: the point's decision-point row exists with source "static" AND the
-      // fallback names the S1 failure (silent before #322 for the outcome itself).
-      const rows = await waitForAnyRows(logPath(ctx.t), (e) => e.kind === "decision-point" && (e as { pointId?: string }).pointId === "dispatch.heavy");
-      const dp = rows[0] as { fallback?: string };
-      expect(dp).toBeDefined();
-      expect(dp.fallback).toMatch(/S1 rejected the request|422|unknown type/i);
+      // Regression (review, MAJOR): the point's decision-point row is PRE-EXISTING behaviour and proves nothing —
+      // runPoint turns every failure into the safe default and the fire-and-forget promise NEVER rejects, so the
+      // failure record must be written inside shadowPoint's own swallow path (kind s1-shadow, questionId naming the
+      // point, bounded error). This test FAILS against the pre-fix source, where nothing wrote it.
+      const rows = await waitForAnyRows(logPath(ctx.t), (e) => e.kind === "s1-shadow" && (e as { questionId?: string }).questionId === "dispatch.heavy");
+      expect(rows.length).toBeGreaterThanOrEqual(1);
+      const rec = rows[0] as { ok?: unknown; error?: unknown };
+      expect(rec.ok).toBe(false);
+      expect(String(rec.error)).toMatch(/S1 rejected the request|422|unknown type/i);
+      expect(String(rec.error).length).toBeLessThanOrEqual(4000);
+      // The dispatch itself is untouched: the safe-default decision-point row still exists beside the failure record.
+      const dps = logRows(readFileSync(logPath(ctx.t), "utf8")).filter((e) => e.kind === "decision-point" && (e as { pointId?: string }).pointId === "dispatch.heavy");
+      expect(dps.length).toBeGreaterThanOrEqual(1);
+    } finally {
+      teardown(ctx);
+    }
+  });
+});
+
+describe("#322 (minor): a probe dispatch writes NO readiness row", () => {
+  it("a trivial probe prompt is not judged: the shadow log gains no readiness.dispatch row", async () => {
+    // A probe IS dispatched (runId returned) but judgeReadiness returns undefined for it ("reply with exactly: OK"),
+    // so the logging branch never fires — the PR's claimed coverage, made real here.
+    const healthy: S1Fetch = async (_url, init) => {
+      const body = JSON.parse(init.body) as { questions: Record<string, unknown> };
+      const answers: Record<string, unknown> = {};
+      for (const id of Object.keys(body.questions)) answers[id] = { type: "noul", noul: 0.9 };
+      return { ok: true, status: 200, json: async () => ({ model: "e2e-s1", answers, usage: { input_tokens: 3, output_tokens: 2 } }) };
+    };
+    const ctx = await dispatchFixture("PROBE-NO-JUDGE", { s1: { mode: "shadow", timeoutMs: 1000 } }, healthy);
+    try {
+      const r = (await ctx.t.call("fleet_dispatch", { cwd: "/w/p", node: "dev2", prompt: "reply with exactly: OK" })) as Record<string, any>;
+      expect(r.dev2?.runId ?? Object.values(r ?? {}).find((v) => v && typeof v === "object" && "runId" in (v as object))?.runId).toBeDefined();
+      await drainShadowDecisions();
+      let log = "";
+      try { log = readFileSync(logPath(ctx.t), "utf8"); } catch { /* no log yet */ }
+      expect(logRows(log).filter((e) => e.kind === "readiness.dispatch")).toEqual([]);
     } finally {
       teardown(ctx);
     }
