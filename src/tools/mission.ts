@@ -69,6 +69,15 @@ export function registerMissionTools(
       const loaded = await store.loadMission(root, p.missionId);
       if (!loaded.ok) return jsonResult({ ok: false, error: loaded.error });
       if (p.approve === true) {
+        // Issue #129: the plan must be READY before it is approved. Gaps in the specs or their scopes block
+        // approval (they burn runs); gaps the record cannot carry yet (test plan, assumption checks, risk owners,
+        // open questions, budget) are returned as warnings and journaled, never as a deadlock.
+        const { readinessOfRecord } = await import("../mission-plan.js");
+        const ready = readinessOfRecord(loaded.record);
+        if (ready.blocking.length > 0) {
+          return jsonResult({ ok: false, error: "the plan is not ready to approve", readiness: { verdict: "needs-more", blocking: ready.blocking, warnings: ready.warnings } });
+        }
+        if (ready.warnings.length > 0) await store.appendJournal(root, p.missionId, { type: "approved-with-warnings", why: `approved with ${ready.warnings.length} readiness warning(s)`, evidence: ready.warnings.map((w) => `${w.area}: ${w.what}`).join("; ").slice(0, 400) });
         if (loaded.record.phase === "designing") { const a = await store.setPhase(root, p.missionId, "awaiting-approval", "plan submitted"); if (!a.ok) return jsonResult({ ok: false, error: a.error }); }
         // Issue #249: materialize the design as reviewable artifact FILES at
         // approval (plan.md + tasks.md in the project checkout) and pin their
@@ -91,7 +100,7 @@ export function registerMissionTools(
         if (designArtifacts) {
           const n = Math.min(5, Math.max(1, Math.floor(typeof p.ticks === "number" ? p.ticks : 1)));
           void n;
-          return jsonResult({ ok: true, phase: "executing", designArtifacts: { written: designArtifacts.written, planSha: designArtifacts.planSha, tasksSha: designArtifacts.tasksSha } });
+          return jsonResult({ ok: true, phase: "executing", ...(ready.warnings.length ? { readinessWarnings: ready.warnings } : {}), designArtifacts: { written: designArtifacts.written, planSha: designArtifacts.planSha, tasksSha: designArtifacts.tasksSha } });
         }
       }
       const { tick } = await import("../mission-runner.js");

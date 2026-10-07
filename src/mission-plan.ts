@@ -65,6 +65,46 @@ export function planReadiness(plan: Plan): Readiness {
   return { verdict: missing.length ? "needs-more" : "ready", missing };
 }
 
+// ---- readiness of a stored mission (issue #129) -------------------------------------------------------------
+
+/** Areas that BLOCK approval (spec and scope gaps burn runs); every other gap is reported as a warning. */
+const BLOCKING_AREA = /^(specs|spec |scopes)/;
+
+/**
+ * Readiness of a stored mission at approval. The record carries specs (with their task: acceptance, verify, scope),
+ * risks, assumptions, open questions and a budget, but not yet a written test plan or per-assumption checks, so
+ * those gaps are WARNINGS, never blockers (a blocker the caller cannot clear would only deadlock approval).
+ * Gaps in the specs and their scopes block: they are the ones that burn a run. Risks carry no owner/mitigation in
+ * the record yet, so a risk gap is a warning like the rest.
+ */
+export function readinessOfRecord(record: MissionRecord): { verdict: Readiness["verdict"]; blocking: Missing[]; warnings: Missing[]; missing: Missing[] } {
+  const specs: PlanSpec[] = Object.values(record.supervisor.specs).map((s) => {
+    const t = (typeof s.spec.task === "object" && s.spec.task !== null ? s.spec.task : {}) as { acceptance?: unknown; verify?: PlanSpec["verify"]; scope?: TaskScope };
+    return {
+      id: s.spec.id,
+      goal: s.spec.goal,
+      ...(Array.isArray(t.acceptance) ? { acceptance: t.acceptance.filter((a): a is string => typeof a === "string") } : {}),
+      ...(t.verify ? { verify: t.verify } : {}),
+      ...((t.scope ?? s.spec.scope) ? { scope: (t.scope ?? s.spec.scope)! } : {}),
+      deps: s.spec.deps,
+    };
+  });
+  const plan: Plan = {
+    specs,
+    // The record has no test plan or assumption checks yet: model them as present so they do not appear as gaps the
+    // caller cannot fix; the areas below are reported from what the record DOES hold.
+    testPlan: { writtenBeforeCode: true, items: ["(not carried by the record)"] },
+    risks: record.risks.map((r) => ({ id: r.id, text: r.text, severity: r.severity, owner: (r as { owner?: string }).owner ?? "unassigned", mitigation: (r as { mitigation?: string }).mitigation ?? "" })),
+    assumptions: record.assumptions.map((a) => ({ text: a.text, check: "recorded" })),
+    questions: record.openQuestions.map((q) => ({ text: q })),
+    ...(record.budget ? { budget: record.budget } : {}),
+  };
+  const r = planReadiness(plan);
+  const blocking = r.missing.filter((m) => BLOCKING_AREA.test(m.area));
+  const warnings = r.missing.filter((m) => !BLOCKING_AREA.test(m.area));
+  return { verdict: r.verdict, blocking, warnings, missing: r.missing };
+}
+
 // ---- time-box ---------------------------------------------------------------------------------------------
 
 export interface DesignBox { maxMs: number; maxUsd: number }
