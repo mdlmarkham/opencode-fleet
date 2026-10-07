@@ -13,7 +13,8 @@
     "test": "vitest run --config ./vitest.config.ts",
     "calibrate": "npm run build && node dist/calibrate-cli.js",
     "pi:verify": "npm run build && node dist/pi-verify-cli.js",
-    "tools:check-allow": "npm run build && node dist/tool-allow-cli.js"
+    "tools:check-allow": "npm run build && node dist/tool-allow-cli.js",
+    "reviewers:score": "npm run build && node dist/reviewer-calibrate-cli.js"
   },
   "files": [
     "dist",

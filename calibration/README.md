@@ -67,3 +67,14 @@ it. Keep that convention when adding more.
 
 Running the configured reviewers over it is the live part (it needs a reviewer endpoint); the scorer takes the findings.
 Extend it with escaped defects via `caseFromEscapedDefect`.
+
+### Running reviewers and scoring (issue #127)
+
+`src/reviewer-run.ts` runs a reviewer set over the corpus through an injected `ReviewFn` (per-case timeout, bounded
+concurrency; a reviewer that throws or times out is recorded `failed`, never scored as a pass) and renders the dated
+report. The live adapter, which shows a reviewer each case's diff at its `baseCommit`, needs a node and a model and is
+not included. To score results produced elsewhere (a `CaseResult[]` JSON):
+
+```
+npm run reviewers:score -- --corpus calibration/reviewer-corpus.json --results results.json [--date 2026-10-06] [--out calibration/reviewer-report-2026-10-06.md]
+```

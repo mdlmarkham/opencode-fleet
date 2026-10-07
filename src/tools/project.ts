@@ -232,6 +232,7 @@ export function registerProjectTools(api: OpenClawPluginApi, cfg: FleetConfig): 
       const recentlyFinished = p.node && p.cwd ? gateInput.recentlyFinished : [];
       const gate = evaluateDesignGate(specCheck.spec, {
         inFlight,
+        liveAnywhere: p.cwd ? gateInput.inFlight : [],
         isolated: (p.isolation ?? cfg.isolation ?? "none") === "clone",
         bounds: { ...(cfg.project?.maxScopePatterns ? { maxScopePatterns: cfg.project.maxScopePatterns } : {}), ...(cfg.project?.maxAcceptanceItems ? { maxAcceptanceItems: cfg.project.maxAcceptanceItems } : {}) },
       }, ackCheck.acks);

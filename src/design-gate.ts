@@ -33,7 +33,12 @@ export interface InFlightRun {
   scope?: { files: string[] };
   /** True when the run works in its own clone, so it cannot clobber a shared checkout. */
   isolated?: boolean;
+  /** The run's goal (issue #260), used only to notice the same task being claimed twice. */
+  goal?: string;
 }
+
+/** Whitespace/case-insensitive form of a goal, so the same task worded identically compares equal (issue #260). */
+export const normalizeGoal = (g: unknown): string => String(g ?? "").toLowerCase().replace(/\s+/g, " ").trim().slice(0, 400);
 
 export interface GateBounds {
   maxScopePatterns: number;
@@ -44,6 +49,8 @@ export const DEFAULT_GATE_BOUNDS: GateBounds = { maxScopePatterns: 20, maxAccept
 
 export interface GateContext {
   inFlight?: InFlightRun[];
+  /** Running work on this checkout path on ANY node (issue #260): the claim check is not limited to the target node. */
+  liveAnywhere?: InFlightRun[];
   /** Whether the new run gets its own clone (isolation "clone"). */
   isolated?: boolean;
   bounds?: Partial<GateBounds>;
@@ -226,6 +233,15 @@ function checks(spec: TaskSpec, ctx: GateContext): Objection[] {
     out.push(objection({ id: "spec.too-large", severity: "block-candidate", message: "The spec is larger than one task should be.", evidence: parts.join("; "), suggestion: "Split it into smaller specs with disjoint scopes and dependencies between them." }));
   }
 
+  // Issue #260 (claim before dispatch): the same task already running anywhere on this checkout is duplicate
+  // work (it happened: one issue dispatched by the fleet and by a parallel session). Acknowledgeable for a
+  // deliberate rerun. Identical wording only: this is a claim check, not a similarity search.
+  const wanted = normalizeGoal(spec.goal);
+  const dupes = wanted ? (ctx.liveAnywhere ?? []).filter((r) => r.goal !== undefined && normalizeGoal(r.goal) === wanted) : [];
+  if (dupes.length > 0) {
+    out.push(objection({ id: "overlap.duplicate-goal", severity: "block-candidate", message: "A run with this exact goal is already in flight on this checkout; dispatching it again is duplicate work.", evidence: `in-flight run(s) with the same goal: ${[...new Set(dupes.map((r) => `${r.runId} (${r.node})`))].join(", ")}`, suggestion: "Adopt the running run (fleet_run_status / fleet_await), wait for it, or acknowledge overlap.duplicate-goal with a reason if this is a deliberate rerun." }));
+  }
+
   const mine = parseScope(spec.scope);
   const myScope = mine.ok ? mine.scope : undefined;
   const live = (ctx.inFlight ?? []);
@@ -266,7 +282,7 @@ export function applyAcknowledgements(objections: Objection[], acks: Acknowledge
 
 export function verdictOf(objections: Objection[]): Verdict {
   const open = objections.filter((o) => !o.acknowledged);
-  if (open.some((o) => o.id === "overlap.in-flight")) return "reject-with-reason";
+  if (open.some((o) => o.id === "overlap.in-flight" || o.id === "overlap.duplicate-goal")) return "reject-with-reason";
   // Issue #288: a design question outranks "too large" — splitting an unanswerable
   // spec does not make it answerable. The verdict the vocabulary always had, now emitted.
   if (open.some((o) => o.id === "spec.needs-design")) return "needs-design";

@@ -37,6 +37,9 @@ export interface Assumption { id: string; text: string; madeBy: string; at: stri
 export interface Risk { id: string; text: string; severity: "low" | "medium" | "high" }
 export interface PlanDiff { version: number; at: string; summary: string }
 
+/** Per-spec publication state (issue #251): a verified spec is published once, in dependency order. */
+export interface Publication { state: "publishing" | "published" | "failed" | "escalated"; ref?: string; failures: number; lastError?: string; at: string }
+
 export interface MissionRecord {
   schemaVersion: number;
   missionId: string;
@@ -56,6 +59,8 @@ export interface MissionRecord {
   /** Where the mission's specs run: the checkout on the nodes, and which nodes may take them. */
   target?: { cwd: string; nodes?: string[] };
   autonomy?: { level: "supervised" | "gated" | "unattended"; contract?: string };
+  /** Publication per verified spec id (issue #251); absent = never attempted. */
+  publications?: Record<string, Publication>;
   supervisor: MissionState;
 }
 
@@ -83,6 +88,13 @@ export function validateRecord(raw: unknown): Loaded {
   if (raw.target !== undefined) {
     const t = raw.target;
     if (!isRec(t) || typeof t.cwd !== "string" || !t.cwd.startsWith("/") || t.cwd.length > 300 || (t.nodes !== undefined && (!Array.isArray(t.nodes) || t.nodes.length > 50 || t.nodes.some((n) => typeof n !== "string")))) return { ok: false, error: "bad target" };
+  }
+  if (raw.publications !== undefined) {
+    const pubs = raw.publications;
+    if (!isRec(pubs) || Object.keys(pubs).length > MAX_SPECS) return { ok: false, error: "bad publications" };
+    for (const [id, v] of Object.entries(pubs)) {
+      if (!isRec(v) || !["publishing", "published", "failed", "escalated"].includes(String(v.state)) || !Number.isInteger(v.failures) || (v.failures as number) < 0 || typeof v.at !== "string" || (v.ref !== undefined && typeof v.ref !== "string") || (v.lastError !== undefined && typeof v.lastError !== "string")) return { ok: false, error: `bad publication entry for ${id}` };
+    }
   }
   const sup = raw.supervisor;
   if (!isRec(sup) || sup.schemaVersion !== SUPERVISOR_SCHEMA_VERSION || sup.missionId !== raw.missionId || !isRec(sup.specs) || Object.keys(sup.specs).length > MAX_SPECS || !Array.isArray(sup.journal)) return { ok: false, error: "supervisor state is missing or inconsistent with the mission" };
