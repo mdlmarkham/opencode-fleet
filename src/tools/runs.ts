@@ -130,6 +130,7 @@ export function registerRunsTools(api: OpenClawPluginApi, cfg: FleetConfig): { r
           state,
           ...(typeof st.exitCode === "number" ? { exitCode: st.exitCode } : {}),
           ...(reconcileVerified !== null ? { verified: reconcileVerified } : {}),
+          ...(st.gateTimedOut === true && reconcileVerified === null ? { gateTimedOut: true as const } : {}),
           ...(st.verifyDetails != null ? { verifyDetails: st.verifyDetails } : {}),
           // Issue #104: persist what the node reported so fleet_sync can apply the scope policy.
           ...(entry?.spec?.scope && st.finishedAt ? { scopeViolations: Array.isArray(st.scopeViolations) ? (st.scopeViolations as string[]) : null } : {}),
@@ -192,6 +193,12 @@ export function registerRunsTools(api: OpenClawPluginApi, cfg: FleetConfig): { r
               ...(Array.isArray(st.scopeViolations) && st.scopeViolations.length
                 ? { scopeWarning: `${st.scopeViolations.length} changed file(s) fall outside the declared scope (advisory; review them).` }
                 : {}),
+            }
+          : {}),
+        ...(st.gateTimedOut === true
+          ? {
+              gateTimedOut: true,
+              verifiedNote: "VERIFICATION GATE TIMED OUT (issue #309): the gate command did not finish within its bound, so the work is UNVERIFIED, not failed. Re-run the gate by hand or on a quieter node (or raise verify.timeoutMs); do not report it as verified.",
             }
           : {}),
         ...(st.verified === false

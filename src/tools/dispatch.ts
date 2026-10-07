@@ -965,8 +965,8 @@ export function registerDispatchTools(api: OpenClawPluginApi, cfg: FleetConfig):
         const payload = (dispatchResult as { payload?: unknown }).payload;
         const parsedResult =
           typeof payload === "string"
-            ? (JSON.parse(payload) as { ok?: boolean; summary?: string; sessionId?: string; handRaised?: boolean; question?: string; verified?: boolean; verifyDetails?: unknown })
-            : ((payload as { ok?: boolean; summary?: string; sessionId?: string; handRaised?: boolean; question?: string; verified?: boolean; verifyDetails?: unknown } | undefined) ?? {});
+            ? (JSON.parse(payload) as { ok?: boolean; summary?: string; sessionId?: string; handRaised?: boolean; question?: string; verified?: boolean; gateTimedOut?: boolean; verifyDetails?: unknown })
+            : ((payload as { ok?: boolean; summary?: string; sessionId?: string; handRaised?: boolean; question?: string; verified?: boolean; gateTimedOut?: boolean; verifyDetails?: unknown } | undefined) ?? {});
         // Same run, new state (see outcomeEntry): keeps startedAt/engine/pid and a
         // silent-death failure recorded above. outcomeEntry consults
         // parsed.verified too: a FAILED gate must not be laundered into a
@@ -1010,6 +1010,9 @@ export function registerDispatchTools(api: OpenClawPluginApi, cfg: FleetConfig):
                   verifiedNote:
                     "VERIFICATION GATE FAILED (issue #62): the worker exited but did not satisfy `expect` (see verifyDetails). Treat this run as unverified — do not report it as successful work.",
                 }
+              : {}),
+            ...(parsedResult.gateTimedOut === true
+              ? { gateTimedOut: true, verifiedNote: "VERIFICATION GATE TIMED OUT (issue #309): the gate command did not finish within its bound, so the work is UNVERIFIED, not failed. Re-run the gate by hand or on a quieter node (or raise verify.timeoutMs); do not report it as verified." }
               : {}),
             ...(timedOut ? { dispatchTimedOut: true, mayStillBeRunning: true } : {}),
           },

@@ -166,14 +166,14 @@ describe("#67: file checks stay inside the run directory (real fs)", () => {
 });
 
 describe("#67: a verify command that forks is bounded as a whole group (real processes)", () => {
-  it("a TERM-ignoring command with a background child is killed at the timeout; the gate reports false", () =>
+  it("a TERM-ignoring command with a background child is killed at the timeout; the gate reports unverified (timed out, #309)", () =>
     scratch(async (d) => {
       const pidFile = join(d, "child.pid");
       // background child ignoring TERM, parent also ignoring TERM, both sleeping long
       const cmd = `trap '' TERM; (trap '' TERM; echo $BASHPID > ${JSON.stringify(pidFile)}; sleep 60) & sleep 60`;
       const t0 = Date.now();
       const out = await evaluateExpect({ command: cmd }, d, { commandTimeoutMs: 800 });
-      expect(out.verified).toBe(false);
+      expect(out.verified).toBeNull();
       expect(Date.now() - t0).toBeLessThan(8_000);
       await new Promise((r) => setTimeout(r, 300));
       const childPid = Number(readFileSync(pidFile, "utf8").trim());

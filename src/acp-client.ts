@@ -28,6 +28,8 @@ export interface AcpRunResult {
   error?: string;
   /** Issue #62: outcome of the optional `expect` verification gate (absent = no gate). */
   verified?: boolean | null;
+  /** Issue #309: the gate timed out (unverified, not failed). */
+  gateTimedOut?: boolean;
   verifyDetails?: VerifyDetails;
 }
 

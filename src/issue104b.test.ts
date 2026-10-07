@@ -199,7 +199,7 @@ describe("issue #104b: timeoutMs bounds a hanging command (shared, overriding th
     const dt = Date.now() - t0;
     expect(dt).toBeLessThan(10_000); // 30s of sleep must NOT be awaited
     expect(dt).toBeGreaterThan(400); // the 500ms bound genuinely applied
-    expect(out.verified).toBe(false);
+    expect(out.verified).toBeNull();
     const first = out.verifyDetails.commands?.[0];
     expect(first?.cmd).toBe("sleep 30");
     expect(first?.exitCode === null || first?.exitCode === 124).toBe(true);
@@ -209,7 +209,7 @@ describe("issue #104b: timeoutMs bounds a hanging command (shared, overriding th
     const t0 = Date.now();
     const out = await evaluateExpect({ commands: ["sleep 30"], timeoutMs: 400 }, dir, { commandTimeoutMs: 30_000 });
     expect(Date.now() - t0).toBeLessThan(10_000);
-    expect(out.verified).toBe(false);
+    expect(out.verified).toBeNull();
   });
 
   it("without timeoutMs, the launcher/evaluator still bounds via its own budget (backward-compatible shape)", () => {
@@ -327,7 +327,7 @@ describe("issue #104b: the detached launcher fragment runs EVERY command (real b
       verifyDetails: { commands: Array<{ cmd: string; exitCode: number | null; ok: boolean }> };
     };
     expect(dt).toBeLessThan(20_000); // sleep 20 was killed by the timeout, not awaited
-    expect(done.verified).toBe(false);
+    expect(done.verified).toBeNull();
     expect(done.verifyDetails.commands[0].cmd).toBe("sleep 20");
     expect(done.verifyDetails.commands[0].exitCode === null || done.verifyDetails.commands[0].exitCode === 124).toBe(true);
   });

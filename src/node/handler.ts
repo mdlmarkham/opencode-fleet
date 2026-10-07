@@ -466,17 +466,21 @@ OPS["run.status"] = async ({ task, io, context }: OpCtx) => {
       const statePath = runStatePath(runId);
       try {
         const raw = await (await import("node:fs/promises")).readFile(statePath, "utf8");
-        const st = JSON.parse(raw) as { pid?: number; state?: string; startedAt?: string; finishedAt?: string; exitCode?: number; verified?: boolean; verifyDetails?: VerifyDetails; scope?: { files: string[] }; cwd?: string; startHead?: string; changedFiles?: string[]; scopeViolations?: string[] | null; scopeError?: string; dirtyWorktree?: boolean };
+        const st = JSON.parse(raw) as { pid?: number; state?: string; startedAt?: string; finishedAt?: string; exitCode?: number; verified?: boolean; gateTimedOut?: boolean; verifyDetails?: VerifyDetails; scope?: { files: string[] }; cwd?: string; startHead?: string; changedFiles?: string[]; scopeViolations?: string[] | null; scopeError?: string; dirtyWorktree?: boolean };
         // Merge worker completion record when present (issue #6). Issue #62:
         // the record may also carry the verify-gate outcome.
         try {
           const doneRaw = await (await import("node:fs/promises")).readFile(runPaths(runId).done, "utf8");
-          const done = JSON.parse(doneRaw) as { exitCode?: number; finishedAt?: string; verified?: boolean; verifyDetails?: VerifyDetails };
+          const done = JSON.parse(doneRaw) as { exitCode?: number; finishedAt?: string; verified?: boolean | null; verifyDetails?: VerifyDetails; endedBy?: string };
           st.state = "finished";
           st.exitCode = done.exitCode;
           st.finishedAt = done.finishedAt;
           if (typeof done.verified === "boolean") {
             st.verified = done.verified;
+            if (done.verifyDetails) st.verifyDetails = done.verifyDetails;
+          } else if (done.endedBy === "gate-timeout") {
+            // Issue #309: the gate did not finish. Not a verdict (verified stays unset => null) and never a pass.
+            st.gateTimedOut = true;
             if (done.verifyDetails) st.verifyDetails = done.verifyDetails;
           }
         } catch { /* still running or not finished */ }
@@ -589,6 +593,7 @@ OPS["run.result"] = async ({ task, io, context }: OpCtx) => {
       let exitCode: number | undefined;
       // Issue #62: verify-gate outcome (from the launcher-written done record).
       let verified: boolean | null = null;
+      let gateTimedOut = false;
       let vDetails: VerifyDetails | undefined;
       try {
         const raw = await (await import("node:fs/promises")).readFile(runStatePath(runId), "utf8");
@@ -597,8 +602,9 @@ OPS["run.result"] = async ({ task, io, context }: OpCtx) => {
       } catch { /* no state file */ }
       try {
         const doneRaw = await (await import("node:fs/promises")).readFile(runPaths(runId).done, "utf8");
-        const done = JSON.parse(doneRaw) as { exitCode?: number; verified?: boolean; verifyDetails?: VerifyDetails };
+        const done = JSON.parse(doneRaw) as { exitCode?: number; verified?: boolean | null; verifyDetails?: VerifyDetails; endedBy?: string };
         if (typeof done.exitCode === "number") exitCode = done.exitCode;
+        if (done.verified === null && done.endedBy === "gate-timeout") gateTimedOut = true;
         // Issue #62: surface the verification gate outcome recorded by the
         // launcher. The parsed result below stays untouched; verified rides
         // alongside it (null when no gate was configured).
@@ -624,6 +630,9 @@ OPS["run.result"] = async ({ task, io, context }: OpCtx) => {
       // control-plane consumers.
       if (verified !== null) {
         parsed.verified = verified;
+        if (vDetails) parsed.verifyDetails = vDetails;
+      } else if (gateTimedOut) {
+        parsed.gateTimedOut = true;
         if (vDetails) parsed.verifyDetails = vDetails;
       }
       return JSON.stringify({
@@ -718,7 +727,8 @@ async function runTask({ task, io, context }: OpCtx): Promise<string> {
       // it after the worker (the ACP session) finished.
       if (expectSpec.expect) {
         const outcome = await evaluateExpect(expectSpec.expect, task.cwd);
-        acpResult.verified = outcome.verified;
+        if (outcome.verified !== null) acpResult.verified = outcome.verified;
+        else acpResult.gateTimedOut = true;
         acpResult.verifyDetails = outcome.verifyDetails;
       }
       return JSON.stringify(acpResult);
@@ -759,7 +769,8 @@ async function runTask({ task, io, context }: OpCtx): Promise<string> {
     // verified:false — visible, not laundered.
     if (expectSpec.expect) {
       const outcome = await evaluateExpect(expectSpec.expect, task.cwd);
-      parsed.verified = outcome.verified;
+      if (outcome.verified !== null) parsed.verified = outcome.verified;
+      else parsed.gateTimedOut = true;
       parsed.verifyDetails = outcome.verifyDetails;
     }
     return JSON.stringify(parsed);
