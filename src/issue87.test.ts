@@ -202,7 +202,7 @@ describe("issue #87: decide() with an injected fetch", () => {
     const r = await decide({ state: {}, questions: QUESTIONS }, { fetch: hang, timeoutMs: 25 });
     expect(aborted).toBe(true);
     expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.error).toMatch(/S1 request failed/);
+    if (!r.ok) expect(r.error).toMatch(/^S1 timed out after 25ms/); // #311: the condition, not "This operation was aborted"
   });
   it("malformed reply (HTTP 200): bad usage or bad answers -> { ok: false }", async () => {
     const badUsage = { ...WIRE_OK(), usage: { input_tokens: "many", output_tokens: 1 } };

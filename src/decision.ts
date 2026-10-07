@@ -20,6 +20,8 @@
  * dispatch path.
  */
 
+import { redactSecrets } from "./untrusted.js";
+
 export const DEFAULT_S1_URL = "http://127.0.0.1:8009";
 /** Wire contract requires `model: string`; this alias is used when the caller does not name one. */
 export const DEFAULT_S1_MODEL = "s1";
@@ -264,7 +266,10 @@ export async function decide(input: DecideInput, opts: DecideOptions = {}): Prom
   });
 
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  const bound = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const t0 = Date.now();
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; ctrl.abort(); }, bound);
   let res: S1Response;
   try {
     res = await doFetch(url, {
@@ -275,12 +280,12 @@ export async function decide(input: DecideInput, opts: DecideOptions = {}): Prom
     });
   } catch (e) {
     clearTimeout(timer);
-    return { ok: false, error: `S1 request failed: ${errorMessage(e)}` };
+    return { ok: false, error: describeTransportFailure(e, { timedOut, boundMs: bound, elapsedMs: Date.now() - t0, origin: originOf(base) }) };
   }
   clearTimeout(timer);
 
   if (!res.ok) {
-    return { ok: false, error: `S1 returned HTTP ${res.status}` };
+    return { ok: false, error: await describeHttpFailure(res, Date.now() - t0) };
   }
 
   let parsed: unknown;
@@ -340,6 +345,39 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 
 function isFiniteNumber(v: unknown): v is number {
   return typeof v === "number" && Number.isFinite(v);
+}
+
+/** scheme://host[:port] only: never the path or query, which may carry tokens (issue #311). */
+export function originOf(url: string): string {
+  try { return new URL(url).origin; } catch { return "the configured S1 endpoint"; }
+}
+
+/**
+ * Name the CONDITION, not the transport (issue #311): "This operation was aborted" describes an AbortController, and
+ * a timeout, a refused connection and a DNS failure all used to surface as one "S1 request failed" string that sent
+ * the operator after the wrong cause. The stable prefixes (`S1 timed out`, `S1 unreachable`, `S1 request failed`)
+ * are what fallbackReason consumers and tests match on.
+ */
+export function describeTransportFailure(e: unknown, ctx: { timedOut: boolean; boundMs: number; elapsedMs: number; origin: string }): string {
+  if (ctx.timedOut) return `S1 timed out after ${ctx.boundMs}ms (elapsed ${ctx.elapsedMs}ms) at ${ctx.origin}`;
+  const code = String((e as { cause?: { code?: unknown }; code?: unknown } | undefined)?.cause?.code ?? (e as { code?: unknown } | undefined)?.code ?? "");
+  if (/^(ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ECONNRESET|EHOSTUNREACH|ENETUNREACH|ETIMEDOUT|UND_ERR_CONNECT_TIMEOUT)$/.test(code)) {
+    return `S1 unreachable at ${ctx.origin} (${code})`;
+  }
+  return `S1 request failed: ${errorMessage(e)}`;
+}
+
+/** HTTP failure: 4xx names the status AND the endpoint's own validation text (redacted, bounded); 5xx says the server failed. */
+export async function describeHttpFailure(res: S1Response, elapsedMs: number): Promise<string> {
+  let detail = "";
+  try {
+    const body = await res.json();
+    const pick = isRecord(body) ? (body.detail ?? body.error ?? body.message ?? body) : body;
+    detail = typeof pick === "string" ? pick : JSON.stringify(pick);
+  } catch { /* no/invalid body: the status alone */ }
+  const clip = redactSecrets(detail).replace(/\s+/g, " ").trim().slice(0, 300);
+  if (res.status >= 500) return `S1 server error: HTTP ${res.status}${clip ? ` ${clip}` : ""} (elapsed ${elapsedMs}ms)`;
+  return `S1 rejected the request: HTTP ${res.status}${clip ? ` ${clip}` : ""}`;
 }
 
 function errorMessage(e: unknown): string {
