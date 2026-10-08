@@ -233,13 +233,17 @@ export interface ReadinessCoverage {
 /** #311's stable fallbackReason prefixes, longest first so "S1 rejected the request" wins over a hypothetical shorter one. */
 const FALLBACK_PREFIXES: readonly string[] = ["S1 rejected the request", "S1 request failed", "S1 unreachable", "S1 timed out"];
 
+/** The `"S1 error: "` wrapper readiness-judge's fallback puts on the decider's own error (#311): stripped before prefix matching, or every real row buckets under its unique raw string. */
+const FALLBACK_WRAPPER = "S1 error: ";
+
 /** Summarize the readiness rows of a shadow log (issue #322): how often S1 actually answered vs fell back, and why. Pure. */
 export function readinessCoverage(log: object[]): ReadinessCoverage {
   const rows = (log as Array<{ kind?: string; source?: string; fallbackReason?: string }>).filter((e) => e.kind === "readiness.dispatch");
   const byReason: Record<string, number> = {};
   for (const e of rows) {
     if (e.source !== "baseline" || e.fallbackReason === undefined) continue;
-    const prefix = FALLBACK_PREFIXES.find((p) => e.fallbackReason!.startsWith(p)) ?? e.fallbackReason;
+    const raw = e.fallbackReason.startsWith(FALLBACK_WRAPPER) ? e.fallbackReason.slice(FALLBACK_WRAPPER.length) : e.fallbackReason;
+    const prefix = FALLBACK_PREFIXES.find((p) => raw.startsWith(p)) ?? raw;
     byReason[prefix] = (byReason[prefix] ?? 0) + 1;
   }
   return {
