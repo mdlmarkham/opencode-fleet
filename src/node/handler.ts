@@ -276,13 +276,17 @@ OPS["bundle"] = async ({ task, io, context }: OpCtx) => {
       // must never ride the auto-commit into the sync bundle. The runtime-dir
       // pathspec only ever DE-stages; src/syncfilter.ts (isRuntimePath /
       // filterSyncPaths / syncAddCommand) is the shared, tested filter.
-      const { syncAddCommand } = await import("../syncfilter.js");
+      // Issue #333: dirt that is ONLY runtime-dir files stages nothing under
+      // the exclusion pathspec, and the old bare `add && commit` then failed
+      // (git commit exits 1) aborting the bundle. The shared guard
+      // (syncCommitCommand) skips the commit when nothing got staged instead.
+      const { syncCommitCommand } = await import("../syncfilter.js");
       const commitOut = await runShell(
         [
           `cd ${shq(task.cwd)}`,
           `git rev-parse --is-inside-work-tree >/dev/null`,
           `DIRTY=$(git status --porcelain --untracked-files=all)`,
-          `if [ -n "$DIRTY" ]; then ${syncAddCommand()} && git -c user.email=fleet-worker@node -c user.name="fleet-worker" commit -q -m "fleet_sync: auto-commit worker working-tree changes before sync"; fi`,
+          `if [ -n "$DIRTY" ]; then ${syncCommitCommand(`git -c user.email=fleet-worker@node -c user.name="fleet-worker" commit -q -m "fleet_sync: auto-commit worker working-tree changes before sync"`)}; fi`,
           `git bundle create ${shq(join(accDir, "sync.bundle"))} --all`,
           `git rev-parse HEAD`,
           `git rev-parse --abbrev-ref HEAD`,

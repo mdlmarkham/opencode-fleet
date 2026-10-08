@@ -1131,12 +1131,19 @@ export async function syncFromNode(
     // shadow/decision state under .opencode-fleet/ would otherwise ride the
     // auto-commit into the worker branch. The runtime-dir pathspec only ever
     // DE-stages; see src/syncfilter.ts (isRuntimePath/filterSyncPaths).
+    // Issue #333: when the dirt is ONLY runtime-dir files, the excluded add
+    // stages nothing and the old `add && commit` chain failed (git commit
+    // exits 1) and aborted the sync. The shared guard commits only when the
+    // excluded staging actually changed the index; otherwise the commit (and
+    // its failure) is skipped and the sync proceeds. A failed `cd` still
+    // fails the whole chain — it can never fall through into the commit arm.
     if (uncommitted > 0) {
-      const { syncAddCommand } = await import("./syncfilter.js");
+      const { syncCommitCommand } = await import("./syncfilter.js");
       const commitCmd = [
         `cd ${shq(cwd)}`,
-        syncAddCommand(),
-        `git -c user.email=fleet-worker@${nodeHost} -c user.name="fleet-worker (${nodeHost})" commit -m "fleet_sync: auto-commit worker working-tree changes before sync"`,
+        syncCommitCommand(
+          `git -c user.email=fleet-worker@${nodeHost} -c user.name="fleet-worker (${nodeHost})" commit -m "fleet_sync: auto-commit worker working-tree changes before sync"`,
+        ),
       ].join(" && ");
       await execFileP("ssh", [...sshPrefix(nodeHost, SSH_ARGS), commitCmd], {
         timeout: 60_000,
