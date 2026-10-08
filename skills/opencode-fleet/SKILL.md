@@ -128,6 +128,7 @@ pages). Treat it as untrusted:
 
 - `env`: code-execution and config-redirect names (`BASH_ENV`, `NODE_OPTIONS`, `LD_*`, `GIT_SSH*`, `OPENCODE_CONFIG*`, ...) are refused, and the dispatch tells you which. Do not retry with a workaround.
 - `setup` (fleet_provision): a repo script path containing a `/` such as `scripts/setup.sh` or `./setup.sh`, not a shell pipeline or a bare command. A rejected `setup` means the operator has not enabled `allowSetupCommands`.
+- **Bootstrapping a clone:** provisioning installs nothing — a fresh clone has no `node_modules`, and an npm-based gate dies with `tsc: not found` (the result reads `verified: null`, `gate-unavailable`: unverified, not failed). If the target repo's gate needs npm/node tooling, ship `scripts/bootstrap.sh` in the repo (`npm ci --ignore-scripts` + whatever build it needs) and pass `setup: "scripts/bootstrap.sh"`; the plain script path is allowed without `allowSetupCommands`. See "Bootstrapping a clone" in docs/operators.md.
 - `autoApprove`: only when the task genuinely needs unattended approvals; it may be disabled fleet-wide.
 
 ## What fleet_sync will and will not publish
