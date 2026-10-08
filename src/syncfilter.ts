@@ -1,5 +1,6 @@
 /**
- * fleet_sync untracked-path staging filter (issue #331).
+ * fleet_sync untracked-path staging filter (issue #331) + empty-staging
+ * guard (issue #333).
  *
  * `fleet_sync` auto-commits a worker's working-tree changes before syncing:
  * `git add -A` stages EVERYTHING, including the plugin's own runtime state
@@ -11,8 +12,10 @@
  *
  * Pure: string in, strings out. The worker-side bundle op (`src/node/handler.ts`)
  * and the manager-side SSH path (`src/provision.ts`) both generate their
- * `git add -A` staging line from `syncAddCommand`, so the filter is testable
- * in isolation and both paths share one implementation.
+ * staging line from `syncAddCommand()` (with the empty-staging guard from
+ * `syncCommitCommand()`), so the filter is testable in isolation and both
+ * paths share one implementation; the path predicates (`isRuntimePath` /
+ * `filterSyncPaths`) are the tested filter helpers underneath it.
  */
 
 /** The plugin runtime directory, relative to a checkout root. Its contents are never tracked. */
@@ -38,11 +41,28 @@ export function filterSyncPaths(paths: string[]): string[] {
  * to the old bare `git add -A` for every non-runtime path, but runtime-dir
  * entries only ever DE-SELECT the pathspec — they can never ADD a file:
  *
- *   git add -A -- ':(exclude).opencode-fleet/' ...
+ *   git add -A -- ':(exclude).opencode-fleet' ...
  *
  * Magic pathspecs are ignored by old git (<2.0); every supported engine
  * carries a modern git, so exclusion can never silently become inclusion.
  */
 export function syncAddCommand(): string {
   return `git add -A -- ':(exclude)${RUNTIME_DIR}'`;
+}
+
+/**
+ * The auto-commit chain both sync paths run (issue #333): stage via
+ * `syncAddCommand()`, then commit ONLY if something is actually staged.
+ * With the exclusion pathspec, a tree whose dirt is solely under
+ * `.opencode-fleet/` stages nothing — the old `add && commit` chain then
+ * failed (`git commit` exits 1, "nothing added to commit but untracked
+ * files present") and aborted the whole sync. `git diff --cached --quiet`
+ * succeeds (exit 0) exactly when the index matches HEAD, so the commit is
+ * skipped instead of failing; the `cd` arm must fail the whole chain, never
+ * fall through into the commit.
+ *
+ * Returns the shell line; commit identity is supplied by the caller.
+ */
+export function syncCommitCommand(commitLine: string): string {
+  return `${syncAddCommand()} && (git diff --cached --quiet || ${commitLine})`;
 }
