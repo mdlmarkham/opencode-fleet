@@ -87,11 +87,17 @@ Provisioning installs nothing: `fleet_provision` ships a git bundle and hands
 over the checkout (`src/provision.ts`) — it never runs `npm ci` or reads
 `package.json`. A fresh clone therefore has no `node_modules`, and the first
 npm-based verification gate dies at `tsc: not found` (exit 127). Since PR #328
-the gate names this for what it is: an exit 126/127 at the gate reads as
+the gate names this for what it is: the canonical `tsc: not found` case (the
+shell's exit 127, or 126 for a file that cannot execute) reads as
 `verified: null` with `endedBy: "gate-unavailable"` and `missing:` naming the
-tool that could not start — the work is **unverified, not failed** (see
-`src/verify.ts`; the same wording backs `fleet_sync`'s refusal when
-`sync.requireVerified` is set).
+tool that could not start. `missing:` is best-effort
+(`classifyEnvironmentFailure` in `src/verify.ts`): when the stderr tail
+carries no not-found signature, the field is absent and dispatch falls back to
+a generic "a tool is missing on the node". It stays fail-closed: a 126/127
+alongside a real failure — a failed file check or another command's
+non-environmental exit — still reads `verified: false`. The work is
+**unverified, not failed** (see `src/verify.ts`; the same wording backs
+`fleet_sync`'s refusal when `sync.requireVerified` is set).
 
 **The pattern: the repo ships `scripts/bootstrap.sh`.** Commit a small script
 that does only what the checkout needs — install deps and build, nothing else —
@@ -112,13 +118,19 @@ those need the operator's `allowSetupCommands: true`. The gap was discoverabilit
 not capability.
 
 Always use `npm ci --ignore-scripts` (or the equivalent for your package
-manager): a plain `npm ci` runs dependency lifecycle scripts as the **worker
-principal** in the clone — arbitrary code from the dependency tree executing
-before any gate or review sees it. Auto-installing during provisioning was
-rejected on purpose; bootstrap only when a dispatch asks for it.
+manager): a plain `npm ci` runs dependency lifecycle scripts as the **SSH
+principal** — the node's SSH login user, often root — inside the clone over
+the default SSH transport: arbitrary code from the dependency tree executing
+as root before any gate or review sees it. Auto-installing during provisioning
+was rejected on purpose; bootstrap only when a dispatch asks for it.
 
-The script runs as the worker principal inside the clone, so keep it to what
-that checkout needs (install, build, generated-code steps).
+The bootstrap script (and any lifecycle scripts it or a plain `npm ci` pulls
+in) runs as the SSH principal — often root — inside the clone; provisioning
+then hands over what it created (`node_modules`, caches) to the worker
+principal, re-verifying the worker can write (issue #71,
+`src/provision.ts`). Keep the script to what that checkout needs (install,
+build, generated-code steps) — it executes with root's authority, which makes
+the `--ignore-scripts` advice above stronger, not weaker.
 
 ## Config reference — generated from the manifest
 

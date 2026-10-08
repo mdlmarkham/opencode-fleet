@@ -38,6 +38,12 @@ describe("issue #324c: bootstrapping a clone docs", () => {
     expect(section).toContain('setup: "scripts/bootstrap.sh"');
   });
 
+  it("that section says setup runs as the SSH principal (often root), never 'the worker principal'", () => {
+    const section = operators.slice(operators.indexOf('## Bootstrapping a clone'));
+    expect(section).toContain("SSH principal");
+    expect(section).not.toContain("runs as the worker principal");
+  });
+
   it("the SKILL carries the same guidance", () => {
     expect(skill).toContain("scripts/bootstrap.sh");
     expect(skill).toContain("--ignore-scripts");
