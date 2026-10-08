@@ -271,12 +271,18 @@ OPS["bundle"] = async ({ task, io, context }: OpCtx) => {
       // stale-ref) bundle that the manager then reported as "pushed".
       // Now: verify we are in a work tree, stage untracked files too, and
       // abort the bundle if git itself fails.
+      // Issue #331: the staging step EXCLUDES the plugin runtime dir —
+      // `.opencode-fleet/` state written by a run (shadow logs, decisions)
+      // must never ride the auto-commit into the sync bundle. The runtime-dir
+      // pathspec only ever DE-stages; src/syncfilter.ts (isRuntimePath /
+      // filterSyncPaths / syncAddCommand) is the shared, tested filter.
+      const { syncAddCommand } = await import("../syncfilter.js");
       const commitOut = await runShell(
         [
           `cd ${shq(task.cwd)}`,
           `git rev-parse --is-inside-work-tree >/dev/null`,
           `DIRTY=$(git status --porcelain --untracked-files=all)`,
-          `if [ -n "$DIRTY" ]; then git add -A && git -c user.email=fleet-worker@node -c user.name="fleet-worker" commit -q -m "fleet_sync: auto-commit worker working-tree changes before sync"; fi`,
+          `if [ -n "$DIRTY" ]; then ${syncAddCommand()} && git -c user.email=fleet-worker@node -c user.name="fleet-worker" commit -q -m "fleet_sync: auto-commit worker working-tree changes before sync"; fi`,
           `git bundle create ${shq(join(accDir, "sync.bundle"))} --all`,
           `git rev-parse HEAD`,
           `git rev-parse --abbrev-ref HEAD`,

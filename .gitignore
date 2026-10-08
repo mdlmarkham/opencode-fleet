@@ -10,6 +10,9 @@ dist/
 # Logs
 *.log
 
+# Plugin runtime dir (issue #331): decision logs, shadow state — never tracked
+.opencode-fleet/
+
 # OS
 .DS_Store
 

@@ -1127,10 +1127,15 @@ export async function syncFromNode(
 
     // Step 2: commit uncommitted changes on the node before bundling, so the
     // sync actually carries the worker's work (issue #1: silent data loss).
+    // Issue #331: stage EXCLUDING the plugin runtime dir — a run that wrote
+    // shadow/decision state under .opencode-fleet/ would otherwise ride the
+    // auto-commit into the worker branch. The runtime-dir pathspec only ever
+    // DE-stages; see src/syncfilter.ts (isRuntimePath/filterSyncPaths).
     if (uncommitted > 0) {
+      const { syncAddCommand } = await import("./syncfilter.js");
       const commitCmd = [
         `cd ${shq(cwd)}`,
-        `git add -A`,
+        syncAddCommand(),
         `git -c user.email=fleet-worker@${nodeHost} -c user.name="fleet-worker (${nodeHost})" commit -m "fleet_sync: auto-commit worker working-tree changes before sync"`,
       ].join(" && ");
       await execFileP("ssh", [...sshPrefix(nodeHost, SSH_ARGS), commitCmd], {
