@@ -1,10 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { execFileSync } from "node:child_process";
 import { deriveIsolationLevels, parseIsolationFacts, detectNodeCapabilities } from "./capabilities.js";
 import { fakeSshMultiline, loadEntry, loadPlugin, nodeReply, type FakeNode, type Loaded } from "./testkit/plugin.js";
 import { loadLedger } from "./ledger.js";
+import { parseTaskSpec } from "./spec.js";
+import { createRunClone, runCloneDir } from "./node/runtime.js";
+import { handleOpencodeRun } from "./node/handler.js";
+import { buildManifest } from "./audit.js";
+import { FEATURE_MIN_PROTOCOL, PROTOCOL_VERSION, requiredProtocol, resolveOp } from "./protocol.js";
+import { handleOpencodeRunPolicy, newProtocolCache, type PolicyCtx } from "./gateway-policy.js";
 
 /**
  * Issue #105 — capability-probe slice ONLY.
@@ -355,4 +362,224 @@ describe("#105: fleet_capabilities surfaces the new fields per node (tool level)
       isolationLevels: ["clone"],
     });
   }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// Issue #105b (retry): spec.base names the commit/branch an isolated clone
+// starts from. Parse shapes, clone-base (tmp repos), dispatch refusal seams,
+// protocol derivation + the older-node refusal.
+// ---------------------------------------------------------------------------
+
+const gitCmd = (cwd: string, ...a: string[]) => execFileSync("git", ["-C", cwd, ...a], { stdio: "pipe" }).toString().trim();
+
+/** A two-commit repo with a `feature` branch BEHIND master (master has one commit feature lacks). */
+function makeBaseRepo(dir: string): { repo: string; featureTip: string; masterTip: string; first: string } {
+  const repo = join(dir, "work", "proj");
+  mkdirSync(repo, { recursive: true });
+  execFileSync("git", ["-C", repo, "init", "-q"], { stdio: "pipe" });
+  gitCmd(repo, "config", "user.email", "t@t");
+  gitCmd(repo, "config", "user.name", "t");
+  writeFileSync(join(repo, "f.txt"), "v1");
+  execFileSync("git", ["-C", repo, "add", "-A"], { stdio: "pipe" });
+  execFileSync("git", ["-C", repo, "commit", "-q", "-m", "first"], { stdio: "pipe" });
+  const first = gitCmd(repo, "rev-parse", "HEAD");
+  execFileSync("git", ["-C", repo, "checkout", "-q", "-b", "feature"], { stdio: "pipe" });
+  const featureTip = gitCmd(repo, "rev-parse", "HEAD");
+  execFileSync("git", ["-C", repo, "checkout", "-q", "master"], { stdio: "pipe" });
+  writeFileSync(join(repo, "g.txt"), "v2");
+  execFileSync("git", ["-C", repo, "add", "-A"], { stdio: "pipe" });
+  execFileSync("git", ["-C", repo, "commit", "-q", "-m", "second (feature does not have it)"], { stdio: "pipe" });
+  const masterTip = gitCmd(repo, "rev-parse", "HEAD");
+  return { repo, featureTip, masterTip, first };
+}
+
+describe("#105b: parseTaskSpec validates spec.base", () => {
+  const ok = (spec: Record<string, unknown>) => parseTaskSpec({ goal: "g", ...spec });
+  it("no base => unchanged behavior (undefined spec.base accepted as-is)", () => {
+    expect(ok({})).toEqual({ ok: true, spec: { goal: "g" } });
+    expect(parseTaskSpec({ goal: "g", base: null }).ok).toBe(true);
+  });
+  it("a branch or a commit alone is accepted verbatim", () => {
+    expect(ok({ base: { branch: "feature" } })).toEqual({ ok: true, spec: { goal: "g", base: { branch: "feature" } } });
+    expect(ok({ base: { commit: "a".repeat(40) } })).toEqual({ ok: true, spec: { goal: "g", base: { commit: "a".repeat(40) } } });
+    expect(ok({ base: { commit: "b".repeat(64) } }).ok).toBe(true);
+  });
+  it("both, neither, bad shapes and unknown keys are refused", () => {
+    const bad: Array<[Record<string, unknown>, RegExp]> = [
+      [{ base: { branch: "feature", commit: "c".repeat(40) } }, /exactly one of branch or commit/],
+      [{ base: {} }, /exactly one of branch or commit/],
+      [{ base: { branch: "feat..ure" } }, /plain ref name/],
+      [{ base: { branch: "-x" } }, /plain ref name/],
+      [{ base: { branch: "a b" } }, /plain ref name/],
+      [{ base: { commit: "nothex" } }, /hex commit sha/],
+      [{ base: { commit: "c".repeat(39) } }, /hex commit sha/],
+      [{ base: { branch: "feature", extra: 1 } }, /unknown key/],
+      [{ base: "feature" }, /base must be an object/],
+      [{ base: ["feature"] }, /base must be an object/],
+    ];
+    for (const [spec, re] of bad) {
+      const r = ok(spec);
+      expect(r.ok, JSON.stringify(spec)).toBe(false);
+      if (!r.ok) expect(r.error, JSON.stringify(spec)).toMatch(re);
+      expect(r.ok === false && r.error.startsWith("spec."), JSON.stringify(spec)).toBe(true);
+    }
+  });
+});
+
+describe("#105b: createRunClone honors the base (tmp repos)", () => {
+  let dir: string;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "fleet105b-")); });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  it("base behind branch: clone starts at the feature tip, heads recorded, sourceMoved derivable", async () => {
+    const { repo, featureTip, masterTip } = makeBaseRepo(dir);
+    const r = await createRunClone("run-b1", repo, { branch: "feature" });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(gitCmd(r.cwd, "rev-parse", "HEAD")).toBe(featureTip);
+    expect(gitCmd(r.cwd, "rev-parse", "--abbrev-ref", "HEAD")).toBe("fleet/run-b1");
+    expect(r.baseHead).toBe(featureTip);
+    expect(r.sourceHead).toBe(masterTip);
+    expect(r.baseHead !== r.sourceHead).toBe(true);
+    expect(existsSync(join(r.cwd, "g.txt"))).toBe(false); // the master-only commit is NOT in the clone
+  });
+  it("base commit: clone HEAD is exactly that sha", async () => {
+    const { repo, first } = makeBaseRepo(dir);
+    const r = await createRunClone("run-b2", repo, { commit: first });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(gitCmd(r.cwd, "rev-parse", "HEAD")).toBe(first);
+    expect(r.baseHead).toBe(first);
+  });
+  it("a missing branch or commit fails the run NAMING it, and removes the run dir", async () => {
+    const { repo } = makeBaseRepo(dir);
+    const missBr = await createRunClone("run-b3", repo, { branch: "nosuch" });
+    expect(missBr.ok).toBe(false);
+    if (!missBr.ok) expect(missBr.error).toMatch(/base branch nosuch not present in the clone/);
+    expect(existsSync(runCloneDir(repo, "run-b3"))).toBe(false);
+    const missCo = await createRunClone("run-b4", repo, { commit: "d".repeat(40) });
+    expect(missCo.ok).toBe(false);
+    if (!missCo.ok) expect(missCo.error).toMatch(/base commit [d]{40} not present in the clone/);
+    expect(existsSync(runCloneDir(repo, "run-b4"))).toBe(false);
+  });
+  it("no base: byte-identical today — HEAD at source HEAD, no baseHead/sourceHead fields", async () => {
+    const { repo, masterTip } = makeBaseRepo(dir);
+    const r = await createRunClone("run-b5", repo);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(gitCmd(r.cwd, "rev-parse", "HEAD")).toBe(masterTip);
+    expect("baseHead" in r).toBe(false);
+    expect("sourceHead" in r).toBe(false);
+  });
+});
+
+describe("#105b: dispatch-level pure seams (fail-closed spec.base)", () => {
+  let p: Loaded | undefined;
+  let restore: (() => void) | undefined;
+  afterEach(() => { p?.dispose(); p = undefined; restore?.(); restore = undefined; });
+
+  it("spec.base with isolation none (explicit or config default) is refused BEFORE any node call", async () => {
+    const entry2 = entry ?? (await loadEntry());
+    restore = fakeSshMultiline(["FLEET_CWD=ok", "GITCLONE=yes", "BWRAP=no"]);
+    const nodes = [{ nodeId: "n-dev2", displayName: "dev2", connected: true, invocableCommands: ["opencode.run"] }];
+    const cfg = { nodes: { dev2: { roles: ["worker"], ssh: false } } };
+    const ack = () => nodeReply({ ok: true, detached: true, runId: "r", pid: 1 });
+    p = loadPlugin(entry2!, { nodes, config: cfg, invoke: () => ack() });
+    const refused = await p.call("fleet_dispatch", { node: "dev2", cwd: "/w/proj", spec: { goal: "g", base: { branch: "feature" } }, isolation: "none" }) as { ok?: boolean; error?: string };
+    expect(refused.ok).toBe(false);
+    expect(refused.error).toBe('spec.base requires isolation: "clone"');
+    expect(p.invokes).toHaveLength(0);
+    expect(await loadLedger(p.rootDir)).toEqual([]);
+    p.dispose();
+    // config-default isolation none + spec.base => refused too (never silently ignored).
+    p = loadPlugin(entry2!, { nodes, config: cfg, invoke: () => ack() });
+    const cfgRefused = await p.call("fleet_dispatch", { node: "dev2", cwd: "/w/proj", spec: { goal: "g", base: { commit: "c".repeat(40) } } }) as { ok?: boolean; error?: string };
+    expect(cfgRefused.ok).toBe(false);
+    expect(cfgRefused.error).toBe('spec.base requires isolation: "clone"');
+    expect(p.invokes).toHaveLength(0);
+    expect(await loadLedger(p.rootDir)).toEqual([]);
+  }, 30_000);
+
+  it.skipIf(!entry)("spec.base with clone is accepted; base rides the run.start payload", async () => {
+    const entry2 = entry ?? (await loadEntry());
+    restore = fakeSshMultiline(["FLEET_CWD=ok", "GITCLONE=yes", "BWRAP=no"]);
+    const nodes = [{ nodeId: "n-dev2", displayName: "dev2", connected: true, invocableCommands: ["opencode.run"] }];
+    const cfg = { nodes: { dev2: { roles: ["worker"], ssh: false } } };
+    p = loadPlugin(entry2!, { nodes, config: cfg, invoke: () => nodeReply({ ok: true, detached: true, runId: "r", pid: 1 }) });
+    const res = await p.call("fleet_dispatch", { node: "dev2", cwd: "/w/proj", spec: { goal: "g", base: { branch: "feature" } }, isolation: "clone" }) as Record<string, unknown>;
+    const row = (res.dev2 ?? res["n-dev2"]) as Record<string, unknown> | undefined;
+    expect(row, JSON.stringify(res).slice(0, 300)).toBeDefined();
+    const start = await p.waitForInvoke((c) => c.params.prompt === "__RUN_START__" && c.params.base !== undefined);
+    expect(start, JSON.stringify(res).slice(0, 300)).toBeDefined();
+    expect(start!.params.isolation).toBe("clone");
+    expect(start!.params.base).toEqual({ branch: "feature" });
+  }, 30_000);
+});
+
+describe("#105b: protocol — a base-bearing task needs protocol 6 and an older node refuses", () => {
+  it("a task with a base derives protocol 6 naming the feature; without one protocol 0", () => {
+    expect(FEATURE_MIN_PROTOCOL.base).toBe(6);
+    expect(PROTOCOL_VERSION).toBeGreaterThanOrEqual(6);
+    const r = requiredProtocol({ isolation: "clone", base: { branch: "feature" } });
+    expect(r.version).toBe(6);
+    expect(r.feature).toMatch(/spec\.base/);
+    expect(requiredProtocol({ isolation: "clone" }).version).toBe(4);
+    expect(requiredProtocol({}).version).toBe(0);
+    // a non-object or empty base needs nothing (the gateway validates the shape first)
+    expect(requiredProtocol({ base: "feature" }).version).toBe(0);
+    expect(requiredProtocol({ base: {} }).version).toBe(0);
+  });
+  for (const pv of [0, 1, 4, 5]) {
+    it(`a protocol-${pv} node refuses a base-bearing task (never clones from HEAD)`, async () => {
+      expect(pv).toBeLessThan(6);
+      const seen: Array<Record<string, unknown>> = [];
+      const ctx = (params: Record<string, unknown>): PolicyCtx => ({
+        params, node: { nodeId: "n1" },
+        invokeNode: async (a: { params: Record<string, unknown> }) => { seen.push(a.params); return { ok: true as const, payload: { ok: true, ...(pv > 0 ? { protocol: pv } : {}) } }; },
+      } as unknown as PolicyCtx);
+      const r = await handleOpencodeRunPolicy(ctx({ prompt: "__RUN_START__", op: "run.start", cwd: "/w", runId: "r1", realPrompt: "x", isolation: "clone", base: { branch: "feature" } }), newProtocolCache());
+      expect(r.ok).toBe(false);
+      expect((r as { message: string }).message).toMatch(/spec\.base/);
+      expect(seen).toHaveLength(1); // only the probe was sent; the task itself never rode to the old node
+      expect(seen[0]).toMatchObject({ prompt: "__RUN_STATUS__" });
+    });
+  }
+  it("the node itself refuses a request stamped above its protocol (end to end, naming versions)", async () => {
+    const out = JSON.parse(await handleOpencodeRun(JSON.stringify({ prompt: "__RUN_START__", op: "run.start", cwd: "/", runId: "r-prot", realPrompt: "x", protocol: PROTOCOL_VERSION + 1 })));
+    expect(out.ok).toBe(false);
+    expect(out.error).toMatch(new RegExp(`needs protocol ${PROTOCOL_VERSION + 1}.*newer than this node's protocol`));
+  });
+  it("an older-node refusal names the feature through the gateway (the #76 rule: refuse, never drop)", async () => {
+    const seen: Array<Record<string, unknown>> = [];
+    const ctx = (params: Record<string, unknown>): PolicyCtx => ({
+      params, node: { nodeId: "n-old" },
+      invokeNode: async (a: { params: Record<string, unknown> }) => { seen.push(a.params); return { ok: true as const, payload: { ok: false, error: "never reached: the gateway refuses first", protocol: 5 } }; },
+    } as unknown as PolicyCtx);
+    const r = await handleOpencodeRunPolicy(ctx({ prompt: "__RUN_START__", op: "run.start", cwd: "/w", runId: "r-prot2", realPrompt: "x", isolation: "clone", base: { commit: "e".repeat(40) } }), newProtocolCache());
+    expect(r.ok).toBe(false);
+    expect((r as { message: string }).message).toMatch(/spec\.base/);
+    expect(seen).toHaveLength(1);
+  });
+});
+
+describe("#105b: the base heads surface in audit + run.status (additive fields only)", () => {
+  it("buildManifest: no base => byte-identical fields; with base => baseHead/sourceHead and the sourceMoved note", () => {
+    const events = { commandsRecorded: false, commands: [], eventCount: 0 };
+    const log = { bytes: 0, truncated: false };
+    const base: Parameters<typeof buildManifest>[0] = {
+      runId: "r", harness: "opencode", cwd: "/w/p", startHead: "a".repeat(40),
+      finishedAt: "2026-01-01T00:05:00Z", exitCode: 0, verified: true, changes: { endHead: "a".repeat(40), files: [], diffStat: "" }, events, log,
+    };
+    const before = buildManifest(base);
+    expect("baseHead" in before).toBe(false);
+    expect("sourceHead" in before).toBe(false);
+    expect("sourceMoved" in before).toBe(false);
+    const moved = buildManifest({ ...base, baseHead: "f".repeat(40), sourceHead: "a".repeat(40), baseBranch: "feature" });
+    expect(moved.baseHead).toBe("f".repeat(40));
+    expect(moved.sourceHead).toBe("a".repeat(40));
+    expect(moved.baseBranch).toBe("feature");
+    expect(moved.sourceMoved).toBe(`clone started at ${"f".repeat(40)} (base feature); source has moved to ${"a".repeat(40)}`);
+    const unmoved = buildManifest({ ...base, baseHead: "a".repeat(40), sourceHead: "a".repeat(40) });
+    expect("sourceMoved" in unmoved).toBe(false);
+  });
 });

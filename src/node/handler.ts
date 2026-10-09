@@ -28,6 +28,7 @@ import { ensureStateDir, fleetStateDir, runPaths, xferPaths, writePrivate } from
 import { UNSET_ORIGIN_PLACEHOLDER, stableOriginCommand } from "../provision.js";
 import { resolveOp, stampProtocol, type Op } from "../protocol.js";
 import { parseScope, scopeViolations } from "../scope.js";
+import { parseBase as parseTaskSpecBase } from "../spec.js";
 import { buildManifest, capLogFile, extractEvents, parseChanges } from "../audit.js";
 import {
   OPCODE_PS_COMMAND,
@@ -340,13 +341,18 @@ OPS["run.start"] = async ({ task, io, context }: OpCtx) => {
         return JSON.stringify({ ok: false, error: `refused: unknown isolation ${JSON.stringify(String(isoMode).slice(0, 20))} (expected none|clone)` });
       }
       let eff = task;
-      let isolation: { mode: "clone"; source: string; cwd: string; branch: string; sourceDirty: boolean } | undefined;
+      let isolation: { mode: "clone"; source: string; cwd: string; branch: string; sourceDirty: boolean; baseHead?: string; sourceHead?: string } | undefined;
       let installedReferences: string[] | undefined;
       let referencesSkipped: Array<{ path?: string; reason: string }> | undefined;
       if (isoMode === "clone") {
-        const clone = await createRunClone(runId, task.cwd);
+        // Issue #105: an optional base rides the spec; the node does not trust
+        // the gateway, so it is re-validated here (shape-checked, exactly one
+        // of branch/commit) BEFORE any clone — a malformed one fails the launch.
+        const baseSpec = parseTaskSpecBase((task as { base?: unknown }).base);
+        if (!baseSpec.ok) return JSON.stringify({ ok: false, error: `refused: ${baseSpec.error}` });
+        const clone = await createRunClone(runId, task.cwd, baseSpec.base);
         if (!clone.ok) return JSON.stringify({ ok: false, error: `refused: cannot isolate the run: ${clone.error}` });
-        isolation = { mode: "clone", source: task.cwd, cwd: clone.cwd, branch: clone.branch, sourceDirty: clone.sourceDirty };
+        isolation = { mode: "clone", source: task.cwd, cwd: clone.cwd, branch: clone.branch, sourceDirty: clone.sourceDirty, ...(clone.baseHead ? { baseHead: clone.baseHead } : {}), ...(clone.sourceHead ? { sourceHead: clone.sourceHead } : {}) };
         eff = { ...task, cwd: clone.cwd };
         // Issue #283: install the spec's references INTO the clone before the worker
         // starts, so a reference the operator named is actually present to read (#262
@@ -401,6 +407,10 @@ OPS["run.start"] = async ({ task, io, context }: OpCtx) => {
       // not trust the gateway); the HEAD at start lets run.status list what changed.
       const scopeSpec = parseScope((task as { scope?: unknown }).scope);
       if (!scopeSpec.ok) return JSON.stringify({ ok: false, error: `refused: ${scopeSpec.error}` });
+      // Issue #105: the base NAME (for the drift note) is re-read from the task;
+      // it rides the run state only when a base was actually resolved in the clone.
+      const namedBase = parseTaskSpecBase((task as { base?: unknown }).base);
+      const base = isolation?.baseHead ? (namedBase.ok ? namedBase.base : undefined) : undefined;
       // The start commit is recorded for every run (issue #42 manifest, #65 scope).
       let startHead: string | undefined;
       {
@@ -421,7 +431,10 @@ OPS["run.start"] = async ({ task, io, context }: OpCtx) => {
         // final exit propagates the worker's real status.
         "set -u",
         // The script publishes its own pid/pgid/state first (issues #64, #69).
-        ...selfStateLines(statePath, { runId, harness: task.harness ?? "opencode", ...(task.piModel ? { piModel: task.piModel } : {}), cwd: eff.cwd, ...(isolation ? { isolation } : {}), ...(startHead ? { startHead } : {}), ...(scopeSpec.scope ? { scope: scopeSpec.scope } : {}) }),
+          // Issue #105: baseHead/sourceHead (+ the base NAME for the drift note)
+        // are recorded only when a base was named — the state file stays
+        // byte-identical for baseless runs.
+        ...selfStateLines(statePath, { runId, harness: task.harness ?? "opencode", ...(task.piModel ? { piModel: task.piModel } : {}), cwd: eff.cwd, ...(isolation ? { isolation } : {}), ...(startHead ? { startHead } : {}), ...(scopeSpec.scope ? { scope: scopeSpec.scope } : {}), ...(isolation?.baseHead ? { baseHead: isolation.baseHead, sourceHead: isolation.sourceHead, ...(base?.branch ? { baseBranch: base.branch } : {}) } : {}) }),
         inner,
         `EC=$?`,
         ...(gate?.verifyLines ?? []),
@@ -466,7 +479,7 @@ OPS["run.start"] = async ({ task, io, context }: OpCtx) => {
         );
       }
       const runPid = selfState?.pid ?? launcherPid;
-      return JSON.stringify({ ok: true, detached: true, runId, pid: runPid, ...(selfState?.pgid ? { pgid: selfState.pgid } : {}), pidSource: selfState ? "script" : "launcher", statePath, logPath, harness: task.harness ?? "opencode", ...(isolation ? { isolation: "clone", runCwd: isolation.cwd, branch: isolation.branch, sourceDirty: isolation.sourceDirty } : {}) });
+      return JSON.stringify({ ok: true, detached: true, runId, pid: runPid, ...(selfState?.pgid ? { pgid: selfState.pgid } : {}), pidSource: selfState ? "script" : "launcher", statePath, logPath, harness: task.harness ?? "opencode", ...(isolation ? { isolation: "clone", runCwd: isolation.cwd, branch: isolation.branch, sourceDirty: isolation.sourceDirty, ...(isolation.baseHead ? { baseHead: isolation.baseHead, sourceHead: isolation.sourceHead } : {}) } : {}) });
 };
 
 OPS["run.status"] = async ({ task, io, context }: OpCtx) => {
@@ -476,7 +489,7 @@ OPS["run.status"] = async ({ task, io, context }: OpCtx) => {
       const statePath = runStatePath(runId);
       try {
         const raw = await (await import("node:fs/promises")).readFile(statePath, "utf8");
-        const st = JSON.parse(raw) as { pid?: number; state?: string; startedAt?: string; finishedAt?: string; exitCode?: number; verified?: boolean; gateTimedOut?: boolean; gateUnavailable?: boolean; gateMissing?: string; verifyDetails?: VerifyDetails; scope?: { files: string[] }; cwd?: string; startHead?: string; changedFiles?: string[]; scopeViolations?: string[] | null; scopeError?: string; dirtyWorktree?: boolean };
+        const st = JSON.parse(raw) as { pid?: number; state?: string; startedAt?: string; finishedAt?: string; exitCode?: number; verified?: boolean; gateTimedOut?: boolean; gateUnavailable?: boolean; gateMissing?: string; verifyDetails?: VerifyDetails; scope?: { files: string[] }; cwd?: string; startHead?: string; changedFiles?: string[]; scopeViolations?: string[] | null; scopeError?: string; dirtyWorktree?: boolean; baseHead?: string; sourceHead?: string; baseBranch?: string };
         // Merge worker completion record when present (issue #6). Issue #62:
         // the record may also carry the verify-gate outcome.
         try {
@@ -548,6 +561,7 @@ OPS["run.status"] = async ({ task, io, context }: OpCtx) => {
               startedAt: st.startedAt, finishedAt: st.finishedAt, exitCode: st.exitCode, verified: st.verified, verifyDetails: st.verifyDetails,
               gateUnavailable: st.gateUnavailable === true, missing: st.gateMissing,
               scope: st.scope, changes: rawChanges ? changes : undefined, events: extractEvents(rawLog, meta.harness ?? "opencode"), log: logInfo,
+              ...(st.baseHead ? { baseHead: st.baseHead, sourceHead: st.sourceHead, ...(st.baseBranch ? { baseBranch: st.baseBranch } : {}) } : {}),
             });
             await writePrivate(paths.manifest, JSON.stringify(manifest)).catch(() => {});
           }

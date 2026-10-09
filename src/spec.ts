@@ -57,6 +57,12 @@ export interface TaskSpec {
    * the worker knows what was equipped for this task, not the whole repo.
    */
   references?: Array<{ path?: string; note?: string }>;
+  /**
+   * Issue #105: the commit/branch a run's clone STARTS from (exactly one of the
+   * two). Requires isolation "clone" (refused at dispatch otherwise) and a node
+   * of protocol 6+; the base resolves inside the clone, never from HEAD.
+   */
+  base?: { branch?: string; commit?: string };
 }
 
 /**
@@ -75,12 +81,54 @@ export type TaskSpecResult = { ok: true; spec?: TaskSpec } | { ok: false; error:
 export const MAX_ACCEPTANCE_ITEMS = 50;
 export const MAX_ACCEPTANCE_LENGTH = 1000;
 
+/** A branch ref name: no `..`, no whitespace, no leading `-`, no control chars. Plain ref names only (no `refs/...`, no `^`, `~`, `:`, `?`, `[`, `\`). */
+const BASE_BRANCH_RE = /^[A-Za-z0-9._/-]+$/;
+/** A commit is 40–64 hex chars. */
+const BASE_COMMIT_RE = /^[0-9a-f]{40,64}$/;
+
+/**
+ * Validate the optional `base` (issue #105): exactly one of `branch` (plain ref
+ * name) or `commit` (40–64 hex). Absent/null = no base, unchanged behavior;
+ * anything present must shape-check or the spec is refused, never trimmed.
+ * Exported because the node handler re-validates the untrusted task payload the
+ * same way it re-validates `scope` — one parser, one refusal path.
+ */
+export function parseBase(value: unknown): { ok: true; base?: { branch?: string; commit?: string } } | { ok: false; error: string } {
+  if (value === undefined || value === null) return { ok: true };
+  if (typeof value !== "object" || Array.isArray(value)) {
+    return { ok: false, error: "base must be an object {branch|commit}" };
+  }
+  const b = value as Record<string, unknown>;
+  const keys = Object.keys(b);
+  const unknownKeys = keys.filter((k) => k !== "branch" && k !== "commit");
+  if (unknownKeys.length) return { ok: false, error: `base has unknown key(s): ${unknownKeys.join(", ")}` };
+  const branch = b.branch;
+  const commit = b.commit;
+  if (branch !== undefined && commit !== undefined) {
+    return { ok: false, error: "base must name exactly one of branch or commit, not both" };
+  }
+  if (branch === undefined && commit === undefined) {
+    return { ok: false, error: "base must name exactly one of branch or commit" };
+  }
+  if (branch !== undefined) {
+    if (typeof branch !== "string" || branch.length === 0 || !BASE_BRANCH_RE.test(branch)
+      || branch.includes("..") || /\s/.test(branch) || branch.startsWith("-")) {
+      return { ok: false, error: `base.branch must be a plain ref name: ${JSON.stringify(String(branch).slice(0, 60))}` };
+    }
+    return { ok: true, base: { branch } };
+  }
+  if (typeof commit !== "string" || !BASE_COMMIT_RE.test(commit)) {
+    return { ok: false, error: "base.commit must be a hex commit sha (40-64 chars)" };
+  }
+  return { ok: true, base: { commit } };
+}
+
 export function parseTaskSpec(value: unknown): TaskSpecResult {
   if (value === undefined || value === null) return { ok: true, spec: undefined };
   if (typeof value !== "object" || Array.isArray(value)) {
     return { ok: false, error: "spec must be an object {goal, acceptance?, verify?}" };
   }
-  const s = value as { goal?: unknown; acceptance?: unknown; verify?: unknown; scope?: unknown };
+  const s = value as { goal?: unknown; acceptance?: unknown; verify?: unknown; scope?: unknown; base?: unknown };
   if (typeof s.goal !== "string" || s.goal.trim().length === 0) {
     return { ok: false, error: "spec.goal must be a non-empty string" };
   }
@@ -100,6 +148,8 @@ export function parseTaskSpec(value: unknown): TaskSpecResult {
   }
   const sc = parseScope(s.scope);
   if (!sc.ok) return { ok: false, error: `spec.${sc.error}` };
+  const base = parseBase(s.base);
+  if (!base.ok) return { ok: false, error: `spec.${base.error}` };
   // verify (if present) is validated by parseExpectSpec where the gate is
   // threaded — one parser, one refusal path (issue #65 slice 1).
   return { ok: true, spec: value as TaskSpec };

@@ -83,6 +83,15 @@ export function registerDispatchTools(api: OpenClawPluginApi, cfg: FleetConfig):
               },
               description: "Post-run verification gate — mapped onto the existing `expect` gate. Absent => no gate, nothing extra is emitted.",
             },
+            base: {
+              type: "object",
+              additionalProperties: false,
+              description: "The commit/branch a run's clone starts from (isolation \"clone\" only; an older node refuses it): exactly one of branch (plain ref name) or commit (hex sha). The clone runs from that state; fleet_run_status reports when the source has moved since.",
+              properties: {
+                branch: { type: "string", description: "Branch to start the clone from (resolved inside the clone as refs/remotes/origin/<branch>)." },
+                commit: { type: "string", description: "Commit sha to start the clone from (40-64 hex)." },
+              },
+            },
           },
         },
         cwd: { type: "string", description: "Working directory on the target node(s)." },
@@ -163,7 +172,7 @@ export function registerDispatchTools(api: OpenClawPluginApi, cfg: FleetConfig):
         isolation?: "none" | "clone";
         env?: Record<string, string>;
         expect?: { files?: string[]; command?: string; commands?: string[]; timeoutMs?: number };
-        spec?: { goal: string; acceptance?: string[]; verify?: { files?: string[]; command?: string; commands?: string[]; timeoutMs?: number }; scope?: { files: string[] } };
+        spec?: { goal: string; acceptance?: string[]; verify?: { files?: string[]; command?: string; commands?: string[]; timeoutMs?: number }; scope?: { files: string[] }; base?: { branch?: string; commit?: string } };
         ref?: { branch?: string; commit?: string };
         perDispatchCostUsd?: number;
         perDispatchTokens?: number;
@@ -190,6 +199,13 @@ export function registerDispatchTools(api: OpenClawPluginApi, cfg: FleetConfig):
       }
       if (!specCheck.spec && typeof raw.prompt !== "string") {
         return jsonResult({ ok: false, error: "no task given: pass `prompt`, or a structured `spec` with at least a goal (issue #65)" });
+      }
+      // Issue #105: a task that NAMES a clone base only makes sense with clone
+      // isolation. Fail closed: spec.base with isolation none (explicit or a
+      // config default) is REFUSED here — the base is never silently ignored
+      // and the run is never started un-isolated from HEAD.
+      if (specCheck.spec?.base && (raw.isolation ?? cfg.isolation ?? "none") !== "clone") {
+        return jsonResult({ ok: false, error: "spec.base requires isolation: \"clone\"" });
       }
       const p = { ...raw, prompt: specCheck.spec ? renderSpec(specCheck.spec) : (raw.prompt as string) };
       const list = await api.runtime.nodes.list();
@@ -687,6 +703,7 @@ export function registerDispatchTools(api: OpenClawPluginApi, cfg: FleetConfig):
           env: p.env,
           expect: expectSpec.expect,
           ...(specCheck.spec?.scope ? { scope: specCheck.spec.scope } : {}),
+          ...(specCheck.spec?.base ? { base: specCheck.spec.base } : {}),
           ref: p.ref,
           async: p.async !== false,
           ...(isolationMode === "clone" ? { isolation: "clone" as const } : {}),
