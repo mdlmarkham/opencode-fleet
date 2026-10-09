@@ -19,11 +19,11 @@
  *   protocol 5  adds Pi `piTools`/`piOffline`; a node below 5 would run Pi with every tool
  *               and the network, silently dropping the restriction the caller asked for
  *   protocol 6  adds the `project.read` op (raw `.fleet/` text for the gateway to re-validate); an older
- *               node would take its sentinel for an ordinary task prompt. Also `spec.base`: a node
- *               below 6 would clone from HEAD as if no base were named
+ *               node would take its sentinel for an ordinary task prompt
+ *   protocol 7  adds `spec.base`: a node below 7 would clone from HEAD as if no base were named
  */
 
-export const PROTOCOL_VERSION = 6;
+export const PROTOCOL_VERSION = 7;
 
 /** Ops that only a node of at least this protocol understands (absent = any node). */
 export const OP_MIN_PROTOCOL: Readonly<Record<string, number>> = { "state.prune": 3, "project.read": 6 };
@@ -35,7 +35,7 @@ export function requiredProtocolForOp(op: string): { version: number; feature?: 
 }
 
 /** Minimum node protocol a request feature needs; a node below it would silently ignore the field. */
-export const FEATURE_MIN_PROTOCOL = { harness: 1, expect: 2, isolation: 4, piSandbox: 5, base: 6 } as const;
+export const FEATURE_MIN_PROTOCOL = { harness: 1, expect: 2, isolation: 4, piSandbox: 5, base: 7 } as const;
 
 /**
  * The lowest node protocol that can honor every non-default feature on this

@@ -86,7 +86,7 @@ export function registerDispatchTools(api: OpenClawPluginApi, cfg: FleetConfig):
             base: {
               type: "object",
               additionalProperties: false,
-              description: "The commit/branch a run's clone starts from, exactly one of branch (plain ref name) or commit (hex sha). Needs isolation \"clone\"; an older node refuses it. fleet_run_status notes source drift.",
+              description: "The commit/branch a run's clone starts from, exactly one of branch (plain ref name) or commit (hex sha). Needs isolation \"clone\"; an older node refuses it. fleet_run_audit notes source drift.",
               properties: {
                 branch: { type: "string", description: "Branch the clone starts from (resolved inside the clone as origin/<branch>)." },
                 commit: { type: "string", description: "Commit sha (40-64 hex) the clone starts from." },

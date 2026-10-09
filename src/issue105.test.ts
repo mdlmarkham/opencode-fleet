@@ -516,12 +516,12 @@ describe("#105b: dispatch-level pure seams (fail-closed spec.base)", () => {
   }, 30_000);
 });
 
-describe("#105b: protocol — a base-bearing task needs protocol 6 and an older node refuses", () => {
-  it("a task with a base derives protocol 6 naming the feature; without one protocol 0", () => {
-    expect(FEATURE_MIN_PROTOCOL.base).toBe(6);
-    expect(PROTOCOL_VERSION).toBeGreaterThanOrEqual(6);
+describe("#105b: protocol — a base-bearing task needs protocol 7 and an older node refuses", () => {
+  it("a task with a base derives protocol 7 naming the feature; without one protocol 0", () => {
+    expect(FEATURE_MIN_PROTOCOL.base).toBe(7);
+    expect(PROTOCOL_VERSION).toBeGreaterThanOrEqual(7);
     const r = requiredProtocol({ isolation: "clone", base: { branch: "feature" } });
-    expect(r.version).toBe(6);
+    expect(r.version).toBe(7);
     expect(r.feature).toMatch(/spec\.base/);
     expect(requiredProtocol({ isolation: "clone" }).version).toBe(4);
     expect(requiredProtocol({}).version).toBe(0);
@@ -529,9 +529,11 @@ describe("#105b: protocol — a base-bearing task needs protocol 6 and an older 
     expect(requiredProtocol({ base: "feature" }).version).toBe(0);
     expect(requiredProtocol({ base: {} }).version).toBe(0);
   });
-  for (const pv of [0, 1, 4, 5]) {
+  // pv 6 is TODAY's shipped protocol (project.read, #210): the exact skew case —
+  // it must be refused for a base-bearing task, never silently cloning from HEAD.
+  for (const pv of [0, 1, 4, 5, 6]) {
     it(`a protocol-${pv} node refuses a base-bearing task (never clones from HEAD)`, async () => {
-      expect(pv).toBeLessThan(6);
+      expect(pv).toBeLessThan(7);
       const seen: Array<Record<string, unknown>> = [];
       const ctx = (params: Record<string, unknown>): PolicyCtx => ({
         params, node: { nodeId: "n1" },
@@ -548,6 +550,20 @@ describe("#105b: protocol — a base-bearing task needs protocol 6 and an older 
     const out = JSON.parse(await handleOpencodeRun(JSON.stringify({ prompt: "__RUN_START__", op: "run.start", cwd: "/", runId: "r-prot", realPrompt: "x", protocol: PROTOCOL_VERSION + 1 })));
     expect(out.ok).toBe(false);
     expect(out.error).toMatch(new RegExp(`needs protocol ${PROTOCOL_VERSION + 1}.*newer than this node's protocol`));
+  });
+  it("the reviewer's probe: a node answering protocol 6 is refused a base-bearing task at the same policy seam (c6bff095 ACCEPTED this)", async () => {
+    const seen: Array<Record<string, unknown>> = [];
+    const ctx = (params: Record<string, unknown>): PolicyCtx => ({
+      params, node: { nodeId: "n-probe6" },
+      invokeNode: async (a: { params: Record<string, unknown> }) => { seen.push(a.params); return { ok: true as const, payload: { ok: false, error: "never reached: the gateway refuses first", protocol: 6 } }; },
+    } as unknown as PolicyCtx);
+    const r = await handleOpencodeRunPolicy(ctx({ prompt: "__RUN_START__", op: "run.start", cwd: "/w", runId: "r-probe6", realPrompt: "x", isolation: "clone", base: { branch: "feature" } }), newProtocolCache());
+    expect(r.ok).toBe(false);
+    expect((r as { message: string }).message).toMatch(/spec\.base/);
+    expect((r as { message: string }).message).toMatch(/protocol 6 \(< 7\)/);
+    // Not dispatched: only the probe rode to the node; no base-bearing task ever did.
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({ prompt: "__RUN_STATUS__" });
   });
   it("an older-node refusal names the feature through the gateway (the #76 rule: refuse, never drop)", async () => {
     const seen: Array<Record<string, unknown>> = [];

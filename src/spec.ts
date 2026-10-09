@@ -60,7 +60,7 @@ export interface TaskSpec {
   /**
    * Issue #105: the commit/branch a run's clone STARTS from (exactly one of the
    * two). Requires isolation "clone" (refused at dispatch otherwise) and a node
-   * of protocol 6+; the base resolves inside the clone, never from HEAD.
+   * of protocol 7+; the base resolves inside the clone, never from HEAD.
    */
   base?: { branch?: string; commit?: string };
 }

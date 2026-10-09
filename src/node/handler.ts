@@ -431,7 +431,7 @@ OPS["run.start"] = async ({ task, io, context }: OpCtx) => {
         // final exit propagates the worker's real status.
         "set -u",
         // The script publishes its own pid/pgid/state first (issues #64, #69).
-          // Issue #105: baseHead/sourceHead (+ the base NAME for the drift note)
+        // Issue #105: baseHead/sourceHead (+ the base NAME for the drift note)
         // are recorded only when a base was named — the state file stays
         // byte-identical for baseless runs.
         ...selfStateLines(statePath, { runId, harness: task.harness ?? "opencode", ...(task.piModel ? { piModel: task.piModel } : {}), cwd: eff.cwd, ...(isolation ? { isolation } : {}), ...(startHead ? { startHead } : {}), ...(scopeSpec.scope ? { scope: scopeSpec.scope } : {}), ...(isolation?.baseHead ? { baseHead: isolation.baseHead, sourceHead: isolation.sourceHead, ...(base?.branch ? { baseBranch: base.branch } : {}) } : {}) }),
