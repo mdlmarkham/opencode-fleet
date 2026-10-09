@@ -53,6 +53,8 @@ export interface GateContext {
   liveAnywhere?: InFlightRun[];
   /** Whether the new run gets its own clone (isolation "clone"). */
   isolated?: boolean;
+  /** Registered shared lines the repo asked to serialize (issue #260 item 3), same shapes as scope.files. Absent: no check. */
+  sharedLines?: string[];
   bounds?: Partial<GateBounds>;
 }
 
@@ -263,6 +265,31 @@ function checks(spec: TaskSpec, ctx: GateContext): Objection[] {
     : [];
   if (isolatedOverlap.length > 0) {
     out.push(objection({ id: "overlap.merge", severity: "nudge", message: "Overlapping scope with a run in a separate clone: no clobbering, but the branches will conflict at sync time.", evidence: `in-flight run(s) with overlapping scope: ${isolatedOverlap.map((r) => r.runId).join(", ")}`, suggestion: "Serialise them or expect a merge conflict at fleet_sync." }));
+  }
+  // Issue #260 item 3: registered shared lines. Every tool-adder edits the same paths (the SKILL tools
+  // table, the schema ratchet, contracts.tools), so two live specs touching a registered line conflict
+  // pairwise at sync time. A nudge only — ordering the specs is enough; it must never break a dispatch.
+  const sharedParsed = parseScope({ files: ctx.sharedLines });
+  const sharedPatterns = sharedParsed.ok && sharedParsed.scope ? sharedParsed.scope.files : [];
+  if (myScope && sharedPatterns.length > 0) {
+    const competing = live
+      .map((r) => {
+        const t = parseScope(r.scope);
+        if (!t.ok || !t.scope) return undefined;
+        const lines = sharedPatterns.filter((line) => scopeOverlap(myScope, { files: [line] }) && scopeOverlap(t.scope!, { files: [line] }));
+        return lines.length > 0 ? { runId: r.runId, lines } : undefined;
+      })
+      .filter((x): x is { runId: string; lines: string[] } => x !== undefined);
+    if (competing.length > 0) {
+      const lines = [...new Set(competing.flatMap((c) => c.lines))];
+      out.push(objection({
+        id: "overlap.shared-line",
+        severity: "nudge",
+        message: "Two live runs edit a registered shared line; order them instead of interleaving.",
+        evidence: `shared line(s) ${lines.map((l) => `"${l}"`).join(", ")} with in-flight run(s) ${competing.map((c) => c.runId).join(", ")}`,
+        suggestion: "Serialize the specs: dispatch them in order (or decompose and sequence the parts); otherwise expect merge conflicts at sync time.",
+      }));
+    }
   }
   return out;
 }

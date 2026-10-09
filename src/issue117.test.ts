@@ -103,7 +103,9 @@ describe.skipIf(!entry)("#117: tools", () => {
     expect(bad.objections[0].id).toBe("overlap.in-flight");
     expect(await p.call("fleet_design_check", { spec: GOOD })).toMatchObject({ verdict: "accept", overlapChecked: false });
     expect(await p.call("fleet_design_check", { spec: { acceptance: ["x"] } })).toMatchObject({ ok: false });
-    expect(p.invokes).toHaveLength(0);
+    // Issue #260 item 3: node+cwd now also reads the repo's shared-line registry (a project.read
+    // invoke, fail-open); with no launch the only invoke is that read.
+    expect(p.invokes.every((c) => c.params.prompt === "__PROJECT_READ__" && c.params.op === "project.read")).toBe(true);
   });
   it("advise (default): the verdict rides along, the dispatch still happens", async () => {
     p = loadPlugin(entry!, { nodes: NODES, config: cfg(), invoke: ok });

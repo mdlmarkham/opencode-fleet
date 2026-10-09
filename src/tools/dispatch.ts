@@ -458,9 +458,23 @@ export function registerDispatchTools(api: OpenClawPluginApi, cfg: FleetConfig):
         });
         // Issue #260: the claim check looks at this checkout on every node, not only the targets.
         const anywhere = capacityInputFromLedger(await loadLedger(rootDir) as never, { cwd: p.cwd, now: Date.now(), staleAfterMs: capacityStaleAfter(cfg.capacity) });
+        // Issue #260 item 3: the repo's registered shared lines ride into the gate as a nudge only.
+        // Fail-open: whatever goes wrong here (timeout, unreadable, absent, invalid) leaves the
+        // gate input untouched — dispatch behavior is byte-identical when the record is unavailable.
+        let sharedLines: string[] | undefined;
+        try {
+          const firstTarget = opencodeTargets[0];
+          if (firstTarget) {
+            const { ingestRemoteProject } = await import("../project-remote.js");
+            const reply = payloadOf(await api.runtime.nodes.invoke({ nodeId: firstTarget.nodeId, command: "opencode.run", params: { prompt: "__PROJECT_READ__", cwd: p.cwd, transport: "http", op: "project.read" }, timeoutMs: 20_000 }));
+            const ing = ingestRemoteProject(reply);
+            if (ing.ok && ing.result.present && Array.isArray(ing.result.record.serialize)) sharedLines = ing.result.record.serialize;
+          }
+        } catch { /* fail-open: no shared lines, no objection, unchanged dispatch */ }
         const gate = evaluateDesignGate(specCheck.spec, {
           inFlight: gateInput.inFlight,
           liveAnywhere: anywhere.inFlight,
+          ...(sharedLines ? { sharedLines } : {}),
           isolated: (p.isolation ?? cfg.isolation ?? "none") === "clone",
           bounds: { ...(cfg.project?.maxScopePatterns ? { maxScopePatterns: cfg.project.maxScopePatterns } : {}), ...(cfg.project?.maxAcceptanceItems ? { maxAcceptanceItems: cfg.project.maxAcceptanceItems } : {}) },
         }, ackCheck.acks);
