@@ -230,9 +230,26 @@ export function registerProjectTools(api: OpenClawPluginApi, cfg: FleetConfig): 
         ? gateInput.inFlight.filter((r) => r.node === p.node)
         : [];
       const recentlyFinished = p.node && p.cwd ? gateInput.recentlyFinished : [];
+      // Issue #260 item 3: the repo's registered shared lines ride into the gate as a nudge only.
+      // Fail-open: any failure (timeout, unreadable, absent, invalid) leaves sharedLines undefined
+      // and the verdict byte-identical; this must never break a design check.
+      let sharedLines: string[] | undefined;
+      try {
+        if (p.node && p.cwd) {
+          const list = await api.runtime.nodes.list();
+          const node = (list.nodes ?? []).find((n) => n.displayName === p.node || n.nodeId === p.node);
+          if (node) {
+            const reply = payloadOf(await api.runtime.nodes.invoke({ nodeId: node.nodeId, command: "opencode.run", params: { prompt: "__PROJECT_READ__", cwd: p.cwd, transport: "http", op: "project.read" }, timeoutMs: 20_000 }));
+            const { ingestRemoteProject } = await import("../project-remote.js");
+            const ing = ingestRemoteProject(reply);
+            if (ing.ok && ing.result.present && Array.isArray(ing.result.record.serialize)) sharedLines = ing.result.record.serialize;
+          }
+        }
+      } catch { /* fail-open: no shared lines, no objection, unchanged verdict */ }
       const gate = evaluateDesignGate(specCheck.spec, {
         inFlight,
         liveAnywhere: p.cwd ? gateInput.inFlight : [],
+        ...(sharedLines ? { sharedLines } : {}),
         isolated: (p.isolation ?? cfg.isolation ?? "none") === "clone",
         bounds: { ...(cfg.project?.maxScopePatterns ? { maxScopePatterns: cfg.project.maxScopePatterns } : {}), ...(cfg.project?.maxAcceptanceItems ? { maxAcceptanceItems: cfg.project.maxAcceptanceItems } : {}) },
       }, ackCheck.acks);

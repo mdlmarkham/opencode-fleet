@@ -1,4 +1,10 @@
 schemaVersion: 1
+# Paths every tool-adder edits (SKILL.md tools table, the SCHEMA_BUDGET_CHARS ratchet, contracts.tools):
+# two live specs touching any of them must be ordered, never interleaved (issue #260 item 3).
+serialize:
+  - skills/opencode-fleet/SKILL.md
+  - src/issue171.test.ts
+  - openclaw.plugin.json
 rules:
   - id: protocol-older-node-test
     severity: block-candidate

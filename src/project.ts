@@ -180,13 +180,23 @@ export function parseRule(raw: unknown, file: string, at: string, allowBlock: bo
   };
 }
 
-export function parseRules(text: string, file = "rules.yml", allowBlock = false): { rules: Rule[]; errors: ProjectError[] } {
+/** Serialized shared lines (issue #260 item 3): the same repo-relative path/glob shapes a task scope allows. */
+function parseSerialize(raw: unknown, file: string, errors: ProjectError[]): string[] | undefined {
+  if (raw === undefined) return undefined;
+  const sc = parseScope({ files: raw });
+  if (!sc.ok) errors.push({ file, field: "serialize", message: sc.error });
+  else if (sc.scope?.files.length) return sc.scope.files;
+  return undefined;
+}
+
+export function parseRules(text: string, file = "rules.yml", allowBlock = false): { rules: Rule[]; serialize?: string[]; errors: ProjectError[] } {
   const errors: ProjectError[] = [];
   const y = parseYaml(text, file);
   if (!y.ok) return { rules: [], errors: [y.error] };
   if (!isObj(y.value)) return { rules: [], errors: [{ file, message: "must be a mapping with schemaVersion and rules" }] };
-  unknownKeys(y.value, ["schemaVersion", "rules"], file, "", errors);
+  unknownKeys(y.value, ["schemaVersion", "rules", "serialize"], file, "", errors);
   if (y.value.schemaVersion !== PROJECT_SCHEMA_VERSION) errors.push({ file, field: "schemaVersion", message: `must be ${PROJECT_SCHEMA_VERSION}` });
+  const serialize = parseSerialize(y.value.serialize, file, errors);
   const list = y.value.rules;
   if (!Array.isArray(list)) return { rules: [], errors: [...errors, { file, field: "rules", message: "must be a list" }] };
   if (list.length > MAX_RULES) return { rules: [], errors: [...errors, { file, field: "rules", message: `more than ${MAX_RULES} rules` }] };
@@ -199,7 +209,7 @@ export function parseRules(text: string, file = "rules.yml", allowBlock = false)
     seen.add(r.id);
     rules.push(r);
   });
-  return { rules: errors.length ? [] : rules, errors };
+  return { rules: errors.length ? [] : rules, serialize: errors.length ? undefined : serialize, errors };
 }
 
 // ---------------------------------------------------------------------------
@@ -331,6 +341,8 @@ export interface ProjectRecord {
   schemaVersion: number;
   charter?: Charter;
   rules: EffectiveRule[];
+  /** Repo-registered shared lines (issue #260 item 3): paths two live runs must not edit concurrently. Absent: none registered. */
+  serialize?: string[];
   decisions: Decision[];
   errors: ProjectError[];
   warnings: string[];
@@ -354,10 +366,12 @@ export function buildProjectRecord(input: ProjectInput): ProjectRecord {
     if (opErrors.length) { errors.push(...opErrors); operatorRules = []; }
   }
   let repoRules: Rule[] = [];
+  let serialize: string[] | undefined;
   if (input.rulesText !== undefined) {
     const r = parseRules(input.rulesText, "rules.yml", false);
     errors.push(...r.errors);
     repoRules = r.rules;
+    serialize = r.serialize;
   }
   const merged = mergeRules({ builtin: input.builtinRules, operator: operatorRules, repo: repoRules, allowRepoBlocking: input.operator?.allowRepoBlocking === true });
   warnings.push(...merged.warnings);
@@ -381,5 +395,5 @@ export function buildProjectRecord(input: ProjectInput): ProjectRecord {
     const have = charter ? (charter as unknown as Record<string, unknown>)[req] : undefined;
     if (have === undefined) errors.push({ file: "charter.md", field: req, message: `required by the operator but missing` });
   }
-  return { schemaVersion: PROJECT_SCHEMA_VERSION, ...(charter ? { charter } : {}), rules: merged.rules, decisions, errors, warnings };
+  return { schemaVersion: PROJECT_SCHEMA_VERSION, ...(charter ? { charter } : {}), rules: merged.rules, decisions, errors, warnings, ...(serialize ? { serialize } : {}) };
 }
