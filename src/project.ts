@@ -33,10 +33,27 @@ function unknownKeys(o: Record<string, unknown>, allowed: readonly string[], fil
   for (const k of Object.keys(o)) if (!allowed.includes(k)) errors.push({ file, field: at ? `${at}.${k}` : k, message: `unknown key "${k}" (allowed: ${allowed.join(", ")})` });
 }
 
-/** Strict, alias-free YAML: no anchors/aliases (alias bombs), no duplicate keys, core schema only. */
+/**
+ * Strict, alias-free YAML: no anchors/aliases (alias bombs), no duplicate keys, core schema only.
+ * Issue #313: an unquoted ` #` starts a YAML comment, so `- text (the #263 incident).` parses as `text (the` with the
+ * citation silently dropped. A plain scalar whose trailing comment starts with no space (`#263`, `#word`) is almost
+ * certainly content, not a comment: reject it, naming the dropped text, and say to quote the value.
+ */
 export function parseYaml(text: string, file: string): { ok: true; value: unknown } | { ok: false; error: ProjectError } {
   try {
-    return { ok: true, value: YAML.parse(text, { schema: "core", maxAliasCount: 0, uniqueKeys: true, strict: true }) as unknown };
+    const doc = YAML.parseDocument(text, { schema: "core", uniqueKeys: true, strict: true });
+    if (doc.errors.length) throw doc.errors[0];
+    let swallowed: { value: string; dropped: string } | undefined;
+    YAML.visit(doc, {
+      Scalar(_k, node) {
+        if (swallowed || node.type !== "PLAIN" || typeof node.comment !== "string") return;
+        if (/^\S/.test(node.comment)) swallowed = { value: String(node.value), dropped: `#${node.comment.split("\n")[0]}` };
+      },
+    });
+    if (swallowed) {
+      return { ok: false, error: { file, message: `unquoted " #" ends the value "${swallowed.value}" and silently drops "${swallowed.dropped}"; quote the whole value` } };
+    }
+    return { ok: true, value: doc.toJS({ maxAliasCount: 0 }) as unknown };
   } catch (e) {
     return { ok: false, error: { file, message: `invalid YAML: ${(e as Error).message.split("\n")[0]}` } };
   }
