@@ -20,9 +20,10 @@
  *               and the network, silently dropping the restriction the caller asked for
  *   protocol 6  adds the `project.read` op (raw `.fleet/` text for the gateway to re-validate); an older
  *               node would take its sentinel for an ordinary task prompt
+ *   protocol 7  adds `spec.base`: a node below 7 would clone from HEAD as if no base were named
  */
 
-export const PROTOCOL_VERSION = 6;
+export const PROTOCOL_VERSION = 7;
 
 /** Ops that only a node of at least this protocol understands (absent = any node). */
 export const OP_MIN_PROTOCOL: Readonly<Record<string, number>> = { "state.prune": 3, "project.read": 6 };
@@ -34,13 +35,13 @@ export function requiredProtocolForOp(op: string): { version: number; feature?: 
 }
 
 /** Minimum node protocol a request feature needs; a node below it would silently ignore the field. */
-export const FEATURE_MIN_PROTOCOL = { harness: 1, expect: 2, isolation: 4, piSandbox: 5 } as const;
+export const FEATURE_MIN_PROTOCOL = { harness: 1, expect: 2, isolation: 4, piSandbox: 5, base: 7 } as const;
 
 /**
  * The lowest node protocol that can honor every non-default feature on this
  * request (0 when it uses none). Only launching ops carry such features.
  */
-export function requiredProtocol(task: { harness?: unknown; expect?: unknown; isolation?: unknown; piTools?: unknown; piOffline?: unknown }): { version: number; feature?: string } {
+export function requiredProtocol(task: { harness?: unknown; expect?: unknown; isolation?: unknown; piTools?: unknown; piOffline?: unknown; base?: unknown }): { version: number; feature?: string } {
   let version = 0;
   let feature: string | undefined;
   if (typeof task.harness === "string" && task.harness && task.harness !== "opencode") {
@@ -59,7 +60,18 @@ export function requiredProtocol(task: { harness?: unknown; expect?: unknown; is
     version = FEATURE_MIN_PROTOCOL.piSandbox;
     feature = "Pi tool/network restrictions (piTools, piOffline)";
   }
+  if (isNamedBase(task.base) && FEATURE_MIN_PROTOCOL.base > version) {
+    version = FEATURE_MIN_PROTOCOL.base;
+    feature = "spec.base (the clone's start commit/branch)";
+  }
   return { version, feature };
+}
+
+/** Issue #105: a present, shape-checked clone base — an object naming branch or commit. */
+function isNamedBase(base: unknown): boolean {
+  if (typeof base !== "object" || base === null || Array.isArray(base)) return false;
+  const b = base as { branch?: unknown; commit?: unknown };
+  return (typeof b.branch === "string" && b.branch.length > 0) || (typeof b.commit === "string" && b.commit.length > 0);
 }
 
 /** Sentinel prompt -> op. Anything else is an ordinary task prompt (op "run"). */

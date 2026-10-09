@@ -262,7 +262,7 @@ describe.skipIf(!entry)("#260 item 3: wiring — the registry rides into the gat
   it("the node protocol is intact: project.read needs protocol 6 and carries no launch features", async () => {
     const { OP_MIN_PROTOCOL, PROTOCOL_VERSION } = await import("./protocol.js");
     expect(OP_MIN_PROTOCOL["project.read"]).toBe(6);
-    expect(PROTOCOL_VERSION).toBe(6);
+    expect(PROTOCOL_VERSION).toBeGreaterThanOrEqual(6);
   });
 });
 

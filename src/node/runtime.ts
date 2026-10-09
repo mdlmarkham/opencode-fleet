@@ -724,7 +724,9 @@ export function runCloneDir(sourceCwd: string, runId: string): string {
   return `${dirname(resolve(sourceCwd))}/.fleet-runs/${runId}`;
 }
 
-export type CloneResult = { ok: true; cwd: string; branch: string; sourceDirty: boolean } | { ok: false; error: string };
+export type CloneResult =
+  | { ok: true; cwd: string; branch: string; sourceDirty: boolean; baseHead?: string; sourceHead?: string }
+  | { ok: false; error: string };
 
 async function git(args: string[], cwd?: string): Promise<{ ok: boolean; out: string }> {
   const { execFile } = await import("node:child_process");
@@ -742,8 +744,16 @@ async function git(args: string[], cwd?: string): Promise<{ ok: boolean; out: st
  * run never shares `.git` with the source, so a hook or config written by one run
  * cannot execute in another's or in the source checkout. Only COMMITTED state is
  * cloned; uncommitted changes in the source are reported via `sourceDirty`.
+ *
+ * Issue #105: `base` names the commit the clone STARTS from — `refs/remotes/origin/<branch>`
+ * for a branch (the --local clone copies the source's branches as origin/*), a verified
+ * sha for a commit. It resolves INSIDE the clone; an unresolvable base fails the run
+ * (the run dir is removed), never falling back to HEAD. The run branch is created AT the
+ * base; `sourceHead` (the source checkout's HEAD, computed pre-clone) and `baseHead`
+ * (the resolved base commit) are recorded so callers can report source drift. No
+ * base => byte-identical behavior (branch at the clone's HEAD, no extra fields).
  */
-export async function createRunClone(runId: string, sourceCwd: string): Promise<CloneResult> {
+export async function createRunClone(runId: string, sourceCwd: string, base?: { branch?: string; commit?: string }): Promise<CloneResult> {
   const fsp = await import("node:fs/promises");
   let runDir: string;
   try {
@@ -753,6 +763,7 @@ export async function createRunClone(runId: string, sourceCwd: string): Promise<
   }
   const head = await git(["-C", sourceCwd, "rev-parse", "--verify", "HEAD"]);
   if (!head.ok) return { ok: false, error: `${sourceCwd} is not a git checkout with at least one commit` };
+  const sourceHead = head.out;
   const dirty = await git(["-C", sourceCwd, "status", "--porcelain"]);
   const cwd = `${runDir}/repo`;
   try {
@@ -765,14 +776,31 @@ export async function createRunClone(runId: string, sourceCwd: string): Promise<
   const steps: string[][] = [
     ["clone", "-q", "--local", "--no-hardlinks", "--", resolve(sourceCwd), cwd],
     ["-C", cwd, "config", "core.hooksPath", "/dev/null"],
-    ["-C", cwd, "checkout", "-q", "-b", branch],
   ];
+  if (!base) steps.push(["-C", cwd, "checkout", "-q", "-b", branch]); // no base: byte-identical (branch at the clone's HEAD)
   for (const a of steps) {
     const r = await git(a);
     if (!r.ok) {
       await fsp.rm(runDir, { recursive: true, force: true }).catch(() => {});
       return { ok: false, error: `git ${a[0] === "-C" ? a[2] : a[0]} failed: ${r.out.slice(0, 200)}` };
     }
+  }
+  if (base) {
+    // Resolve the base IN THE CLONE (never in the source, never HEAD).
+    const rev = base.commit ?? `refs/remotes/origin/${base.branch}`;
+    const named = base.commit ?? base.branch!;
+    const found = await git(["-C", cwd, "rev-parse", "--verify", "--end-of-options", `${rev}^{commit}`]);
+    if (!found.ok || !/^[0-9a-f]{40,64}$/.test(found.out)) {
+      await fsp.rm(runDir, { recursive: true, force: true }).catch(() => {});
+      return { ok: false, error: `base ${base.commit ? "commit" : "branch"} ${named} not present in the clone` };
+    }
+    const baseHead = found.out;
+    const at = await git(["-C", cwd, "checkout", "-q", "-b", branch, baseHead]);
+    if (!at.ok) {
+      await fsp.rm(runDir, { recursive: true, force: true }).catch(() => {});
+      return { ok: false, error: `git checkout failed: ${at.out.slice(0, 200)}` };
+    }
+    return { ok: true, cwd, branch, sourceDirty: dirty.ok && dirty.out.length > 0, baseHead, sourceHead };
   }
   return { ok: true, cwd, branch, sourceDirty: dirty.ok && dirty.out.length > 0 };
 }

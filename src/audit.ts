@@ -172,6 +172,12 @@ export interface ManifestInput {
   gateUnavailable?: boolean;
   missing?: string;
   scope?: { files: string[] };
+  /** Issue #105: the resolved base commit (present only when the task named a base). */
+  baseHead?: string;
+  /** Issue #105: the source checkout's HEAD at clone time; baseHead !== sourceHead means the source moved. */
+  sourceHead?: string;
+  /** Issue #105: the base branch name, when the base was a branch (for the drift note). */
+  baseBranch?: string;
   changes?: Changes;
   events: Commands;
   log: { bytes: number; truncated: boolean; originalBytes?: number };
@@ -200,6 +206,9 @@ export function buildManifest(i: ManifestInput) {
     ...(i.verifyDetails != null ? { verifyDetails: i.verifyDetails } : {}),
     startHead: i.startHead ?? null,
     endHead: i.changes?.endHead ?? null,
+    // Issue #105: present only when the task NAMED a clone base; the note flags
+    // source drift (the source checkout has commits the clone does not).
+    ...(i.baseHead ? { baseHead: i.baseHead, sourceHead: i.sourceHead ?? null, ...(i.baseBranch ? { baseBranch: i.baseBranch } : {}), ...(i.sourceHead && i.baseHead !== i.sourceHead ? { sourceMoved: `clone started at ${i.baseHead} (base${i.baseBranch ? ` ${i.baseBranch}` : ""}); source has moved to ${i.sourceHead}` } : {}) } : {}),
     // Issue #271: true only when the run left changes uncommitted with the
     // branch tip at base (a silent data-loss shape for fleet_sync);
     // undefined (field omitted) otherwise — byte-identical manifests for
