@@ -91,6 +91,7 @@ If the operator set `sync.requireVerified` / `blockOnScopeViolation` / `requireR
 | Set up nodes | `fleet_provision`, `fleet_provision_config`, `fleet_cleanup` |
 | Gates, review, projects | `fleet_design_check`, `fleet_review`, `fleet_sync`, `fleet_project_start`, `fleet_project_show`, `fleet_mission_show`, `fleet_mission_project`, `fleet_project_upkeep` |
 | Recipes | `fleet_recipe_recommend`, `fleet_recipe_record`, `fleet_recipe_list` |
+| PRs | `fleet_prs` (read-only: open PRs, stacks, base merged and not retargeted) |
 | Operator only | `fleet_deploy` (build and install the plugin; apply with a gateway restart, not a reload) |
 
 ## Hard rules

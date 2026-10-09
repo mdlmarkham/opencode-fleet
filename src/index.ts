@@ -30,6 +30,7 @@ import { registerReviewTools } from "./tools/review.js";
 import { registerNodesTools } from "./tools/nodes.js";
 import { registerProvisionTools } from "./tools/provision.js";
 import { registerRecipesTools } from "./tools/recipes.js";
+import { registerPrsTools } from "./tools/prs.js";
 import type { FleetConfig } from "./tools/shared.js";
 
 /**
@@ -300,5 +301,6 @@ export default definePluginEntry({
     registerNodesTools(api, cfg);
     registerProvisionTools(api, cfg);
     registerRecipesTools(api, cfg);
+    registerPrsTools(api, cfg);
   },
 });
