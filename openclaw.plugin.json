@@ -386,7 +386,8 @@
       "fleet_project_start",
       "fleet_project_upkeep",
       "fleet_mission_abort",
-      "fleet_board"
+      "fleet_board",
+      "fleet_prs"
     ]
   }
 }

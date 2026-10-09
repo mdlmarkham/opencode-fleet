@@ -9,7 +9,8 @@ import { loadEntry, loadPlugin } from "./testkit/plugin.js";
 // Ratcheted down to 39_200 in #239; raised to 39800 in #132: fleet_mission_project and the projection config block.
 // Ratcheted down to 39_200 in #239; raised in #124: fleet_mission_abort (kill switch).
 // Combined in #132 merge: projection additions over #124's autonomy additions. Merged actual 40_286.
-export const SCHEMA_BUDGET_CHARS = 41_200;
+// Raised to 41_720 in #260 item 2: fleet_prs (read-only PR stack check), trimmed to a 514-char footprint.
+export const SCHEMA_BUDGET_CHARS = 41_720;
 // Per tool: no single tool may balloon unnoticed.
 export const PER_TOOL_BUDGET_CHARS = 10_000;
 
