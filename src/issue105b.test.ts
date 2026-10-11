@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { diskFreeCommand, diskHeadroom, parseFreeKb } from "./capacity.js";
+import { loadLedger, upsertRun, type LedgerEntry } from "./ledger.js";
 import { fakeSshMultiline, loadEntry, loadPlugin, nodeReply, type Loaded } from "./testkit/plugin.js";
 
 describe("#105: disk headroom", () => {
@@ -55,5 +56,19 @@ describe("#105: fleet_dispatch honours capacity.minFreeDiskGb for isolated runs"
     const r = await dispatch({ isolation: "none" });
     expect(r.dev2?.reason).toBeUndefined();
     expect(starts()).toHaveLength(1);
+  });
+  it("a refused second run leaves the first's slot (and entry) exactly as they were", async () => {
+    await setup("FREE_KB=1048576", { minFreeDiskGb: 5 });
+    await upsertRun(p!.rootDir, {
+      runId: "held-run", node: "dev2", nodeId: "n-dev2", cwd: "/w/proj", prompt: "first",
+      startedAt: new Date().toISOString(), updatedAt: new Date().toISOString(), state: "running",
+    } as LedgerEntry);
+    const r = await dispatch();
+    expect(r.dev2).toMatchObject({ ok: false, retryable: true, reason: "no-disk", freeGb: 1 });
+    expect(starts()).toHaveLength(0);
+    // The pre-existing run is untouched — its slot stays held, nothing new was started.
+    const ledger = await loadLedger(p!.rootDir);
+    expect(ledger).toHaveLength(1);
+    expect(ledger[0]).toMatchObject({ runId: "held-run", node: "dev2", state: "running" });
   });
 });
