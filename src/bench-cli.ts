@@ -18,7 +18,7 @@
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { loadCorpus, renderReport, summarize, type BenchObservation } from "./benchmark.js";
+import { isIntervention, loadCorpus, observationFromRecord, renderReport, summarize, type BenchObservation } from "./benchmark.js";
 
 function arg(name: string, def?: string): string | undefined {
   const i = process.argv.indexOf(`--${name}`);
@@ -42,9 +42,20 @@ export type DispatchFn = (input: {
   model?: string;
 }) => Promise<{ runId: string } | { error: string }>;
 
-/** One status poll; returns the run's verified/failed outcome. Injected for tests. */
+/** One status poll; returns the run's verified/failed/intervention outcome. Injected for tests. */
 export type StatusFn = (input: { node: string; runId: string }) => Promise<
-  { verified: boolean | null; failed: boolean; durationMs?: number; costUsd?: number; tokens?: number } | { error: string }
+  {
+    verified: boolean | null;
+    failed: boolean;
+    /** Issue #112: the run record's abnormal-outcome fields, read as data. */
+    handRaised?: boolean;
+    gateTimedOut?: boolean;
+    gateUnavailable?: boolean;
+    state?: string;
+    durationMs?: number;
+    costUsd?: number;
+    tokens?: number;
+  } | { error: string }
 >;
 
 /**
@@ -70,7 +81,13 @@ export async function runOne(
   if ("error" in launched) return { ...base, failed: true };
   const st = await status({ node, runId: launched.runId });
   if ("error" in st) return { ...base, failed: true };
-  return { ...base, verified: st.verified, failed: st.failed, ...(st.durationMs ? { durationMs: st.durationMs } : {}), ...(st.tokens ? { tokens: st.tokens } : {}), ...(st.costUsd ? { costUsd: st.costUsd } : {}) };
+  const record = { ...base, verified: st.verified, failed: st.failed, ...(typeof st.handRaised === "boolean" ? { handRaised: st.handRaised } : {}), ...(st.gateTimedOut === true ? { gateTimedOut: true } : {}), ...(st.gateUnavailable === true ? { gateUnavailable: true } : {}), ...(st.state ? { state: st.state } : {}), ...(st.durationMs ? { durationMs: st.durationMs } : {}), ...(st.tokens ? { tokens: st.tokens } : {}), ...(st.costUsd ? { costUsd: st.costUsd } : {}) };
+  // Issue #112: the intervention verdict is DERIVED from the same record, so
+  // the report's intervention rate shares one definition with the audit trail.
+  // An explicit override still wins (an operator knows things a record does not).
+  const override = typeof (st as { intervened?: unknown }).intervened === "boolean" ? (st as unknown as { intervened: boolean }).intervened : undefined;
+  const intervened = override ?? isIntervention(record);
+  return { ...record, ...(st.durationMs ? { durationMs: st.durationMs } : {}), ...(st.tokens ? { tokens: st.tokens } : {}), ...(st.costUsd ? { costUsd: st.costUsd } : {}), ...(intervened ? { intervened: true } : {}) };
 }
 
 async function main(): Promise<number> {
@@ -94,7 +111,7 @@ async function main(): Promise<number> {
   const observations: BenchObservation[] = [];
   for (const line of (await readFile(join(root, recordsPath), "utf8")).split("\n")) {
     if (!line.trim()) continue;
-    try { observations.push(JSON.parse(line) as BenchObservation); }
+    try { observations.push(observationFromRecord(JSON.parse(line) as Parameters<typeof observationFromRecord>[0])); }
     catch { console.error(`skipping unparsable observation line: ${line.slice(0, 80)}`); }
   }
   console.log(renderReport(summarize(observations), loaded.version));

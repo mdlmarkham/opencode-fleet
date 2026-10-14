@@ -133,6 +133,69 @@ export const MIN_CONFIDENT_N = 10;
 
 const comboKey = (o: BenchObservation): string => `${o.engine}\u0000${o.model ?? ""}`;
 
+/**
+ * An intervention is any outcome where the worker did not finish clean on its
+ * own: the manager or a human had to step in. Issue #112 bounded slice. One
+ * record, one verdict, derived from the fields the fleet ALREADY records on a
+ * run (ledger entry / run result / `__RUN_STATUS__` snapshot) — no new ledger:
+ *
+ *   - verified === false            the expect/spec gate FAILED (manager review)
+ *   - handRaised === true           the worker stopped to ask a question
+ *   - gateTimedOut/gateUnavailable  a human must re-run or bootstrap the gate
+ *   - state "aborted" / "timed-out"/ "failed" — the run was killed, hit a wall
+ *     clock, or died; someone must rescue or re-dispatch
+ *   - failed === true               dispatch/status error (runner could not
+ *     even read the run)
+ *
+ * Not interventions: verified===true with no hand-raise (clean), and
+ * verified===null WITHOUT a named abnormal cause (ungated / unknown — already
+ * counted separately as `unknown`, so it is not double-counted as intervened).
+ */
+export function isIntervention(rec: {
+  verified?: boolean | null;
+  handRaised?: boolean | null;
+  gateTimedOut?: boolean | null;
+  gateUnavailable?: boolean | null;
+  state?: string | null;
+  failed?: boolean | null;
+}): boolean {
+  if (rec.handRaised === true) return true;
+  if (rec.verified === false) return true;
+  if (rec.gateTimedOut === true || rec.gateUnavailable === true) return true;
+  if (rec.state === "aborted" || rec.state === "timed-out" || rec.state === "failed" || rec.state === "failed-verification") return true;
+  if (rec.failed === true) return true;
+  return false;
+}
+
+/** Derive one benchmark observation from a run record's recorded fields (pure). */
+export function observationFromRecord(rec: {
+  taskId: string;
+  engine: string;
+  model?: string;
+  verified?: boolean | null;
+  handRaised?: boolean | null;
+  gateTimedOut?: boolean | null;
+  gateUnavailable?: boolean | null;
+  state?: string | null;
+  failed?: boolean | null;
+  durationMs?: number | null;
+  tokens?: number | null;
+  costUsd?: number | null;
+}): BenchObservation {
+  const num = (v: unknown): number | undefined => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
+  return {
+    taskId: rec.taskId,
+    engine: rec.engine,
+    ...(rec.model ? { model: rec.model } : {}),
+    verified: typeof rec.verified === "boolean" ? rec.verified : null,
+    ...(isIntervention(rec) ? { intervened: true } : {}),
+    ...(num(rec.durationMs) ? { durationMs: num(rec.durationMs) } : {}),
+    ...(num(rec.tokens) ? { tokens: num(rec.tokens) } : {}),
+    ...(num(rec.costUsd) ? { costUsd: num(rec.costUsd) } : {}),
+    ...(rec.failed === true ? { failed: true } : {}),
+  };
+}
+
 function mean(xs: number[]): number | null {
   if (xs.length === 0) return null;
   return xs.reduce((a, b) => a + b, 0) / xs.length;
