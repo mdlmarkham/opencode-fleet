@@ -563,6 +563,42 @@ export function registerDispatchTools(api: OpenClawPluginApi, cfg: FleetConfig):
       if (readiness && !readiness.ready) results.readiness = readiness;
       if (noGate && gateMode !== "off") results.verification = { gate: "none", note: "no verify gate: success is just the process exit code and is unchecked. Pass a `spec` with `verify` (or `expect`) so a run that exits 0 but did nothing is caught." };
       if (dispatchWarnings.length) results.warnings = dispatchWarnings;
+      // Issue #260 (merge queue): flag a shared-line collision between two live
+      // claims AT DISPATCH TIME. When an ACTIVE run on this checkout (ledger
+      // state running, not past the stale window — the same liveness rule the
+      // capacity machinery uses) declares a `spec.scope` whose globs could
+      // touch the same file as the incoming spec's, the result carries a
+      // structured `scopeOverlap` warning naming the other runId and the
+      // colliding patterns. A WARNING, never a refusal (the design gate owns
+      // the block decision, with its acknowledge path). Matching is
+      // `scopeOverlap` itself — the same matcher the scope machinery uses for
+      // scopeViolations — so no second glob engine exists. No overlap => no
+      // field: the dispatch result is unchanged for disjoint dispatches.
+      const { parseScope: overlapScopeParse, scopeOverlap: scopeOverlapMatch } = await import("../scope.js");
+      const mineOverlap = overlapScopeParse(specCheck.spec?.scope);
+      const myScopeForOverlap = mineOverlap.ok ? mineOverlap.scope : undefined;
+      if (myScopeForOverlap) {
+        const liveClaims = (await import("../capacity.js")).capacityInputFromLedger(await loadLedger(rootDir) as never, {
+          cwd: p.cwd,
+          now: Date.now(),
+          staleAfterMs: staleAfterFor(cfg.capacity),
+        }).inFlight;
+        const clashes: Array<{ runId: string; node: string; files: string[] }> = [];
+        for (const other of liveClaims) {
+          const theirs = overlapScopeParse(other.scope);
+          if (!theirs.ok || !theirs.scope) continue;
+          const files = [...new Set(
+            myScopeForOverlap.files.flatMap((a) => theirs.scope!.files.filter((b) => scopeOverlapMatch({ files: [a] }, { files: [b] })).map((b) => `${a} ↔ ${b}`)),
+          )];
+          if (files.length > 0) clashes.push({ runId: other.runId, node: other.node, files });
+        }
+        if (clashes.length > 0) {
+          results.scopeOverlap = {
+            note: "Advisory warning, not a refusal: another active run may touch the same files (shared-line collision). Work will interleave in a shared checkout and the branches may conflict at merge time.",
+            runs: clashes,
+          };
+        }
+      }
       // Issue #87, slice 3: surface the opt-in routing decision — only when
       // `route` was requested; the default path adds no field at all.
       if (s1RouteDecision) results.s1 = { route: s1RouteDecision };
